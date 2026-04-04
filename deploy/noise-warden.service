@@ -9,8 +9,15 @@ Group=noisewarden
 WorkingDirectory=/opt/noise-warden/current
 Environment=NOISE_WARDEN_CONFIG=/opt/noise-warden/current/config/noise_warden.yaml
 ExecStart=/opt/noise-warden/venv/bin/uvicorn noise_warden.main:app --host 0.0.0.0 --port 8787
-Restart=always
-RestartSec=3
+# Graceful shutdown: give the engine time to finalize active incidents and flush the DB
+TimeoutStopSec=15
+# Restart on failure only — don't restart on clean exit (e.g. manual stop)
+Restart=on-failure
+# Back off to avoid tight crash loops when config is broken or a dependency is missing
+RestartSec=10
+# Rate-limit restarts: max 5 attempts in 120 seconds, then give up
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target

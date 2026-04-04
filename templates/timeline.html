@@ -1,19 +1,644 @@
 {% extends "base.html" %}
 {% block content %}
+<style>
+  /* ---- Controls ---- */
+  #tl-controls { display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  #tl-controls button { padding:8px 14px; }
+  #tl-controls button.active { background:#222; color:#fff; }
+  #tl-view-label { font-weight:bold; margin:0 8px; min-width:160px; text-align:center; }
+  #tl-status { margin-top:4px; }
+
+  /* ---- Shared grid ---- */
+  .tl-wrapper { display:flex; border:1px solid #ddd; border-radius:8px; overflow:hidden; }
+  .tl-hours-col { width:48px; position:relative; flex-shrink:0; background:#fafafa; border-right:1px solid #ddd; }
+  .tl-hour-label { position:absolute; left:4px; font-size:11px; color:#888; transform:translateY(-7px); pointer-events:none; }
+  .tl-columns { display:flex; flex:1; min-width:0; overflow-x:auto; }
+
+  .tl-col { flex:1; position:relative; border-right:1px solid #f0f0f0; min-width:0; }
+  .tl-col:last-child { border-right:none; }
+  .tl-col-header { text-align:center; font-size:12px; padding:4px 2px; background:#f8f8f8; border-bottom:1px solid #ddd; white-space:nowrap; overflow:hidden; }
+  .tl-col-header.today { font-weight:bold; color:#3498db; }
+  .tl-col-body { position:relative; }
+
+  .tl-hour-line { position:absolute; left:0; right:0; border-top:1px solid #f0f0f0; pointer-events:none; }
+  .tl-now-line { position:absolute; left:0; right:0; border-top:2px solid #3498db; pointer-events:none; z-index:5; }
+
+  /* ---- Incident blocks ---- */
+  .tl-block { position:absolute; left:3px; right:3px; border-radius:5px; padding:2px 5px; color:#fff; font-size:11px; cursor:pointer; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.18); z-index:2; transition:opacity .12s; box-sizing:border-box; }
+  .tl-block:hover { opacity:.82; }
+  .tl-block-label { font-weight:bold; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+  /* Month compact pips (no padding — just colored position markers) */
+  .tl-pip { position:absolute; left:2px; right:2px; border-radius:3px; cursor:pointer; min-height:5px; z-index:2; }
+  .tl-pip:hover { opacity:.75; }
+
+  /* ---- Popup overlay ---- */
+  #popup-overlay { position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:100; display:flex; align-items:center; justify-content:center; padding:16px; }
+  #popup-box { background:#fff; border-radius:12px; max-width:500px; width:100%; max-height:90vh; overflow-y:auto; padding:24px; position:relative; box-shadow:0 8px 32px rgba(0,0,0,.2); }
+  #popup-close { position:absolute; top:10px; right:14px; background:none; border:none; font-size:24px; cursor:pointer; color:#666; padding:4px 8px; }
+  .popup-section { margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid #eee; }
+  .popup-section:last-child { border-bottom:none; margin-bottom:0; padding-bottom:0; }
+  .popup-lbl { color:#666; font-size:13px; }
+  .popup-val { font-weight:bold; }
+
+  /* The hero element — excess dB badge, prominently visible for authorities */
+  .excess-badge { display:inline-block; font-size:20px; font-weight:bold; padding:8px 16px; border-radius:8px; color:#fff; margin:6px 0; }
+  .excess-low { background:#f39c12; }
+  .excess-mid { background:#e67e22; }
+  .excess-high { background:#e74c3c; }
+  .excess-severe { background:#c0392b; }
+</style>
+
 <div class="card">
-  <h2>Timeline ({{ view }})</h2>
-  <p>
-    <a href="/timeline?view=day">Day</a> |
-    <a href="/timeline?view=week">Week</a> |
-    <a href="/timeline?view=month">Month</a>
-  </p>
-  <div>
-    {% for r in rows %}
-      <div class="card" style="margin-bottom:8px;">
-        <b>#{{ r.id }}</b> {{ r.start_ts }}<br>
-        Start dB: {{ r.start_db }} | Duration: {{ r.duration_sec or "active" }} sec
-      </div>
-    {% endfor %}
+  <h2>Timeline</h2>
+  <div id="tl-controls">
+    <button id="btn-day" onclick="switchView('day')">Day</button>
+    <button id="btn-week" onclick="switchView('week')">Week</button>
+    <button id="btn-month" onclick="switchView('month')">Month</button>
+    <button onclick="navigate(-1)" title="Previous">&#8592;</button>
+    <span id="tl-view-label"></span>
+    <button onclick="navigate(1)" title="Next">&#8594;</button>
+    <button onclick="goToday()">Today</button>
+    <span id="tl-count" class="small" style="margin-left:8px"></span>
+  </div>
+  <p class="small" id="tl-status"></p>
+  <div id="tl-grid"></div>
+</div>
+
+<div id="popup-overlay" style="display:none" onclick="hidePopup()">
+  <div id="popup-box" onclick="event.stopPropagation()">
+    <button id="popup-close" onclick="hidePopup()">&times;</button>
+    <div id="popup-content"></div>
   </div>
 </div>
+
+<script>
+/* ======================================================================
+   DATA — injected by server, cached by SW for offline use.
+   All popup/detail views read from this array (zero extra DB calls).
+   ====================================================================== */
+var INCIDENTS = {{ incidents_json | safe }};
+var ORDINANCE = {{ ordinance_json | safe }};
+
+/* ======================================================================
+   CONSTANTS
+   ====================================================================== */
+var CACHE_NAME = 'noise-warden-timeline-v1';
+var HOUR_PX = 40;
+var GRID_PX = 24 * HOUR_PX;              // 960px for day/week
+var MONTH_HOUR_PX = 16;
+var MONTH_GRID_PX = 24 * MONTH_HOUR_PX;  // 384px for month
+var HDR_PX = 26;                          // column header height
+var DAY_MS = 86400000;
+var DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+
+/* ======================================================================
+   STATE
+   ====================================================================== */
+var currentView = '{{ view }}' || 'day';
+var currentDate = new Date();
+currentDate.setHours(0, 0, 0, 0);
+
+/* ======================================================================
+   INIT
+   ====================================================================== */
+document.addEventListener('DOMContentLoaded', function () {
+  render();
+  registerSW();
+  precacheSnippets();
+  updateOnlineStatus();
+  window.addEventListener('online', updateOnlineStatus);
+  window.addEventListener('offline', updateOnlineStatus);
+});
+
+/* ======================================================================
+   NAVIGATION — all client-side, zero network calls
+   ====================================================================== */
+function switchView(view) {
+  currentView = view;
+  if (view === 'month') {
+    currentDate.setDate(1);
+  }
+  render();
+  history.replaceState(null, '', '/timeline?view=' + view);
+}
+
+function navigate(dir) {
+  if (currentView === 'day') {
+    currentDate.setDate(currentDate.getDate() + dir);
+  } else if (currentView === 'week') {
+    currentDate.setDate(currentDate.getDate() + (dir * 7));
+  } else {
+    currentDate.setMonth(currentDate.getMonth() + dir);
+    currentDate.setDate(1);
+  }
+  render();
+}
+
+function goToday() {
+  currentDate = new Date();
+  currentDate.setHours(0, 0, 0, 0);
+  if (currentView === 'month') {
+    currentDate.setDate(1);
+  }
+  render();
+}
+
+/* ======================================================================
+   RENDER DISPATCH
+   ====================================================================== */
+function render() {
+  updateViewButtons();
+  if (currentView === 'day') { renderDay(); }
+  else if (currentView === 'week') { renderWeek(); }
+  else { renderMonth(); }
+}
+
+function updateViewButtons() {
+  document.getElementById('btn-day').className = (currentView === 'day') ? 'active' : '';
+  document.getElementById('btn-week').className = (currentView === 'week') ? 'active' : '';
+  document.getElementById('btn-month').className = (currentView === 'month') ? 'active' : '';
+}
+
+/* ======================================================================
+   DAY VIEW — single tall column with full incident labels
+   ====================================================================== */
+function renderDay() {
+  var dayStart = new Date(currentDate);
+  dayStart.setHours(0, 0, 0, 0);
+  setViewLabel(dayStart.toLocaleDateString([], { weekday:'long', month:'long', day:'numeric', year:'numeric' }));
+
+  var gridEl = document.getElementById('tl-grid');
+  gridEl.innerHTML = '';
+
+  var wrapper = makeEl('div', 'tl-wrapper');
+  wrapper.style.height = (GRID_PX + HDR_PX) + 'px';
+
+  // Hour labels column
+  wrapper.appendChild(buildHoursColumn(HOUR_PX, GRID_PX));
+
+  // Single day column
+  var columns = makeEl('div', 'tl-columns');
+  columns.appendChild(buildDayColumn(dayStart, HOUR_PX, GRID_PX, true));
+  wrapper.appendChild(columns);
+
+  gridEl.appendChild(wrapper);
+}
+
+/* ======================================================================
+   WEEK VIEW — 7 day columns with condensed labels
+   ====================================================================== */
+function renderWeek() {
+  var monday = getMonday(currentDate);
+  var sunday = new Date(monday);
+  sunday.setDate(sunday.getDate() + 6);
+  setViewLabel(formatDateShort(monday) + ' \u2013 ' + formatDateShort(sunday));
+
+  var gridEl = document.getElementById('tl-grid');
+  gridEl.innerHTML = '';
+
+  var wrapper = makeEl('div', 'tl-wrapper');
+  wrapper.style.height = (GRID_PX + HDR_PX) + 'px';
+
+  wrapper.appendChild(buildHoursColumn(HOUR_PX, GRID_PX));
+
+  var columns = makeEl('div', 'tl-columns');
+  for (var d = 0; d < 7; d++) {
+    var dayStart = new Date(monday);
+    dayStart.setDate(dayStart.getDate() + d);
+    dayStart.setHours(0, 0, 0, 0);
+    columns.appendChild(buildDayColumn(dayStart, HOUR_PX, GRID_PX, false));
+  }
+  wrapper.appendChild(columns);
+
+  gridEl.appendChild(wrapper);
+}
+
+/* ======================================================================
+   MONTH VIEW — compact day columns with colored pips (no text labels)
+   ====================================================================== */
+function renderMonth() {
+  var year = currentDate.getFullYear();
+  var month = currentDate.getMonth();
+  var numDays = new Date(year, month + 1, 0).getDate();
+  setViewLabel(currentDate.toLocaleDateString([], { month:'long', year:'numeric' }));
+
+  var gridEl = document.getElementById('tl-grid');
+  gridEl.innerHTML = '';
+
+  var wrapper = makeEl('div', 'tl-wrapper');
+  wrapper.style.height = (MONTH_GRID_PX + HDR_PX) + 'px';
+
+  // No hour labels in month view (columns are too narrow)
+  var columns = makeEl('div', 'tl-columns');
+  for (var d = 1; d <= numDays; d++) {
+    var dayStart = new Date(year, month, d, 0, 0, 0, 0);
+    var col = buildDayColumn(dayStart, MONTH_HOUR_PX, MONTH_GRID_PX, false);
+    // Override header to just the date number (saves horizontal space)
+    col.querySelector('.tl-col-header').textContent = d;
+    columns.appendChild(col);
+  }
+  wrapper.appendChild(columns);
+
+  gridEl.appendChild(wrapper);
+}
+
+/* ======================================================================
+   SHARED: hour-label column (left gutter)
+   ====================================================================== */
+function buildHoursColumn(hourPx, gridPx) {
+  var col = makeEl('div', 'tl-hours-col');
+  col.style.height = (gridPx + HDR_PX) + 'px';
+
+  // Spacer matching the column header height
+  var spacer = makeEl('div');
+  spacer.style.height = HDR_PX + 'px';
+  col.appendChild(spacer);
+
+  for (var h = 0; h < 24; h++) {
+    var lbl = makeEl('div', 'tl-hour-label');
+    lbl.style.top = (HDR_PX + h * hourPx) + 'px';
+    lbl.textContent = formatHour(h);
+    col.appendChild(lbl);
+  }
+  return col;
+}
+
+/* ======================================================================
+   SHARED: Build one day's column (header + hour lines + incidents + now line)
+   ====================================================================== */
+function buildDayColumn(dayStart, hourPx, gridPx, showLabels) {
+  var dayEnd = new Date(dayStart.getTime() + DAY_MS);
+  var today = new Date();
+
+  var col = makeEl('div', 'tl-col');
+
+  // Header (e.g. "Tue 8" or just "8" for month view — caller can override)
+  var hdr = makeEl('div', 'tl-col-header');
+  var dow = (dayStart.getDay() + 6) % 7; // 0=Mon .. 6=Sun
+  hdr.textContent = DAYS[dow] + ' ' + dayStart.getDate();
+  if (isSameDay(dayStart, today)) {
+    hdr.className += ' today';
+  }
+  col.appendChild(hdr);
+
+  // Body — all incident blocks and lines are absolutely positioned inside this
+  var body = makeEl('div', 'tl-col-body');
+  body.style.height = gridPx + 'px';
+
+  // Hour lines
+  for (var h = 1; h < 24; h++) {
+    var line = makeEl('div', 'tl-hour-line');
+    line.style.top = (h * hourPx) + 'px';
+    body.appendChild(line);
+  }
+
+  // Incidents overlapping this day
+  var visibleCount = 0;
+  for (var i = 0; i < INCIDENTS.length; i++) {
+    var inc = INCIDENTS[i];
+    var start = new Date(inc.start_ts);
+    // Defensive: if end_ts is missing, treat as a short blip at start time
+    var end = inc.end_ts ? new Date(inc.end_ts) : new Date(start.getTime() + 1000);
+
+    if (start >= dayEnd || end <= dayStart) { continue; }
+    visibleCount++;
+
+    var clampStart = Math.max(start.getTime(), dayStart.getTime());
+    var clampEnd = Math.min(end.getTime(), dayEnd.getTime());
+    var topMin = (clampStart - dayStart.getTime()) / 60000;
+    var durMin = (clampEnd - clampStart) / 60000;
+
+    var top = (topMin / 60) * hourPx;
+    var minH = showLabels ? 18 : 5;
+    var height = Math.max(minH, (durMin / 60) * hourPx);
+    var excess = safeNum(inc.peak_db, inc.start_db) - safeNum(inc.threshold_db);
+
+    var block = makeEl('div', showLabels ? 'tl-block' : 'tl-pip');
+    block.style.top = top + 'px';
+    block.style.height = height + 'px';
+    block.style.backgroundColor = severityColor(excess);
+    block.title = Math.round(safeNum(inc.start_db)) + ' dB \u00B7 ' + formatDuration(inc.duration_sec);
+
+    // Closure captures the correct incident reference per iteration
+    block.onclick = (function (incident) {
+      return function (e) { e.stopPropagation(); showPopup(incident); };
+    })(inc);
+
+    // Full text label only if block is tall enough
+    if (showLabels && height >= 22) {
+      var label = makeEl('div', 'tl-block-label');
+      label.textContent = Math.round(safeNum(inc.start_db)) + ' dB \u00B7 ' + formatDuration(inc.duration_sec);
+      block.appendChild(label);
+    }
+
+    body.appendChild(block);
+  }
+
+  // "Now" line
+  if (isSameDay(dayStart, today)) {
+    var nowMin = today.getHours() * 60 + today.getMinutes();
+    var nowTop = (nowMin / 60) * hourPx;
+    var nowLine = makeEl('div', 'tl-now-line');
+    nowLine.style.top = nowTop + 'px';
+    body.appendChild(nowLine);
+  }
+
+  col.appendChild(body);
+
+  // Accumulate incident count for the status display
+  accumulateCount(visibleCount);
+
+  return col;
+}
+
+/* ======================================================================
+   POPUP — the primary deliverable for showing evidence to authorities
+   ====================================================================== */
+function showPopup(inc) {
+  var startDate = new Date(inc.start_ts);
+  var endDate = inc.end_ts ? new Date(inc.end_ts) : null;
+  var peakDb = safeNum(inc.peak_db, inc.start_db);
+  var avgDb = safeNum(inc.avg_db, inc.start_db);
+  var thresholdDb = safeNum(inc.threshold_db);
+  var excessPeak = peakDb - thresholdDb;
+  var period = inferPeriod(inc.start_ts);
+
+  var durationStr = '\u2014';
+  if (inc.duration_sec && inc.duration_sec > 0) {
+    durationStr = formatDuration(inc.duration_sec);
+  } else if (endDate) {
+    durationStr = formatDuration((endDate - startDate) / 1000);
+  }
+
+  var html = '';
+
+  // Header
+  html += '<div class="popup-section">';
+  html += '<h3 style="margin:0 0 4px">Incident #' + inc.id + '</h3>';
+  html += '<span class="popup-lbl">' + escapeHtml(inc.classification || 'unclassified');
+  html += ' \u00B7 ' + escapeHtml(inc.mode || '') + '</span>';
+  html += '</div>';
+
+  // Times
+  html += '<div class="popup-section">';
+  html += '<div><span class="popup-lbl">Start:</span> <span class="popup-val">' + formatDateTime(startDate) + '</span></div>';
+  if (endDate) {
+    html += '<div><span class="popup-lbl">End:</span> <span class="popup-val">' + formatDateTime(endDate) + '</span></div>';
+  } else {
+    html += '<div><span class="popup-lbl">End:</span> <span class="popup-val">In progress</span></div>';
+  }
+  html += '<div><span class="popup-lbl">Duration:</span> <span class="popup-val">' + durationStr + '</span></div>';
+  html += '</div>';
+
+  // Violation comparison — THE HERO ELEMENT for authority presentation
+  html += '<div class="popup-section">';
+  html += '<div class="excess-badge ' + excessClass(excessPeak) + '">';
+  html += '+' + excessPeak.toFixed(1) + ' dB above ' + period + ' limit';
+  html += '</div>';
+  html += '<div style="margin-top:8px">';
+  html += '<div><span class="popup-lbl">Ordinance threshold (' + period + '):</span> <span class="popup-val">' + thresholdDb + ' dBA</span></div>';
+  html += '<div><span class="popup-lbl">Peak reading:</span> <span class="popup-val">' + peakDb.toFixed(1) + ' dBA</span></div>';
+  html += '<div><span class="popup-lbl">Average reading:</span> <span class="popup-val">' + avgDb.toFixed(1) + ' dBA</span></div>';
+  html += '</div>';
+  html += '</div>';
+
+  // Classification details (skip if no meaningful data)
+  if (inc.music_like_score != null) {
+    html += '<div class="popup-section">';
+    html += '<div><span class="popup-lbl">Music-like score:</span> <span class="popup-val">' + safeNum(inc.music_like_score).toFixed(2) + '</span></div>';
+    if (inc.responded) {
+      html += '<div><span class="popup-lbl">Response:</span> <span class="popup-val">Activated</span></div>';
+    }
+    html += '</div>';
+  }
+
+  // Notes
+  if (inc.notes) {
+    html += '<div class="popup-section">';
+    html += '<div class="popup-lbl">Notes:</div>';
+    html += '<div>' + escapeHtml(inc.notes) + '</div>';
+    html += '</div>';
+  }
+
+  // Audio snippet player
+  if (inc.has_snippet) {
+    html += '<div class="popup-section">';
+    html += '<div class="popup-lbl">Audio evidence:</div>';
+    html += '<audio controls preload="none" style="width:100%;margin-top:6px">';
+    html += '<source src="/snippets/' + inc.id + '" type="audio/wav">';
+    html += '</audio>';
+    html += '<p class="small" id="snippet-status-' + inc.id + '"></p>';
+    html += '</div>';
+  }
+
+  document.getElementById('popup-content').innerHTML = html;
+  document.getElementById('popup-overlay').style.display = 'flex';
+
+  // Non-blocking cache check for the audio snippet
+  if (inc.has_snippet) {
+    checkSnippetCache(inc.id);
+  }
+}
+
+function hidePopup() {
+  document.getElementById('popup-overlay').style.display = 'none';
+  // Stop any playing audio when closing
+  var audio = document.querySelector('#popup-box audio');
+  if (audio) { audio.pause(); }
+}
+
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') { hidePopup(); }
+});
+
+/* ======================================================================
+   SNIPPET CACHE STATUS
+   ====================================================================== */
+function checkSnippetCache(incidentId) {
+  var statusEl = document.getElementById('snippet-status-' + incidentId);
+  if (!statusEl || !('caches' in window)) { return; }
+
+  caches.open(CACHE_NAME).then(function (cache) {
+    return cache.match('/snippets/' + incidentId);
+  }).then(function (match) {
+    if (statusEl) {
+      statusEl.textContent = match ? '\u2713 Available offline' : 'Streams when online';
+    }
+  }).catch(function () {
+    // Cache API unavailable — degrade gracefully
+  });
+}
+
+/* ======================================================================
+   UTILITIES
+   ====================================================================== */
+
+/** Create an element with an optional CSS class. */
+function makeEl(tag, className) {
+  var e = document.createElement(tag);
+  if (className) { e.className = className; }
+  return e;
+}
+
+/** Return the first non-null, non-NaN numeric argument, defaulting to 0. */
+function safeNum() {
+  for (var i = 0; i < arguments.length; i++) {
+    if (arguments[i] != null && !isNaN(arguments[i])) { return Number(arguments[i]); }
+  }
+  return 0;
+}
+
+function formatHour(h) {
+  if (h === 0) { return '12 AM'; }
+  if (h < 12) { return h + ' AM'; }
+  if (h === 12) { return '12 PM'; }
+  return (h - 12) + ' PM';
+}
+
+function formatDuration(sec) {
+  if (!sec || sec <= 0) { return '< 1s'; }
+  if (sec < 60) { return Math.round(sec) + 's'; }
+  var m = Math.floor(sec / 60);
+  if (m < 60) { return m + 'm ' + Math.round(sec % 60) + 's'; }
+  var hrs = Math.floor(m / 60);
+  return hrs + 'h ' + (m % 60) + 'm';
+}
+
+function formatDateTime(d) {
+  return d.toLocaleDateString([], { weekday:'short', month:'short', day:'numeric', year:'numeric' })
+    + ' ' + d.toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+}
+
+function formatDateShort(d) {
+  return d.toLocaleDateString([], { month:'short', day:'numeric' });
+}
+
+function getMonday(d) {
+  var date = new Date(d);
+  var day = date.getDay();
+  // Shift Sunday (0) back 6 days, everything else back to prior Monday
+  var diff = date.getDate() - day + (day === 0 ? -6 : 1);
+  date.setDate(diff);
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+function isSameDay(a, b) {
+  return a.getFullYear() === b.getFullYear()
+    && a.getMonth() === b.getMonth()
+    && a.getDate() === b.getDate();
+}
+
+function severityColor(excessDb) {
+  if (excessDb >= 15) { return '#c0392b'; }  // Deep red — extreme violation
+  if (excessDb >= 10) { return '#e74c3c'; }  // Red — severe
+  if (excessDb >= 5)  { return '#e67e22'; }  // Orange — moderate
+  return '#f39c12';                            // Amber — just above threshold
+}
+
+function excessClass(excessDb) {
+  if (excessDb >= 15) { return 'excess-severe'; }
+  if (excessDb >= 10) { return 'excess-high'; }
+  if (excessDb >= 5)  { return 'excess-mid'; }
+  return 'excess-low';
+}
+
+/** Determine day/night period from the start timestamp using ordinance hours. */
+function inferPeriod(startTs) {
+  var hour = new Date(startTs).getHours();
+  var nightStart = (ORDINANCE.measurement && ORDINANCE.measurement.night_start) || 22;
+  var dayStart = (ORDINANCE.measurement && ORDINANCE.measurement.day_start) || 7;
+  if (hour >= nightStart || hour < dayStart) { return 'night'; }
+  return 'day';
+}
+
+function escapeHtml(str) {
+  var div = document.createElement('div');
+  div.textContent = str || '';
+  return div.innerHTML;
+}
+
+function setViewLabel(text) {
+  document.getElementById('tl-view-label').textContent = text;
+}
+
+/**
+ * Accumulate visible incident count across columns before updating the UI.
+ * Week/month views call buildDayColumn() multiple times per render — the
+ * debounced timeout fires after all columns have rendered in the same frame.
+ */
+var _renderCount = 0;
+var _countTimer = null;
+function accumulateCount(count) {
+  _renderCount += count;
+  clearTimeout(_countTimer);
+  _countTimer = setTimeout(function () {
+    var n = _renderCount;
+    _renderCount = 0;
+    var countEl = document.getElementById('tl-count');
+    if (n === 0) {
+      countEl.textContent = 'No incidents in this period';
+    } else {
+      countEl.textContent = n + ' incident' + (n !== 1 ? 's' : '');
+    }
+  }, 0);
+}
+
+/* ======================================================================
+   ONLINE / OFFLINE STATUS
+   ====================================================================== */
+function updateOnlineStatus() {
+  var statusEl = document.getElementById('tl-status');
+  if (!navigator.onLine) {
+    statusEl.textContent = '\u26A1 Offline mode \u2014 showing cached data';
+    statusEl.style.color = '#e67e22';
+  } else {
+    statusEl.textContent = '';
+    statusEl.style.color = '';
+  }
+}
+
+/* ======================================================================
+   SERVICE WORKER REGISTRATION + SNIPPET PRE-CACHING
+   ====================================================================== */
+function registerSW() {
+  if (!('serviceWorker' in navigator)) { return; }
+  navigator.serviceWorker.register('/sw.js').catch(function () {
+    // SW registration failed — page still functions, just no offline support
+  });
+}
+
+/**
+ * Pre-cache audio snippets from the most recent 24 hours.
+ * Each fetch() goes through the SW, which intercepts and caches the response.
+ * Failures are silently swallowed (snippet won't be available offline, is all).
+ */
+function precacheSnippets() {
+  var cutoff = Date.now() - (24 * 60 * 60 * 1000);
+  var targets = [];
+
+  for (var i = 0; i < INCIDENTS.length; i++) {
+    var inc = INCIDENTS[i];
+    if (inc.has_snippet && new Date(inc.start_ts).getTime() > cutoff) {
+      targets.push(inc.id);
+    }
+  }
+  if (targets.length === 0) { return; }
+
+  var cached = 0;
+  var statusEl = document.getElementById('tl-status');
+
+  for (var j = 0; j < targets.length; j++) {
+    fetch('/snippets/' + targets[j]).then(function () {
+      cached++;
+      if (cached === targets.length && navigator.onLine && statusEl) {
+        statusEl.textContent = targets.length + ' recent snippet' + (targets.length !== 1 ? 's' : '') + ' cached for offline use';
+      }
+    }).catch(function () {
+      // Network error for this snippet — skip
+    });
+  }
+}
+</script>
 {% endblock %}

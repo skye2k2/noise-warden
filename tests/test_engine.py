@@ -8,7 +8,7 @@ incident lifecycle end-to-end.
 import os
 import time
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -23,13 +23,13 @@ from noise_warden.storage import Storage
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_sine_block(freq=440, sr=16000, duration=0.5, amplitude=0.5):
+def _make_sine_block(freq=440, sr=22050, duration=0.5, amplitude=0.5):
     """Generate a sine wave block matching the default capture config."""
     t = np.linspace(0, duration, int(sr * duration), endpoint=False, dtype=np.float32)
     return np.sin(2 * np.pi * freq * t) * amplitude
 
 
-def _make_silence_block(sr=16000, duration=0.5):
+def _make_silence_block(sr=22050, duration=0.5):
     """Generate a near-silent block."""
     return np.zeros(int(sr * duration), dtype=np.float32)
 
@@ -40,7 +40,7 @@ class FakeCapture:
     of reading from a real microphone.
     """
 
-    def __init__(self, blocks, sr=16000, block_seconds=0.5):
+    def __init__(self, blocks, sr=22050, block_seconds=0.5):
         self.sr = sr
         self.block_seconds = block_seconds
         self._blocks = list(blocks)
@@ -56,6 +56,12 @@ class FakeCapture:
 
     def get_preroll(self, seconds):
         return []
+
+    def validate_device(self):
+        return (True, "fake device")
+
+    def reinitialize(self):
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +204,7 @@ class TestEngineErrorHandling:
     def test_capture_error_sets_error_state(self, base_cfg, tmp_storage, tmp_state):
         """If AudioCapture.read_block() raises, engine should set error state and keep running."""
         failing_capture = MagicMock()
-        failing_capture.sr = 16000
+        failing_capture.sr = 22050
         failing_capture.block_seconds = 0.5
         call_count = 0
 
@@ -212,6 +218,8 @@ class TestEngineErrorHandling:
 
         failing_capture.read_block = fail_then_succeed
         failing_capture.get_preroll.return_value = []
+        failing_capture.validate_device.return_value = (True, "mock device")
+        failing_capture.reinitialize.return_value = None
 
         with patch("noise_warden.engine.AudioCapture", return_value=failing_capture):
             with patch("noise_warden.engine.HAClient"):
@@ -352,6 +360,7 @@ class TestWeightedAvgDb:
             "start": datetime(2026, 1, 1, tzinfo=timezone.utc),
             "dbs": dbs,
             "classification": "other",
+            "period": "day",
             "responded": False,
             "last_above": datetime(2026, 1, 1, tzinfo=timezone.utc),
             "tmp_wav": None,
@@ -365,3 +374,418 @@ class TestWeightedAvgDb:
         simple_mean = sum(dbs) / len(dbs)  # 69.5
         # The weighted avg should be noticeably higher than the simple mean
         assert incident["avg_db"] > simple_mean
+
+
+# ---------------------------------------------------------------------------
+# Audio device validation
+# ---------------------------------------------------------------------------
+
+class TestAudioDeviceValidation:
+
+    def test_validate_device_returns_tuple(self):
+        """AudioCapture.validate_device() should return a (bool, str) tuple."""
+        from noise_warden.audio import AudioCapture
+        # Can't test with real devices, but can verify the interface
+        capture = FakeCapture([])
+        ok, msg = capture.validate_device()
+        assert isinstance(ok, bool)
+        assert isinstance(msg, str)
+
+
+# ---------------------------------------------------------------------------
+# Drive-by quarantine (move, not delete)
+# ---------------------------------------------------------------------------
+
+class TestDriveByQuarantine:
+
+    def test_driveby_moves_snippet_to_autodismissed(self, base_cfg, tmp_storage, tmp_state, tmp_path):
+        """Drive-by auto-dismiss should move the snippet to autodismissed/ instead of deleting."""
+        # Create a snippet file in the snippets directory
+        snippets_dir = os.path.join(str(tmp_path), "snippets")
+        os.makedirs(snippets_dir)
+        snippet_file = os.path.join(snippets_dir, "incident_1_test.wav")
+        with open(snippet_file, "wb") as f:
+            f.write(b"RIFF" + b"\x00" * 40)
+
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                engine = Engine(base_cfg, tmp_storage, tmp_state)
+
+        # Create a fake incident in the DB
+        row = {
+            "start_ts": "2026-04-01T12:00:00+00:00",
+            "start_db": 70, "peak_db": 70, "avg_db": 70,
+            "threshold_db": 55, "music_like_score": 0.5,
+            "beat_confidence": 0.3, "classification": "other",
+            "mode": "record_only",
+        }
+        iid = tmp_storage.create_incident(row)
+
+        # Set up an active incident with a clear drive-by pattern (short, fade-out)
+        dbs = [75, 73, 70, 68, 65, 62, 60]  # Monotonic decrease
+        # Start time must be recent so duration < driveby_max_duration_sec (30s)
+        recent_start = datetime.now(timezone.utc) - __import__("datetime").timedelta(seconds=5)
+        engine.active = {
+            "id": iid,
+            "start": recent_start,
+            "dbs": dbs,
+            "classification": "other",
+            "period": "night",
+            "responded": False,
+            "last_above": datetime.now(timezone.utc),
+            "tmp_wav": snippet_file,
+            "recording": True,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        # The original file should be GONE from snippets/
+        assert not os.path.exists(snippet_file)
+
+        # But it should exist in snippets/autodismissed/
+        quarantine_path = os.path.join(snippets_dir, "autodismissed", "incident_1_test.wav")
+        assert os.path.exists(quarantine_path)
+
+        # And the incident should be soft-deleted
+        assert tmp_storage.get_incident(iid) is None
+
+
+# ---------------------------------------------------------------------------
+# Disk full graceful recording stop
+# ---------------------------------------------------------------------------
+
+class TestDiskFullRecordingStop:
+
+    def test_append_audio_catches_write_error(self, base_cfg, tmp_storage, tmp_state, tmp_path):
+        """If _append_audio encounters an OSError, it should disable recording but not crash."""
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                engine = Engine(base_cfg, tmp_storage, tmp_state)
+
+        # Set up an active incident with recording enabled
+        engine.active = {
+            "id": 1,
+            "start": datetime(2026, 4, 1, 12, 0, 0, tzinfo=timezone.utc),
+            "dbs": [70],
+            "classification": "other",
+            "period": "day",
+            "responded": False,
+            "last_above": datetime(2026, 4, 1, 12, 0, 0, tzinfo=timezone.utc),
+            "tmp_wav": "/nonexistent/path/will_fail.wav",
+            "recording": True,
+        }
+
+        block = np.zeros(8000, dtype=np.float32)
+
+        # This should NOT raise — it should catch the OSError and disable recording
+        engine._append_audio(block)
+
+        assert engine.active["recording"] is False
+
+
+# ---------------------------------------------------------------------------
+# Day/night boundary split
+# ---------------------------------------------------------------------------
+
+class TestPeriodBoundarySplit:
+    """Verify that incidents are split when they cross a day/night boundary,
+    so each segment carries the correct threshold for timeline display."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_day_to_night_split_creates_new_incident(self, base_cfg, tmp_storage, tmp_state):
+        """When an active day incident crosses into night, the old incident should
+        finalize and a new one should begin with the night threshold."""
+        base_cfg["audio"]["recording_enabled"] = False
+        # Disable drive-by filter so the short test incident isn't auto-dismissed
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+
+        # Create a day incident in the DB
+        day_row = {
+            "start_ts": datetime.now(timezone.utc).isoformat(),
+            "start_db": 70, "peak_db": 72, "avg_db": 70,
+            "threshold_db": 65.0, "music_like_score": 0.5,
+            "beat_confidence": 0.3, "classification": "other",
+            "mode": "respond",
+        }
+        day_id = tmp_storage.create_incident(day_row)
+
+        # Start must be recent for a valid positive duration at finalization
+        recent_start = datetime.now(timezone.utc) - timedelta(seconds=30)
+        engine.active = {
+            "id": day_id,
+            "start": recent_start,
+            "dbs": [70, 71, 72],
+            "classification": "other",
+            "period": "day",
+            "responded": False,
+            "last_above": datetime.now(timezone.utc),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        # Simulate that the clock has crossed into night (is_night returns True)
+        block = np.zeros(8000, dtype=np.float32)
+        with patch("noise_warden.engine.is_night", return_value=True), \
+             patch.object(engine.ha, "publish_event"):
+            # Night threshold for residential continuous = 55 dB; our 70 dB exceeds it
+            split = engine._check_period_split(
+                db_now=70.0, threshold=55.0, mscore=0.5, bconf=0.3,
+                classification="other", block=block
+            )
+
+        assert split is True
+
+        # Old day incident should be finalized (has end_ts)
+        all_incidents = tmp_storage.list_incidents(limit=100)
+        assert len(all_incidents) == 2, f"Expected 2 incidents (day + night), got {len(all_incidents)}"
+
+        # The newer incident (first in DESC order) should be the night continuation
+        night_incident = all_incidents[0]
+        old_incident = all_incidents[1]
+        assert old_incident["id"] == day_id
+        assert old_incident["end_ts"] is not None, "Day incident should be finalized"
+        assert night_incident["threshold_db"] == 55.0, "Night incident should use night threshold"
+        assert night_incident["mode"] == "record_only", "Night incidents use record_only mode"
+
+        # Engine's active incident should be the new night one
+        assert engine.active is not None
+        assert engine.active["period"] == "night"
+
+    def test_night_to_day_below_threshold_no_new_incident(self, base_cfg, tmp_storage, tmp_state):
+        """When crossing night→day and the noise is below the day threshold,
+        the old incident finalizes but no new incident starts."""
+        base_cfg["audio"]["recording_enabled"] = False
+        # Disable drive-by filter so the short test incident isn't auto-dismissed
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+
+        night_row = {
+            "start_ts": datetime.now(timezone.utc).isoformat(),
+            "start_db": 58, "peak_db": 60, "avg_db": 58,
+            "threshold_db": 55.0, "music_like_score": 0.5,
+            "beat_confidence": 0.3, "classification": "other",
+            "mode": "record_only",
+        }
+        night_id = tmp_storage.create_incident(night_row)
+
+        recent_start = datetime.now(timezone.utc) - timedelta(seconds=30)
+        engine.active = {
+            "id": night_id,
+            "start": recent_start,
+            "dbs": [58, 59, 60],
+            "classification": "other",
+            "period": "night",
+            "responded": False,
+            "last_above": datetime.now(timezone.utc),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        block = np.zeros(8000, dtype=np.float32)
+        # is_night returns False → day period; day threshold = 65; noise at 60 < 65
+        with patch("noise_warden.engine.is_night", return_value=False), \
+             patch.object(engine.ha, "publish_event"):
+            split = engine._check_period_split(
+                db_now=60.0, threshold=65.0, mscore=0.5, bconf=0.3,
+                classification="other", block=block
+            )
+
+        assert split is True
+        # Night incident finalized
+        all_incidents = tmp_storage.list_incidents(limit=100)
+        assert len(all_incidents) == 1, "Only the original night incident should exist"
+        assert all_incidents[0]["end_ts"] is not None
+        # No new incident — noise below day threshold
+        assert engine.active is None
+
+    def test_no_split_when_period_unchanged(self, base_cfg, tmp_storage, tmp_state):
+        """If the period hasn't changed, _check_period_split should be a no-op."""
+        base_cfg["audio"]["recording_enabled"] = False
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+
+        row = {
+            "start_ts": "2026-04-04T14:00:00+00:00",
+            "start_db": 70, "peak_db": 70, "avg_db": 70,
+            "threshold_db": 65.0, "music_like_score": 0.5,
+            "beat_confidence": 0.3, "classification": "other",
+            "mode": "respond",
+        }
+        iid = tmp_storage.create_incident(row)
+
+        engine.active = {
+            "id": iid,
+            "start": datetime(2026, 4, 4, 14, 0, 0, tzinfo=timezone.utc),
+            "dbs": [70],
+            "classification": "other",
+            "period": "day",
+            "responded": False,
+            "last_above": datetime.now(timezone.utc),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        block = np.zeros(8000, dtype=np.float32)
+        # Still daytime — no split expected
+        with patch("noise_warden.engine.is_night", return_value=False):
+            split = engine._check_period_split(
+                db_now=70.0, threshold=65.0, mscore=0.5, bconf=0.3,
+                classification="other", block=block
+            )
+
+        assert split is False
+        # Active incident should be untouched
+        assert engine.active["id"] == iid
+        assert len(tmp_storage.list_incidents(limit=100)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Max duration split
+# ---------------------------------------------------------------------------
+
+class TestDurationSplit:
+    """Verify that incidents exceeding max_incident_record_hours are split
+    so WAV files and in-memory dB arrays stay bounded."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_long_incident_is_split(self, base_cfg, tmp_storage, tmp_state):
+        """An incident that exceeds max_incident_record_hours should be finalized
+        and a new one started if noise is still above threshold."""
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["audio"]["max_incident_record_hours"] = 2
+        # Disable drive-by filter
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+
+        row = {
+            "start_ts": datetime.now(timezone.utc).isoformat(),
+            "start_db": 70, "peak_db": 72, "avg_db": 70,
+            "threshold_db": 65.0, "music_like_score": 0.5,
+            "beat_confidence": 0.3, "classification": "other",
+            "mode": "respond",
+        }
+        iid = tmp_storage.create_incident(row)
+
+        # Start time is 3 hours ago — exceeds the 2-hour limit
+        engine.active = {
+            "id": iid,
+            "start": datetime.now(timezone.utc) - timedelta(hours=3),
+            "dbs": [70, 71, 72],
+            "classification": "other",
+            "period": "day",
+            "responded": False,
+            "last_above": datetime.now(timezone.utc),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        block = np.zeros(8000, dtype=np.float32)
+        with patch("noise_warden.engine.is_night", return_value=False), \
+             patch.object(engine.ha, "publish_event"):
+            split = engine._check_duration_split(
+                db_now=70.0, threshold=65.0, mscore=0.5, bconf=0.3,
+                classification="other", block=block
+            )
+
+        assert split is True
+        all_incidents = tmp_storage.list_incidents(limit=100)
+        assert len(all_incidents) == 2, f"Expected 2 incidents, got {len(all_incidents)}"
+
+        # Old incident finalized
+        old = all_incidents[1]
+        assert old["id"] == iid
+        assert old["end_ts"] is not None
+
+        # New incident started with fresh state
+        new = all_incidents[0]
+        assert new["id"] != iid
+        assert engine.active is not None
+        assert engine.active["id"] == new["id"]
+
+    def test_short_incident_not_split(self, base_cfg, tmp_storage, tmp_state):
+        """An incident under max_incident_record_hours should not be split."""
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["audio"]["max_incident_record_hours"] = 6
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+
+        row = {
+            "start_ts": datetime.now(timezone.utc).isoformat(),
+            "start_db": 70, "peak_db": 70, "avg_db": 70,
+            "threshold_db": 65.0, "music_like_score": 0.5,
+            "beat_confidence": 0.3, "classification": "other",
+            "mode": "respond",
+        }
+        iid = tmp_storage.create_incident(row)
+
+        # Only 1 hour old — well under the 6-hour limit
+        engine.active = {
+            "id": iid,
+            "start": datetime.now(timezone.utc) - timedelta(hours=1),
+            "dbs": [70],
+            "classification": "other",
+            "period": "day",
+            "responded": False,
+            "last_above": datetime.now(timezone.utc),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        block = np.zeros(8000, dtype=np.float32)
+        split = engine._check_duration_split(
+            db_now=70.0, threshold=65.0, mscore=0.5, bconf=0.3,
+            classification="other", block=block
+        )
+
+        assert split is False
+        assert engine.active["id"] == iid
+
+    def test_duration_split_below_threshold_no_continuation(self, base_cfg, tmp_storage, tmp_state):
+        """If dB drops below threshold at the split point, no new incident starts."""
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["audio"]["max_incident_record_hours"] = 1
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+
+        row = {
+            "start_ts": datetime.now(timezone.utc).isoformat(),
+            "start_db": 58, "peak_db": 60, "avg_db": 58,
+            "threshold_db": 55.0, "music_like_score": 0.5,
+            "beat_confidence": 0.3, "classification": "other",
+            "mode": "record_only",
+        }
+        iid = tmp_storage.create_incident(row)
+
+        engine.active = {
+            "id": iid,
+            "start": datetime.now(timezone.utc) - timedelta(hours=2),
+            "dbs": [58, 59, 60],
+            "classification": "other",
+            "period": "night",
+            "responded": False,
+            "last_above": datetime.now(timezone.utc),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        block = np.zeros(8000, dtype=np.float32)
+        # Current dB (50) is below threshold (55)
+        with patch("noise_warden.engine.is_night", return_value=True), \
+             patch.object(engine.ha, "publish_event"):
+            split = engine._check_duration_split(
+                db_now=50.0, threshold=55.0, mscore=0.5, bconf=0.3,
+                classification="other", block=block
+            )
+
+        assert split is True
+        assert engine.active is None
+        all_incidents = tmp_storage.list_incidents(limit=100)
+        assert len(all_incidents) == 1

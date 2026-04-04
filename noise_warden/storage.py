@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, sqlite3, csv, io
+import os, sqlite3, csv, io, glob, time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS incidents (
   deleted INTEGER DEFAULT 0
 );
 
+CREATE INDEX IF NOT EXISTS idx_incidents_start_ts ON incidents(start_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_incidents_deleted ON incidents(deleted);
+
 CREATE TABLE IF NOT EXISTS build_meta (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   notes TEXT DEFAULT '',
@@ -39,12 +42,21 @@ CREATE TABLE IF NOT EXISTS calibration_profiles (
 );
 '''
 
+# Increment this when adding migrations. Each migration runs exactly once.
+SCHEMA_VERSION = 1
+
 class Storage:
     def __init__(self, db_path: str):
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         with self.conn() as c:
+            # WAL mode: allows concurrent reads during engine writes (critical on Pi)
+            c.execute("PRAGMA journal_mode=WAL")
+            # NORMAL sync is safe with WAL — trades a tiny crash-window for much better
+            # write throughput on the Pi's slow I/O
+            c.execute("PRAGMA synchronous=NORMAL")
             c.executescript(SCHEMA)
+            self._run_migrations(c)
 
     @contextmanager
     def conn(self):
@@ -55,6 +67,23 @@ class Storage:
             c.commit()
         finally:
             c.close()
+
+    def _run_migrations(self, c):
+        """Run any pending schema migrations. Uses SQLite's built-in user_version pragma
+        to track the current schema version. Each migration block runs exactly once,
+        guarded by a version check. Add new migrations at the end with the next version number."""
+        current = c.execute("PRAGMA user_version").fetchone()[0]
+        if current >= SCHEMA_VERSION:
+            return
+
+        # Migration 1: baseline — indexes added via SCHEMA, WAL mode set in __init__
+        if current < 1:
+            print(f"[storage] Running migration to schema version 1")
+            # Indexes are created by SCHEMA above; this just stamps the version
+            pass
+
+        c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        print(f"[storage] Schema version now {SCHEMA_VERSION}")
 
     def create_incident(self, row: dict) -> int:
         with self.conn() as c:
@@ -149,7 +178,9 @@ class Storage:
         with self.conn() as c:
             return [dict(r) for r in c.execute("SELECT * FROM calibration_profiles ORDER BY id DESC").fetchall()]
 
-    def cleanup_old_snippets(self, retention_days: int):
+    def cleanup_old_snippets(self, retention_days: int, snippets_dir: str = None):
+        """Remove snippet files older than retention_days. Also purges the autodismissed/
+        quarantine folder of files older than the same retention window."""
         cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
         removed = 0
         with self.conn() as c:
@@ -167,6 +198,26 @@ class Storage:
                             removed += 1
                         except Exception:
                             pass
+
+        # Purge old quarantined drive-by snippets (moved, not deleted, by the engine)
+        if snippets_dir:
+            removed += self._cleanup_autodismissed(snippets_dir, retention_days)
+        return removed
+
+    @staticmethod
+    def _cleanup_autodismissed(snippets_dir: str, retention_days: int):
+        """Remove quarantined drive-by snippets older than retention_days.
+        These live in snippets/autodismissed/ and were preserved for manual review."""
+        quarantine_dir = os.path.join(snippets_dir, "autodismissed")
+        removed = 0
+        for filepath in glob.glob(os.path.join(quarantine_dir, "*.wav")):
+            try:
+                age_days = (time.time() - os.path.getmtime(filepath)) / 86400
+                if age_days > retention_days:
+                    os.remove(filepath)
+                    removed += 1
+            except OSError:
+                pass
         return removed
 
     def repair_stale_incidents(self):

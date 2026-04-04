@@ -279,3 +279,72 @@ class TestVacuum:
     def test_vacuum_does_not_error(self, tmp_storage):
         """VACUUM should complete without raising."""
         tmp_storage.vacuum()
+
+
+# ---------------------------------------------------------------------------
+# WAL mode + schema versioning
+# ---------------------------------------------------------------------------
+
+class TestWalAndSchema:
+
+    def test_wal_mode_enabled(self, tmp_path):
+        """Storage should initialize with WAL journal mode for safe concurrent access."""
+        db_path = str(tmp_path / "wal_test.db")
+        s = Storage(db_path)
+        import sqlite3
+        c = sqlite3.connect(db_path)
+        mode = c.execute("PRAGMA journal_mode").fetchone()[0]
+        c.close()
+        assert mode == "wal"
+
+    def test_schema_version_set(self, tmp_path):
+        """Storage should stamp user_version on fresh databases."""
+        db_path = str(tmp_path / "version_test.db")
+        s = Storage(db_path)
+        import sqlite3
+        c = sqlite3.connect(db_path)
+        version = c.execute("PRAGMA user_version").fetchone()[0]
+        c.close()
+        assert version >= 1
+
+    def test_start_ts_index_exists(self, tmp_path):
+        """The start_ts index should exist for query performance."""
+        db_path = str(tmp_path / "index_test.db")
+        s = Storage(db_path)
+        import sqlite3
+        c = sqlite3.connect(db_path)
+        indexes = [r[1] for r in c.execute("PRAGMA index_list(incidents)").fetchall()]
+        c.close()
+        assert "idx_incidents_start_ts" in indexes
+
+
+# ---------------------------------------------------------------------------
+# Autodismissed cleanup
+# ---------------------------------------------------------------------------
+
+class TestAutodismissedCleanup:
+
+    def test_cleanup_removes_old_quarantined_files(self, tmp_path):
+        """Files in autodismissed/ older than retention should be removed."""
+        snippets_dir = str(tmp_path / "snippets")
+        quarantine = os.path.join(snippets_dir, "autodismissed")
+        os.makedirs(quarantine)
+
+        # Create a "stale" WAV — set modification time to 60 days ago
+        old_file = os.path.join(quarantine, "old_incident.wav")
+        with open(old_file, "wb") as f:
+            f.write(b"RIFF" + b"\x00" * 40)
+        import time
+        old_mtime = time.time() - (60 * 86400)
+        os.utime(old_file, (old_mtime, old_mtime))
+
+        # Create a "fresh" WAV
+        new_file = os.path.join(quarantine, "new_incident.wav")
+        with open(new_file, "wb") as f:
+            f.write(b"RIFF" + b"\x00" * 40)
+
+        removed = Storage._cleanup_autodismissed(snippets_dir, retention_days=30)
+
+        assert removed == 1
+        assert not os.path.exists(old_file)
+        assert os.path.exists(new_file)

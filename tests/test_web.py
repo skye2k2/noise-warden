@@ -37,9 +37,13 @@ def web_app(base_cfg, tmp_path):
     with open(cfg_path, "w") as f:
         yaml.dump(base_cfg, f)
 
-    # Create static dirs
+    # Create static dirs and seed the sw.js file for the /sw.js route
     static_dir = str(tmp_path / "static")
     os.makedirs(os.path.join(static_dir, "build"), exist_ok=True)
+    import shutil
+    real_sw = os.path.join(os.path.dirname(__file__), "..", "static", "sw.js")
+    if os.path.exists(real_sw):
+        shutil.copy(real_sw, os.path.join(static_dir, "sw.js"))
 
     # Set env var BEFORE importing web module, so load_yaml() finds the config
     os.environ["NOISE_WARDEN_CONFIG"] = cfg_path
@@ -389,3 +393,78 @@ class TestCalibrationApply:
 
         # Restore
         web_mod.cfg["detection"]["calibration_offset_db"] = original
+
+
+# ---------------------------------------------------------------------------
+# Timeline (offline-first visual calendar)
+# ---------------------------------------------------------------------------
+
+class TestTimeline:
+
+    def test_timeline_embeds_incident_json(self, client, storage):
+        """The timeline page must embed all incident data as JSON for client-side rendering."""
+        storage.create_incident({
+            "start_ts": "2026-04-01T22:00:00Z", "start_db": 72, "peak_db": 72, "avg_db": 72,
+            "threshold_db": 55, "music_like_score": 0.5, "beat_confidence": 0.3,
+            "classification": "noise", "mode": "record_only",
+        })
+        resp = client.get("/timeline")
+        assert resp.status_code == 200
+        # JSON blob must appear in the rendered HTML
+        assert "INCIDENTS" in resp.text
+        assert '"start_db": 72' in resp.text or '"start_db":72' in resp.text
+
+    def test_timeline_embeds_ordinance_json(self, client):
+        """Ordinance data must be embedded for the popup threshold comparison."""
+        resp = client.get("/timeline")
+        assert "ORDINANCE" in resp.text
+        assert "Pleasant Grove" in resp.text
+
+    def test_timeline_has_snippet_flag(self, client, storage, tmp_path):
+        """Incidents with snippet files should have has_snippet=true in the JSON."""
+        wav = tmp_path / "test.wav"
+        wav.write_bytes(b"RIFF" + b"\x00" * 40)
+        storage.create_incident({
+            "start_ts": "2026-04-01T22:00:00Z", "start_db": 70, "peak_db": 70, "avg_db": 70,
+            "threshold_db": 55, "music_like_score": 0.5, "beat_confidence": 0.3,
+            "classification": "noise", "mode": "record_only", "snippet_path": str(wav),
+        })
+        resp = client.get("/timeline")
+        assert '"has_snippet": true' in resp.text or '"has_snippet":true' in resp.text
+
+    def test_timeline_view_param_preserved(self, client):
+        """The view parameter should be reflected in the rendered JS state."""
+        resp = client.get("/timeline?view=week")
+        assert resp.status_code == 200
+        assert "'week'" in resp.text
+
+    def test_timeline_no_server_paths_leaked(self, client, storage, tmp_path):
+        """Server-side snippet_path must NOT appear in the rendered HTML."""
+        wav = tmp_path / "secret_path.wav"
+        wav.write_bytes(b"RIFF" + b"\x00" * 40)
+        storage.create_incident({
+            "start_ts": "2026-04-01T22:00:00Z", "start_db": 70, "peak_db": 70, "avg_db": 70,
+            "threshold_db": 55, "music_like_score": 0.5, "beat_confidence": 0.3,
+            "classification": "noise", "mode": "record_only", "snippet_path": str(wav),
+        })
+        resp = client.get("/timeline")
+        assert "secret_path.wav" not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Service Worker route
+# ---------------------------------------------------------------------------
+
+class TestServiceWorker:
+
+    def test_sw_returns_200(self, client):
+        resp = client.get("/sw.js")
+        assert resp.status_code == 200
+
+    def test_sw_content_type(self, client):
+        resp = client.get("/sw.js")
+        assert "javascript" in resp.headers.get("content-type", "")
+
+    def test_sw_contains_cache_strategy(self, client):
+        resp = client.get("/sw.js")
+        assert "noise-warden-timeline" in resp.text

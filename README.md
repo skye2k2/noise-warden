@@ -52,6 +52,10 @@ These are the defaults. Configuration supports any jurisdiction's thresholds.
   - 90% availability on two cores at 1GHz+ (process needs to be immediately responsive)
   - 3GB available RAM (only needed when tracking extremely long-running incidents)
   - However much storage space you want to dedicate to evidence recording
+    - At the default 22,050 Hz sample rate: ~2.6 MB/min (~3.7 GB/day of continuous recording)
+    - At 44,100 Hz (CD quality): ~5.3 MB/min (~7.6 GB/day)
+    - At 48,000 Hz (studio quality): ~5.8 MB/min (~8.3 GB/day)
+    - For storage-limited deployments (≤16 GB SD), stick with 22,050 Hz and consider a shorter `retention_days`
 
   > I highly recommend a Pi 4+, as the increased CPU and RAM speed helps cut down on processing time, which in turn actually keeps the overhead of the system low.
 
@@ -89,7 +93,7 @@ The project uses a symlinked versioning layout that keeps **code disposable** an
 
 ```
 /opt/noise-warden/
-├── current -> /opt/noise-warden/noise-warden-v6   # symlink to active version
+├── current -> /opt/noise-warden/noise-warden-v7   # symlink to active version
 ├── deploy_noise_warden.sh                          # version-swap script (lives outside any version)
 ├── venv/                                           # shared Python virtualenv
 ├── shared/                                         # persistent data — survives upgrades
@@ -98,8 +102,8 @@ The project uses a symlinked versioning layout that keeps **code disposable** an
 │   ├── playlist/
 │   └── build/
 │       └── build_photo.jpg
-├── noise-warden-v5/                                # previous version (kept for rollback)
-└── noise-warden-v6/                                # active version
+├── noise-warden-v7/                                # previous version (kept for rollback)
+└── noise-warden-v8/                                # active version
 ```
 
 Key invariants:
@@ -111,7 +115,7 @@ Key invariants:
 
 1. Transfer the version archive to the Pi:
     ```bash
-    scp noise-warden-v6.zip pi@<pi-ip>:~
+    scp noise-warden-v7.zip pi@<pi-ip>:~
     ```
 
 2. SSH in and set up the base directory structure:
@@ -120,8 +124,8 @@ Key invariants:
     sudo mkdir -p /opt/noise-warden
     sudo chown -R $USER:$USER /opt/noise-warden
     cd /opt/noise-warden
-    mv ~/noise-warden-v6.zip .
-    unzip noise-warden-v6.zip
+    mv ~/noise-warden-v7.zip .
+    unzip noise-warden-v7.zip
     ```
 
 3. Install system-level dependencies (these are not managed by pip):
@@ -131,7 +135,7 @@ Key invariants:
 
 4. Run the install script from inside the version directory:
     ```bash
-    cd noise-warden-v6
+    cd noise-warden-v7
     bash scripts/install_pi.sh
     ```
     This will: create the `shared/` data directories, create a Python venv at `/opt/noise-warden/venv/`, install pip dependencies, copy `deploy_noise_warden.sh` up to the base directory, set the `current` symlink, create a `noisewarden` system user, and install the systemd service unit.
@@ -183,7 +187,7 @@ When you have a new version ready:
 If something goes sideways:
 ```bash
 cd /opt/noise-warden
-./deploy_noise_warden.sh noise-warden-v6
+./deploy_noise_warden.sh noise-warden-v7
 ```
 
 That's it. Previous version is still on disk, data is still in `shared/`.
@@ -200,6 +204,14 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 |---------|---------|
 | `site` | City name and ordinance reference |
 | `audio` | Sample rate, block size, device selection, mic calibration offset, secondary/reference mic toggles, snippet pre/post buffer durations |
+
+**Recording quality**: The `audio.sample_rate` setting controls recording fidelity. Three options are available via the Calibration page or config YAML:
+
+| Rate | Label | Frequency ceiling | Disk usage | Notes |
+|------|-------|-------------------|------------|-------|
+| 22,050 Hz | Wideband | 11 kHz | ~2.6 MB/min | Default. Captures all A-weighted energy for dB calculations. Good balance of fidelity and size |
+| 44,100 Hz | CD quality | 22 kHz | ~5.3 MB/min | Full audible spectrum. Recordings sound natural to any listener |
+| 48,000 Hz | Studio quality | 24 kHz | ~5.8 MB/min | Professional standard. Marginal benefit over 44,100 for evidence purposes |
 | `gpio` | Relay pin, active-high/low, enable toggle |
 | `response` | Daytime audio response toggle, playlist directory, player command, amp power-on delay |
 | `rules` | Day/night schedule, dB thresholds, evaluation interval, release/merge/minimum duration timings, hysteresis |
@@ -263,18 +275,37 @@ pytest tests/ -v -s
 |------|--------|
 | `test_config.py` | YAML loading, validation, required sections, error paths |
 | `test_dsp.py` | RMS/dBFS math, A-weighting, spectrum features, beat confidence, music score, exclusion filters |
-| `test_engine.py` | Lifecycle, incident creation, disarmed skip, error recovery, drive-by detection, disk quota, weighted avg dB |
+| `test_engine.py` | Lifecycle, incident creation, disarmed skip, error recovery, drive-by detection, drive-by quarantine, disk quota, disk-full recording stop, weighted avg dB, device validation, day/night boundary split, max duration split |
 | `test_ordinance.py` | Threshold lookups, day/night boundary edge cases, ordinance data integrity |
 | `test_response.py` | PlaylistPlayer file selection, shlex command parsing, RelayController |
 | `test_state.py` | StateStore get/set, snapshot isolation, thread safety |
-| `test_storage.py` | Incident CRUD, soft delete, pagination, CSV export, snippet cleanup, stale repair, vacuum |
-| `test_web.py` | All GET pages, API endpoints, POST mutations, auth enforcement, recording toggle, calibration apply |
+| `test_storage.py` | Incident CRUD, soft delete, pagination, CSV export, snippet cleanup, autodismissed cleanup, stale repair, vacuum, WAL mode, schema versioning, index existence |
+| `test_web.py` | All GET pages, API endpoints, POST mutations, auth enforcement, recording toggle, calibration apply, timeline JSON embedding, SW route, path leak prevention |
 
 ## Notes on legal / practical reality
 
 - My local noise ordinance says measurements should align to ANSI Type 1/2 instruments, but this is **not** one. The code mirrors the *logic* (A-weighted, slow/fast behavior, day/night thresholds) but is _not_ certification-grade.
 - My ordinance also states measurements are not strictly required if other evidence/testimony shows a disturbance. This makes my log + timestamps + trend data useful even if my meter is not admissible as a formal calibrated instrument.
 - Use the response mode conservatively. The most defensible and neighbor-safe deployment is: **log always, manual review, response disabled by default until calibrated and tested**.
+
+### Database backup
+
+All incident history lives in a single SQLite file (`shared/noise_warden.db`). SD card failure = total loss. Set up periodic backups:
+
+```bash
+# /opt/noise-warden/backup_db.sh
+#!/bin/bash
+BACKUP_DIR=/opt/noise-warden/backups
+mkdir -p "$BACKUP_DIR"
+sqlite3 /opt/noise-warden/shared/noise_warden.db ".backup $BACKUP_DIR/noise_warden_$(date +%Y-%m-%d).db"
+# Keep 30 days of backups
+find "$BACKUP_DIR" -name '*.db' -mtime +30 -delete
+```
+
+Add to crontab (`crontab -e`):
+```
+0 */6 * * * /opt/noise-warden/backup_db.sh
+```
 
 ## [CHANGELOG](docs/CHANGELOG.md)
 
@@ -288,10 +319,10 @@ pytest tests/ -v -s
 - ~~TODO: Restore "Clear All Incidents" action — RESOLVED in v5: POST `/incidents/clear` with soft-delete-all and confirmation dialog in template.~~
 - ~~TODO: Throttle MQTT `publish_state()` — RESOLVED in v5: fires every ~5 seconds instead of every 0.5s loop (~12 msgs/min vs. ~120).~~
 - TODO: Re-integrate GPIO relay control — `RelayController` is currently a boolean flag with no hardware interaction (`gpiozero` dependency removed)
-- TODO: Visual timeline redesign — vertical Google Calendar-style view with day/week/month spreads, incident blocks labeled by start dB and duration. Clicking an event should open a detail popup showing exact start/stop time, duration, ordinance vs. violation comparison (excess dB called out), and playback controls for associated WAV snippets. Current template is text-only cards.
+- ~~TODO: Visual timeline redesign — vertical Google Calendar-style view with day/week/month spreads, incident blocks labeled by start dB and duration. Clicking an event should open a detail popup showing exact start/stop time, duration, ordinance vs. violation comparison (excess dB called out), and playback controls for associated WAV snippets. Current template is text-only cards. RESOLVED in v7: full visual calendar with day/week/month views, severity-colored incident blocks, click-to-detail popup with excess dB badge, offline-first via Service Worker (network-first for page, cache-first for snippets), and 24-hour snippet pre-caching.~~
 - ~~TODO: Wire `sustain_blocks_required` and `release_blocks_required` config values — RESOLVED in v5: dead config keys removed.~~
-- ~~TODO: Drive-by homie detection — RESOLVED in v6: `_looks_like_driveby()` checks short incidents for fade-out pattern and auto-soft-deletes matches. Configurable via `driveby_max_duration_sec` and `driveby_fade_tail_fraction`.~~
-- ~~TODO: Recording space quota with warnings — RESOLVED in v6: `_check_disk_quota()` runs at startup and daily; warns when free space drops below `disk_quota_warn_mb` (default 500 MB). Publishes `disk_free_mb` and `disk_warning` to state.~~
+- ~~TODO: Drive-by homie detection — RESOLVED in v6: `_looks_like_driveby()` checks short incidents for fade-out pattern and auto-soft-deletes matches. Configurable via `driveby_max_duration_sec` and `driveby_fade_tail_fraction`. ENHANCED in v7: auto-dismissed snippets quarantined to `snippets/autodismissed/` instead of deleted, with configurable retention cleanup.~~
+- ~~TODO: Recording space quota with warnings — RESOLVED in v6: `_check_disk_quota()` runs at startup and daily; warns when free space drops below `disk_quota_warn_mb` (default 500 MB). Publishes `disk_free_mb` and `disk_warning` to state. ENHANCED in v7: critical 50 MB floor proactively stops active recording; `_append_audio()` catches write failures gracefully (preserves partial WAV).~~
 - ~~TODO: Elegant dashboard auto-refresh solution — RESOLVED in v6: JS polls `/api/state` every 5 seconds and updates pill elements in-place. Zero database reads (in-memory StateStore).~~
 - TODO: `disk_free_mb` and `disk_warning` are not in the `StateStore` initial schema — they get added dynamically after the first quota check, so `/api/state` consumers see an inconsistent shape until then
 - TODO: Dashboard polling does not surface `disk_warning` — a low-disk situation logs to stdout but is invisible in the web UI (add a pill or banner)
@@ -306,7 +337,7 @@ pytest tests/ -v -s
 - ~~**`RuntimeState` uses bare class attributes** — RESOLVED in v3: replaced with plain dict `engine.state`.~~
 - ~~**Ring buffer `push()` is O(n) per sample** — RESOLVED in v3: replaced with block-level deque in `AudioCapture`.~~
 - ~~**No thread safety on shared engine state** — RESOLVED in v4: `StateStore` uses `threading.Lock` on all reads/writes; `snapshot()` returns `copy.deepcopy()`.~~
-- ~~**Silent audio capture failure** — RESOLVED in v4: engine loop body wrapped in `try/except`; on error sets `state.mic_ok=False`, `state.last_error`, `state.mode="error"`, sleeps 1s and retries.~~
+- ~~**Silent audio capture failure** — RESOLVED in v4: engine loop body wrapped in `try/except`; on error sets `state.mic_ok=False`, `state.last_error`, `state.mode="error"`, sleeps 1s and retries. ENHANCED in v7: tiered exception handling — `PortAudioError`/`OSError` triggers automatic mic reconnection with device fingerprint validation and 2s backoff; periodic device health checks during cleanup intervals.~~
 - ~~**Config save accepts arbitrary text without validation** — RESOLVED in v4: `save_yaml_text_validated()` parses and validates YAML before writing; errors returned via redirect message.~~
 - ~~**`engine.stop()` defined but never called** — RESOLVED in v4: FastAPI `lifespan` context manager calls `engine.stop()` on shutdown.~~
 - ~~**Event audio frames accumulate unbounded in RAM** — RESOLVED in v4: WAV written to disk in append mode via `soundfile.SoundFile` during capture; only pre-roll blocks briefly held in memory.~~

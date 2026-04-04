@@ -1,5 +1,60 @@
 # noise-warden CHANGELOG
 
+## v7 - 2026-04-04 — "Show Me the Evidence Edition"
+
+Visual timeline redesign with offline-first architecture, plus a comprehensive deployment-hardening pass addressing silent failure modes, data integrity, and operational resilience. The primary use case is presenting cached noise incident data — including audio snippets — to authorities without network access, and having the system survive real-world Pi deployment conditions.
+
+<details>
+
+<summary>Key details</summary>
+
+### Timeline
+
+- **Visual calendar views** — day (single tall column, 40px/hr), week (7 columns), and month (compact colored pips). All view switching is client-side with zero network requests after initial page load
+- **Severity-colored incident blocks** — amber (< 5 dB over), orange (5–10), red (10–15), deep red (> 15 dB over threshold)
+- **Click-to-detail popup** — prominent excess dB badge (the hero element), ordinance threshold comparison, peak/avg readings, duration, classification, notes, and inline audio playback
+- **All incident data embedded as JSON** — 30 days of incidents serialized into the page at render time. Detail popups, view switches, and navigation all read from this local dataset (zero extra database calls)
+- **Server-side path scrubbing** — `snippet_path` is never sent to the client; only a `has_snippet` boolean is exposed
+
+### Offline-first architecture
+
+- **Service Worker** (`static/sw.js`) — network-first for the timeline page (normalized cache key strips query params so `?view=day` and `?view=week` share one entry), cache-first for audio snippets, pass-through for everything else
+- **Snippet pre-caching** — on page load, fetches all snippets from the most recent 24 hours through the SW, which intercepts and caches each response
+- **Offline status indicator** — `navigator.onLine` events update a status line; cached data remains fully navigable
+- **Root-scoped `/sw.js` route** — SW is served from the application root (not `/static/`) so it can intercept `/timeline` and `/snippets/*` requests
+
+### Database hardening
+
+- **WAL mode enabled** — `PRAGMA journal_mode=WAL` + `PRAGMA synchronous=NORMAL` in `Storage.__init__()`. Prevents blocking and corruption from concurrent engine writes + web reads on Pi
+- **Schema migration framework** — `PRAGMA user_version` tracks the current schema version. `_run_migrations()` runs versioned migration blocks exactly once. Future column additions won't break existing databases
+- **Query performance indexes** — `idx_incidents_start_ts` (DESC) and `idx_incidents_deleted` added to the schema. Timeline and incident list queries no longer full-scan on large datasets
+
+### Audio resilience
+
+- **Recording quality configurable** — default sample rate raised from 16,000 Hz to 22,050 Hz (wideband). Three options available via calibration page UI or config YAML: 22,050 Hz (wideband, ~2.6 MB/min), 44,100 Hz (CD quality, ~5.3 MB/min), 48,000 Hz (studio, ~5.8 MB/min). All DSP functions work at any rate — only playback fidelity changes. Server-side validation rejects invalid rates
+- **Audio loop reconnection** — `PortAudioError` and `OSError` exceptions in the audio loop now reinitialize `AudioCapture` instead of spinning on a dead handle. 2-second backoff between retries
+- **Mic device validation** — `AudioCapture.validate_device()` fingerprints the input device at startup (name + channels + sample rate). Periodic validation (daily) detects silent mic replacement or system default changes. Mismatch sets `mic_ok=False` with a descriptive error
+- **Disk full graceful degradation** — `_append_audio()` catches write failures and disables recording for the active incident (dB monitoring continues). `_check_disk_quota()` proactively stops recording at 50 MB free (hard floor), before writes start failing. Partial WAVs are preserved
+- **Day/night boundary split** — if an active incident crosses a day/night boundary, the engine finalizes the current segment and immediately begins a new incident with the updated threshold. Each segment carries its own period-specific threshold for accurate timeline display. If the noise drops below the new period's threshold, the old incident simply finalizes with no continuation
+- **Max duration split** — `max_incident_record_hours` config (default 6) is now enforced. Long incidents are automatically split at the configured boundary, capping WAV file size and in-memory dB array growth. A new segment starts immediately if noise is still above threshold. Previously this config key was dead code
+
+### Drive-by evidence safety
+
+- **Quarantine, not delete** — `_finalize_incident()` now moves auto-dismissed drive-by snippets to `snippets/autodismissed/` instead of permanently deleting them. Files are preserved for manual review
+- **Quarantine cleanup** — `cleanup_old_snippets()` purges `autodismissed/` files older than `retention_days`, same as regular snippets
+
+### Operational improvements
+
+- **Systemd unit hardened** — `TimeoutStopSec=15` (prevents hanging on shutdown), `Restart=on-failure` (not `always`), `RestartSec=10` (avoids tight crash loops), `StartLimitBurst=5` / `StartLimitIntervalSec=120` (rate-limits restarts)
+- **Timezone validation** — new `detection.expected_timezone` config key (e.g., `America/Denver`). Engine startup checks the Pi's system timezone against the expected value and warns if they differ, since day/night threshold selection uses local time
+- **DB backup guidance** — README now includes a recommended backup script and crontab entry
+
+### Maintenance
+
+- Test suite expanded to 184 tests (13 new: WAL mode, schema versioning, index existence, autodismissed cleanup, drive-by quarantine, disk-full recording stop, device validation, day/night boundary split, max duration split)
+
+</details>
+
 ## v6 - 2026-04-04 — "Self-Aware Housekeeping Edition"
 
 Security hardening, operational polish, and closing the loop on several long-standing paper cuts. The engine now cleans up after itself on startup (stale incidents, expired snippets, DB vacuum, disk quota), the dashboard refreshes itself, drive-bys get auto-dismissed, calibration profiles can be applied with one click, and recording can be toggled from the UI.
@@ -39,7 +94,7 @@ Security hardening, operational polish, and closing the loop on several long-sta
 - Removed unused `snippets_dir` parameter from `cleanup_old_snippets()`
 - Removed unused `rule_name` variable in engine loop
 - Static analysis warnings resolved across all source and test files (unused variables, float equality in tests, etc.)
-- Test suite expanded to 155 tests covering drive-by detection, disk quota, weighted avg dB, thresholds page, and calibration apply
+- Test suite expanded to 163 tests covering drive-by detection, disk quota, weighted avg dB, thresholds page, and calibration apply
 - README deployment instructions rewritten: deployment architecture diagram, first-time install, iterative upgrade workflow, and rollback procedure
 
 </details>

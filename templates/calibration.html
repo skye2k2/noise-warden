@@ -36,6 +36,29 @@
 </div>
 
 <div class="card">
+  <h2>Recording Quality</h2>
+  <p class="small">
+    Higher sample rates capture more high-frequency detail (cymbals, harmonics) and produce
+    more natural-sounding evidence recordings, but use more disk space.
+  </p>
+  <form method="post" action="/calibration/sample-rate">
+    <label for="sr-select"><b>Sample rate:</b></label>
+    <select id="sr-select" name="sample_rate">
+      <option value="22050" {% if cfg.audio.sample_rate == 22050 %}selected{% endif %}>22,050 Hz — Wideband (≈2.6 MB/min, recommended)</option>
+      <option value="44100" {% if cfg.audio.sample_rate == 44100 %}selected{% endif %}>44,100 Hz — CD quality (≈5.3 MB/min)</option>
+      <option value="48000" {% if cfg.audio.sample_rate == 48000 %}selected{% endif %}>48,000 Hz — Studio quality (≈5.8 MB/min)</option>
+    </select>
+    <button type="submit">Apply</button>
+    <span class="small" style="margin-left:8px">(requires restart)</span>
+  </form>
+  <p class="small" style="margin-top:8px">
+    Current: <b>{{ cfg.audio.sample_rate }} Hz</b>. For storage-limited Pi deployments (≤16 GB SD),
+    22,050 Hz keeps file sizes manageable. All rates capture the A-weighted energy range used for
+    dB calculations; higher rates only improve playback fidelity.
+  </p>
+</div>
+
+<div class="card">
   <h2>Manual Calibration</h2>
   <p>If you prefer to calibrate without a reference source:</p>
   <ul>

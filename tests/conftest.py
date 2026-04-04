@@ -41,7 +41,7 @@ def _minimal_cfg_dict(tmp_dir):
             "auth_token": "",
         },
         "audio": {
-            "sample_rate": 16000,
+            "sample_rate": 22050,
             "block_seconds": 0.5,
             "input_device": None,
             "input_channels": 1,
@@ -136,7 +136,7 @@ def base_cfg(tmp_path):
             "auth_token": "",
         },
         "audio": {
-            "sample_rate": 16000,
+            "sample_rate": 22050,
             "block_seconds": 0.5,
             "input_device": None,
             "input_channels": 1,

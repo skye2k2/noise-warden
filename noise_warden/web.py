@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, io
+import json, os, io
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
@@ -101,12 +101,42 @@ def get_snippet(request: Request, incident_id: int):
     # FileResponse manages the file handle lifecycle properly
     return FileResponse(row["snippet_path"], media_type="audio/wav")
 
+@app.get("/sw.js")
+def service_worker():
+    """Serve the Service Worker from root scope so it can intercept /timeline and /snippets/ requests."""
+    return FileResponse(os.path.join(static_dir, "sw.js"), media_type="application/javascript")
+
 @app.get("/timeline", response_class=HTMLResponse)
 def timeline(request: Request, view: str = "day"):
-    since = since_for_view(view)
+    # Always load 30 days — all view switching is client-side (zero extra requests)
+    since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     rows = storage.list_incidents(limit=5000, since=since)
+
+    # Build client-safe incident list (server-side paths excluded for security)
+    incidents = []
+    for r in rows:
+        incidents.append({
+            "id": r["id"],
+            "start_ts": r["start_ts"],
+            "end_ts": r.get("end_ts"),
+            "duration_sec": r.get("duration_sec"),
+            "start_db": r.get("start_db"),
+            "peak_db": r.get("peak_db"),
+            "avg_db": r.get("avg_db"),
+            "threshold_db": r.get("threshold_db"),
+            "music_like_score": r.get("music_like_score"),
+            "classification": r.get("classification", ""),
+            "mode": r.get("mode", ""),
+            "responded": bool(r.get("responded")),
+            "notes": r.get("notes", ""),
+            "has_snippet": bool(r.get("snippet_path")),
+        })
+
     return templates.TemplateResponse("timeline.html", {
-        "request": request, "rows": rows, "view": view
+        "request": request,
+        "view": view,
+        "incidents_json": json.dumps(incidents),
+        "ordinance_json": json.dumps(ORDINANCE),
     })
 
 @app.get("/config", response_class=HTMLResponse)
@@ -187,6 +217,36 @@ def calibration_apply(request: Request, offset_db: float = Form(...)):
         return RedirectResponse(url=f"/calibration?msg=apply-error:{e}", status_code=303)
 
     return RedirectResponse(url="/calibration?msg=applied", status_code=303)
+
+VALID_SAMPLE_RATES = {22050, 44100, 48000}
+
+@app.post("/calibration/sample-rate")
+def set_sample_rate(request: Request, sample_rate: int = Form(...)):
+    """Update sample rate in config YAML. Requires a service restart to take effect
+    because AudioCapture is initialized once at engine startup."""
+    must_auth(request)
+    if sample_rate not in VALID_SAMPLE_RATES:
+        return RedirectResponse(
+            url=f"/calibration?msg=error:invalid sample rate {sample_rate}", status_code=303
+        )
+
+    cfg["audio"]["sample_rate"] = sample_rate
+
+    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    try:
+        import re
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        updated = re.sub(
+            r"(sample_rate:\s*)\d+",
+            rf"\g<1>{sample_rate}",
+            raw
+        )
+        save_yaml_text_validated(cfg_path, updated)
+    except Exception as e:
+        return RedirectResponse(url=f"/calibration?msg=apply-error:{e}", status_code=303)
+
+    return RedirectResponse(url="/calibration?msg=sample-rate-updated-restart-required", status_code=303)
 
 @app.post("/control/pause")
 def pause(request: Request):

@@ -7,7 +7,7 @@ app:
   auth_token: ""  # optional bearer token; blank disables auth (LAN only)
 
 audio:
-  sample_rate: 16000
+  sample_rate: 22050       # 22050 (wideband), 44100 (CD quality), or 48000 (studio). Lower = smaller files
   block_seconds: 0.5
   input_device: null
   input_channels: 1
@@ -22,6 +22,9 @@ detection:
   zone: residential_agricultural
   mode: continuous_music_focus   # continuous | intermittent | continuous_music_focus
   calibration_offset_db: 88.0
+  # Day/night thresholds use the Pi's system clock. Ensure `timedatectl set-timezone`
+  # matches the ordinance jurisdiction (e.g. America/Denver for Pleasant Grove, UT).
+  expected_timezone: America/Denver  # For startup validation only — not used for time math
   night_start_hour: 22
   night_end_hour: 7
   song_gap_merge_sec: 12
