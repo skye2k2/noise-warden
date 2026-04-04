@@ -1,0 +1,35 @@
+# Example Home Assistant REST commands / sensors
+
+rest_command:
+  noise_warden_arm:
+    url: "http://PI_IP:8787/api/arm"
+    method: POST
+    headers:
+      Authorization: "Bearer change-me"
+
+  noise_warden_disarm:
+    url: "http://PI_IP:8787/api/disarm"
+    method: POST
+    headers:
+      Authorization: "Bearer change-me"
+
+  noise_warden_kill:
+    url: "http://PI_IP:8787/api/kill"
+    method: POST
+    headers:
+      Authorization: "Bearer change-me"
+
+sensor:
+  - platform: rest
+    name: noise_warden_status
+    resource: "http://PI_IP:8787/api/status"
+    value_template: "{{ value_json.last_classification }}"
+    json_attributes:
+      - armed
+      - manual_kill
+      - response_active
+      - current_db
+      - current_slow_db
+      - current_fast_db
+      - active_incident_id
+      - last_update

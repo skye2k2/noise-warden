@@ -1,0 +1,69 @@
+app:
+  host: "0.0.0.0"
+  port: 8787
+  log_level: "INFO"
+
+audio:
+  input_device_name: "USB Audio"
+  sample_rate: 48000
+  channels: 1
+  block_seconds: 0.125
+  calibration_offset_db: 0.0
+  # crude self-playback suppression by muting detection while output active + cooldown
+  suppress_detection_while_playing: true
+  suppress_after_stop_seconds: 2.0
+
+classification:
+  # ordinance-aware thresholds (residential)
+  day_continuous_db: 65.0
+  night_continuous_db: 55.0
+  day_intermittent_db: 70.0
+  night_intermittent_db: 60.0
+
+  # your policy
+  ignore_impulse_noise: true
+  night_record_only: true
+
+  # trigger policy (tune carefully)
+  trigger_mode: "continuous_or_music"
+  trigger_persist_seconds: 8.0
+  clear_below_seconds: 12.0
+  min_event_seconds: 4.0
+
+  # "intermittent" suppression: likely drive-bys / passers
+  intermittent_max_on_cycle: 0.10
+  intermittent_max_continuous_seconds: 360.0
+
+  # spectral heuristics
+  music_min_spectral_flux: 0.02
+  music_min_bandwidth_hz: 250.0
+  bass_pulse_min_rate_hz: 0.8
+  bass_pulse_max_rate_hz: 4.5
+  bass_band_low_hz: 30.0
+  bass_band_high_hz: 180.0
+  mower_tonal_band_low_hz: 80.0
+  mower_tonal_band_high_hz: 500.0
+  mower_max_flatness: 0.20
+  mower_min_tonal_ratio: 2.8
+
+playback:
+  enabled: false
+  player: "vlc"
+  playlist_path: "/home/pi/noise-warden/media/playlist.m3u"
+  amp_gpio_pin: 17
+  amp_power_on_delay_ms: 300
+  amp_power_off_delay_ms: 0
+  max_play_minutes: 20
+
+logging:
+  db_path: "./data/noise_warden.db"
+  retention_days: 90
+
+web:
+  static_dir: "./web/static"
+  templates_dir: "./web/templates"
+
+home_assistant:
+  enabled: true
+  # optional simple bearer token for REST actions
+  api_token: "change-me"
