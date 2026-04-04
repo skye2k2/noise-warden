@@ -1,0 +1,9 @@
+{% extends "base.html" %}{% block content %}
+<div class="card"><h2>Dashboard</h2><div id="status">Loading...</div>
+<p class="small">Updates every 5 seconds. Cached fallback if temporarily unreachable.</p>
+<button onclick="postAction('/api/arm')">Arm</button>
+<button onclick="postAction('/api/disarm')">Disarm / Emergency Kill</button>
+<button onclick="window.location='/api/incidents/export.csv'">Export CSV</button>
+<button onclick="postAction('/api/incidents/clear')">Clear All Incidents</button></div>
+<div class="card"><h3>Recent Incidents</h3><div id="incidents">Loading...</div></div>
+<script>startDashboard();</script>{% endblock %}

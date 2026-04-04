@@ -1,0 +1,58 @@
+site:
+  city_name: Pleasant Grove
+  ordinance_reference: "Pleasant Grove Code - Public Disturbances / Residential measurement section"
+
+audio:
+  sample_rate: 48000
+  block_seconds: 1.0
+  channels_primary: 1
+  primary_device: null
+  channels_secondary: 1
+  secondary_device: null
+  channels_reference: 1
+  reference_device: null
+  enable_secondary_mic: false
+  enable_reference_input: false
+  snippet_pre_seconds: 15
+  snippet_post_seconds: 10
+
+gpio:
+  enable_relay: true
+  relay_pin: 17
+  relay_active_high: true
+
+response:
+  enable_daytime_response: false
+  playlist_dir: "./media/playlist"
+  player_command: "ffplay -nodisp -autoexit -loglevel quiet {file}"
+  amp_power_on_delay_sec: 0.75
+
+rules:
+  night_start: "22:00"
+  night_end: "07:00"
+  residential_day_threshold_db: 60.0
+  residential_night_threshold_db: 55.0
+  evaluation_interval_sec: 10
+  release_below_threshold_sec: 20
+  song_gap_merge_sec: 10
+  min_event_duration_sec: 15
+  hysteresis_db: 3.0
+
+filters:
+  exclude_impulse: true
+  impulse_peak_delta_db: 18.0
+  exclude_driveby: true
+  driveby_max_duration_sec: 18
+  exclude_mower_like: true
+  exclude_thunder_like: true
+  thunder_impulse_delta_db: 22.0
+  thunder_low_band_hz_max: 120.0
+  thunder_taper_window_sec: 6
+  exclude_rain_like: true
+  rain_flatness_threshold: 0.65
+  rain_band_energy_spread_threshold: 0.75
+
+web:
+  host: "0.0.0.0"
+  port: 8787
+  refresh_seconds: 5
