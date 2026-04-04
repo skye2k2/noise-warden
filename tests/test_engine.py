@@ -141,6 +141,8 @@ class TestEngineProcessing:
         base_cfg["detection"]["mode"] = "continuous"
         # Disable recording to avoid WAV file I/O in test
         base_cfg["audio"]["recording_enabled"] = False
+        # Disable drive-by filter — our short test signal would be auto-dismissed
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
 
         # Generate several loud blocks — RMS of amplitude=0.8 sine ≈ -1.9 dBFS + 88 offset ≈ 86 dBA
         loud_blocks = [_make_sine_block(amplitude=0.8) for _ in range(5)]
@@ -220,7 +222,146 @@ class TestEngineErrorHandling:
                 engine.stop()
 
         # Engine should have recorded the error at some point
-        snap = tmp_state.snapshot()
         # After stop, mode is "stopped", but last_error should have been set during the failure
         # (It may have been cleared if recovery succeeded, but the engine survived — that's the key)
         assert call_count >= 2, "Engine should have retried after error"
+
+
+# ---------------------------------------------------------------------------
+# Drive-by auto-dismiss detection
+# ---------------------------------------------------------------------------
+
+class TestDriveByDetection:
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_short_fadeout_is_driveby(self, base_cfg, tmp_storage, tmp_state):
+        """A short incident with a clear fade-out tail should be detected as a drive-by."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        # Simulate: rise to peak then monotonic fade-out over ~10 seconds (20 blocks at 0.5s)
+        dbs = [60, 65, 70, 72, 74, 75, 74, 72, 70, 68, 66, 64, 62, 60, 58, 56]
+        assert engine._looks_like_driveby(dbs, duration_sec=8.0)
+
+    def test_pure_fadeout_is_driveby(self, base_cfg, tmp_storage, tmp_state):
+        """A short incident that only fades out (caught mid-pass) should also match."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        dbs = [75, 73, 71, 69, 67, 65, 63, 61]
+        assert engine._looks_like_driveby(dbs, duration_sec=4.0)
+
+    def test_sustained_noise_is_not_driveby(self, base_cfg, tmp_storage, tmp_state):
+        """A long incident above the duration limit should not be a drive-by."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        dbs = [70, 72, 71, 70, 72, 73, 71, 70, 69, 68]
+        assert not engine._looks_like_driveby(dbs, duration_sec=45.0)
+
+    def test_rising_noise_is_not_driveby(self, base_cfg, tmp_storage, tmp_state):
+        """A short incident with rising dB readings lacks a fade-out and should not match."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        dbs = [60, 62, 64, 66, 68, 70, 72, 74]
+        assert not engine._looks_like_driveby(dbs, duration_sec=4.0)
+
+    def test_too_few_samples(self, base_cfg, tmp_storage, tmp_state):
+        """Fewer than 3 dB readings should not match (insufficient data)."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert not engine._looks_like_driveby([70, 68], duration_sec=1.0)
+        assert not engine._looks_like_driveby([], duration_sec=0.0)
+
+    def test_driveby_config_overrides(self, base_cfg, tmp_storage, tmp_state):
+        """Custom config values for drive-by params should be respected."""
+        base_cfg["detection"]["driveby_max_duration_sec"] = 10
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        dbs = [75, 73, 71, 69, 67, 65, 63, 61]
+        # Under 10s → still a drive-by
+        assert engine._looks_like_driveby(dbs, duration_sec=8.0)
+        # Over 10s → not a drive-by
+        assert not engine._looks_like_driveby(dbs, duration_sec=12.0)
+
+
+# ---------------------------------------------------------------------------
+# Disk quota warning
+# ---------------------------------------------------------------------------
+
+class TestDiskQuota:
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_disk_quota_sets_state(self, base_cfg, tmp_storage, tmp_state):
+        """_check_disk_quota should populate disk_free_mb in state."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._check_disk_quota()
+        snap = tmp_state.snapshot()
+        assert "disk_free_mb" in snap
+        assert isinstance(snap["disk_free_mb"], float)
+
+    def test_disk_quota_warning_on_low_space(self, base_cfg, tmp_storage, tmp_state):
+        """Setting an absurdly high threshold should trigger a warning."""
+        base_cfg["audio"]["disk_quota_warn_mb"] = 999999999  # 999 TB — always triggers
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._check_disk_quota()
+        snap = tmp_state.snapshot()
+        assert snap.get("disk_warning") is not None
+        assert "Low disk" in snap["disk_warning"]
+
+    def test_disk_quota_no_warning_when_plenty(self, base_cfg, tmp_storage, tmp_state):
+        """A tiny threshold should never trigger a warning."""
+        base_cfg["audio"]["disk_quota_warn_mb"] = 0.001  # 1 KB — never triggers
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._check_disk_quota()
+        snap = tmp_state.snapshot()
+        assert snap.get("disk_warning") is None
+
+
+# ---------------------------------------------------------------------------
+# Exponentially-weighted average dB
+# ---------------------------------------------------------------------------
+
+class TestWeightedAvgDb:
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_weighted_avg_favors_later_readings(self, base_cfg, tmp_storage, tmp_state):
+        """
+        For a long incident that starts quiet and gets loud, the weighted avg
+        should be higher than a simple arithmetic mean because later (louder)
+        readings carry more weight.
+        """
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["audio"]["recording_enabled"] = False
+
+        # Simulate a long incident: 20 blocks starting quiet (60 dB) then ramping to 80 dB
+        dbs = [60 + i for i in range(20)]  # 60, 61, ..., 79
+
+        # Manually set up the active incident and finalize
+        engine.active = {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": dbs[0], "peak_db": max(dbs), "avg_db": dbs[0],
+                "threshold_db": 65.0, "music_like_score": 0.5,
+                "beat_confidence": 0.3, "classification": "other",
+                "mode": "respond",
+            }),
+            "start": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "dbs": dbs,
+            "classification": "other",
+            "responded": False,
+            "last_above": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        incident = tmp_storage.list_incidents()[0]
+        simple_mean = sum(dbs) / len(dbs)  # 69.5
+        # The weighted avg should be noticeably higher than the simple mean
+        assert incident["avg_db"] > simple_mean

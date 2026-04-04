@@ -2,6 +2,7 @@
 {% block content %}
 <div class="card">
   <h2>Calibration Wizard</h2>
+  {% if request.query_params.get("msg") %}<p><b>{{ request.query_params.get("msg") }}</b></p>{% endif %}
   <p>Enter a known reference SPL and the observed raw dBFS reading to compute an offset.</p>
   <form id="calform">
     <input type="text" name="name" placeholder="Profile name" required>
@@ -14,18 +15,24 @@
 
 <div class="card">
   <h2>Saved Profiles</h2>
+  <p class="small">Current active offset: <b>{{ cfg.detection.calibration_offset_db }} dB</b></p>
   <table>
-    <tr><th>ID</th><th>Name</th><th>Offset dB</th><th>Created</th></tr>
+    <tr><th>ID</th><th>Name</th><th>Offset dB</th><th>Created</th><th></th></tr>
     {% for p in profiles %}
     <tr>
       <td>{{ p.id }}</td>
       <td>{{ p.name }}</td>
       <td>{{ "%.2f"|format(p.offset_db) }}</td>
       <td>{{ p.created_ts }}</td>
+      <td>
+        <form method="post" action="/calibration/apply" style="display:inline;">
+          <input type="hidden" name="offset_db" value="{{ p.offset_db }}">
+          <button type="submit">Apply</button>
+        </form>
+      </td>
     </tr>
     {% endfor %}
   </table>
-  <p>Apply a profile by setting <code>detection.calibration_offset_db</code> in config to the desired offset value.</p>
 </div>
 
 <div class="card">

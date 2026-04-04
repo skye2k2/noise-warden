@@ -4,16 +4,21 @@
   <h2>Dashboard</h2>
   {% if message %}<p><b>{{ message }}</b></p>{% endif %}
   <p>
-    <span class="pill">Running: {{ state.running }}</span>
-    <span class="pill">Armed: {{ state.armed }}</span>
-    <span class="pill">Mic OK: {{ state.mic_ok }}</span>
-    <span class="pill">Mode: {{ state.mode }}</span>
-    <span class="pill">Current dB: {{ state.current_db }}</span>
-    <span class="pill">Threshold: {{ state.current_threshold_db }}</span>
+    <span class="pill" id="pill-running">Running: {{ state.running }}</span>
+    <span class="pill" id="pill-armed">Armed: {{ state.armed }}</span>
+    <span class="pill" id="pill-mic">Mic OK: {{ state.mic_ok }}</span>
+    <span class="pill" id="pill-mode">Mode: {{ state.mode }}</span>
+    <span class="pill" id="pill-db">Current dB: {{ state.current_db }}</span>
+    <span class="pill" id="pill-threshold">Threshold: {{ state.current_threshold_db }}</span>
   </p>
-  <p class="small">If Home Assistant is unavailable, cached browser state can still be shown; the local web app remains authoritative.</p>
+  <p class="small">Status updates every 5 seconds from in-memory state (no database reads).</p>
   <form method="post" action="/control/pause" style="display:inline-block;"><button>Pause</button></form>
   <form method="post" action="/control/resume" style="display:inline-block;"><button>Resume</button></form>
+  {% if cfg.audio.recording_enabled %}
+  <form method="post" action="/control/recording" style="display:inline-block;"><input type="hidden" name="enabled" value="false"><button>Disable Recording</button></form>
+  {% else %}
+  <form method="post" action="/control/recording" style="display:inline-block;"><input type="hidden" name="enabled" value="true"><button>Enable Recording</button></form>
+  {% endif %}
 </div>
 
 <div class="card">
@@ -42,4 +47,38 @@
     {% endfor %}
   </table>
 </div>
+
+<script>
+(function () {
+  const POLL_INTERVAL = 5000;
+
+  // Map state keys → pill element IDs and display labels
+  const pills = {
+    running:              { el: document.getElementById('pill-running'),   label: 'Running' },
+    armed:                { el: document.getElementById('pill-armed'),     label: 'Armed' },
+    mic_ok:               { el: document.getElementById('pill-mic'),       label: 'Mic OK' },
+    mode:                 { el: document.getElementById('pill-mode'),      label: 'Mode' },
+    current_db:           { el: document.getElementById('pill-db'),        label: 'Current dB' },
+    current_threshold_db: { el: document.getElementById('pill-threshold'), label: 'Threshold' },
+  };
+
+  async function pollState() {
+    try {
+      const resp = await fetch('/api/state');
+      if (!resp.ok) { return; }
+
+      const data = await resp.json();
+      for (const [key, info] of Object.entries(pills)) {
+        if (info.el && data[key] !== undefined) {
+          info.el.textContent = info.label + ': ' + data[key];
+        }
+      }
+    } catch (err) {
+      // Network error — silently skip this cycle
+    }
+  }
+
+  setInterval(pollState, POLL_INTERVAL);
+})();
+</script>
 {% endblock %}

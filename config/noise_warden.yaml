@@ -35,6 +35,9 @@ detection:
   mower_centroid_min_hz: 300
   mower_centroid_max_hz: 3000
   allow_response_night: false
+  # Drive-by auto-dismiss: short events with a fade-out pattern are struck from the record
+  driveby_max_duration_sec: 30
+  driveby_fade_tail_fraction: 0.5  # Fraction of samples to check for monotonic-ish fade
 
 response:
   enable_daytime_response: false

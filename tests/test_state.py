@@ -3,6 +3,7 @@ Tests for noise_warden.state — thread-safe StateStore.
 
 Validates get/set semantics, snapshot isolation, and thread safety.
 """
+import pytest
 import threading
 
 from noise_warden.state import StateStore
@@ -15,7 +16,7 @@ class TestStateStore:
         assert snap["armed"] is True
         assert snap["running"] is False
         assert snap["mic_ok"] is False
-        assert snap["current_db"] == 0.0
+        assert snap["current_db"] == pytest.approx(0.0)
         assert snap["mode"] == "idle"
         assert snap["active_incident_id"] is None
         assert snap["last_error"] is None
@@ -23,7 +24,7 @@ class TestStateStore:
     def test_set_updates_values(self, tmp_state):
         tmp_state.set(current_db=72.5, mode="incident_active")
         snap = tmp_state.snapshot()
-        assert snap["current_db"] == 72.5
+        assert snap["current_db"] == pytest.approx(72.5)
         assert snap["mode"] == "incident_active"
 
     def test_set_updates_timestamp(self, tmp_state):
@@ -40,7 +41,7 @@ class TestStateStore:
         snap["current_db"] = 999.0
         snap["mode"] = "HACKED"
         actual = tmp_state.snapshot()
-        assert actual["current_db"] == 0.0
+        assert actual["current_db"] == pytest.approx(0.0)
         assert actual["mode"] == "idle"
 
     def test_multiple_sets_accumulate(self, tmp_state):
@@ -48,7 +49,7 @@ class TestStateStore:
         tmp_state.set(mic_ok=True)
         tmp_state.set(mode="error")
         snap = tmp_state.snapshot()
-        assert snap["current_db"] == 55.0
+        assert snap["current_db"] == pytest.approx(55.0)
         assert snap["mic_ok"] is True
         assert snap["mode"] == "error"
 

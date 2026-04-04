@@ -10,7 +10,9 @@ Well, to make a very long story short, sometimes people choose to be loud and ob
 
 Now, let's be clear, I don't mean the occasional Super Bowl party. I mean people who care so little about how they impact others' lives that they will run air compressors and play rap music at 11pm or 6am or whatever suits them without a thought for the newborn their neighbor just got to sleep, the neighborhood children who have school the next day, or the graveyard shift you just finished.
 
-Yes. All of these are examples from my life, each of them in different cities with different neighbors. Our current neighbor takes the cake, though. He stuck an amplified music system in his garage, and started playing frankly terrible music for _hours_ at a time, sending the bass vibrating through my house, night and day. We begged each to be reasonable humans, but each refused. We had begged each jerk in the past to be reasonable humans, but each refused, and this piece was no exception. Recently, after finally giving in and calling the city hotline to report a noise disturbance, only to have my neighbor turn his music back down to still-technically-violating-the-noise-ordinance-but-quiet-enough-no-one-can-reasonably-complain levels, I decided to get quantifiable irrefutable proof on my side. Something that I could show on my phone to a patrolman or take into city council and have them instantly see and understand the recent violations and impact. Especially because for me, I was able to program in the exact city noise ordinance as the trigger threshold.
+Yes. All of these are examples from my life, each of them in different cities with different neighbors. Our current neighbor takes the cake, though. He stuck an amplified music system in his garage, and started playing frankly terrible music for _hours_ at a time, sending the bass vibrating through my house, night and day. We had begged each jerk in the past to be reasonable humans, but each refused, and this piece was no exception. Recently, after finally giving in and calling the city hotline to report a noise disturbance, only to have my neighbor turn his music back down to still-technically-violating-the-noise-ordinance-but-quiet-enough-no-one-can-reasonably-complain levels before the policeman stopped by, I decided to get quantifiable irrefutable proof on my side. Something that I could show on my phone or tablet to a patrolman or take into city council and have them instantly see and understand the recent violations and impact. Especially because for me, I was able to program in the exact city noise ordinance as the trigger threshold.
+
+Since I had previously gotten out of bed, located my camcorder, opened up a sound meter on my phone, gotten shoes on, gone outside, and stood fuming at my fence line, holding my phone up to the video camera for minutes while I actively fumed, triggering fight-or-flight adrenaline dumps into my system that would take half an hour to wear off enough to fall asleep, I decided to see if we would take me out of the equation. And with recent improvements to Raspberry Pi, ChatGPT and Claude, I could iterate quickly and have something deployable within days, not the months or years it would have taken for me to become proficient enough to architect each piece of my solution one at a time while learning a new programming language and hardware environment. And it finally got the wife to let me buy a Pi. Definite win-win, there.
 
 </details>
 
@@ -81,24 +83,110 @@ These are the defaults. Configuration supports any jurisdiction's thresholds.
 - Calibrated SPL meter for one-time calibration cross-check
 - UPS HAT or USB UPS for power continuity
 
-### Installation
+### Deployment Architecture
 
-1. Clone this repository on your Pi (or download, transfer, and extract an archive)
-2. Run the install script:
+The project uses a symlinked versioning layout that keeps **code disposable** and **data persistent**. Multiple versions can coexist on disk, and rollback is a symlink flip + service restart.
+
+```
+/opt/noise-warden/
+├── current -> /opt/noise-warden/noise-warden-v6   # symlink to active version
+├── deploy_noise_warden.sh                          # version-swap script (lives outside any version)
+├── venv/                                           # shared Python virtualenv
+├── shared/                                         # persistent data — survives upgrades
+│   ├── noise_warden.db
+│   ├── snippets/
+│   ├── playlist/
+│   └── build/
+│       └── build_photo.jpg
+├── noise-warden-v5/                                # previous version (kept for rollback)
+└── noise-warden-v6/                                # active version
+```
+
+Key invariants:
+- `shared/` is **never** inside a version directory — the DB, WAV snippets, playlist, and build assets persist across upgrades
+- Config lives in the active version at `current/config/noise_warden.yaml` — copy forward when upgrading if you've made changes
+- The `deploy_noise_warden.sh` script is copied to `/opt/noise-warden/` on first install and stays there permanently
+
+### First-Time Installation
+
+1. Transfer the version archive to the Pi:
     ```bash
-    cd noise-warden
-    ./scripts/install_pi.sh
+    scp noise-warden-v6.zip pi@<pi-ip>:~
     ```
-    This will: install system dependencies (`python3-venv`, `portaudio19-dev`, `libsndfile1`, `ffmpeg`), create a Python venv, install pip dependencies, create data directories, and install a systemd service.
-3. Edit the configuration:
+
+2. SSH in and set up the base directory structure:
+    ```bash
+    ssh pi@<pi-ip>
+    sudo mkdir -p /opt/noise-warden
+    sudo chown -R $USER:$USER /opt/noise-warden
+    cd /opt/noise-warden
+    mv ~/noise-warden-v6.zip .
+    unzip noise-warden-v6.zip
+    ```
+
+3. Install system-level dependencies (these are not managed by pip):
+    ```bash
+    sudo apt update && sudo apt install -y python3-venv portaudio19-dev libsndfile1 ffmpeg
+    ```
+
+4. Run the install script from inside the version directory:
+    ```bash
+    cd noise-warden-v6
+    bash scripts/install_pi.sh
+    ```
+    This will: create the `shared/` data directories, create a Python venv at `/opt/noise-warden/venv/`, install pip dependencies, copy `deploy_noise_warden.sh` up to the base directory, set the `current` symlink, create a `noisewarden` system user, and install the systemd service unit.
+
+5. Edit the configuration:
     ```bash
     nano config/noise_warden.yaml
     ```
-4. Enable and start the service:
+
+6. Enable and start the service:
     ```bash
     sudo systemctl enable --now noise-warden
     ```
-5. Open in browser: `http://<pi-ip>:8787/`
+
+7. Open in browser: `http://<pi-ip>:8787/`
+
+### Iterative Upgrade (the actual workflow)
+
+When you have a new version ready:
+
+1. Transfer and extract the new version alongside the old one:
+    ```bash
+    scp noise-warden-v7.zip pi@<pi-ip>:~
+    ssh pi@<pi-ip>
+    cd /opt/noise-warden
+    mv ~/noise-warden-v7.zip .
+    unzip noise-warden-v7.zip
+    ```
+
+2. If you've customized `config/noise_warden.yaml`, copy it forward:
+    ```bash
+    cp current/config/noise_warden.yaml noise-warden-v7/config/noise_warden.yaml
+    ```
+
+3. Run the deploy script (which lives at the base level, outside any version):
+    ```bash
+    ./deploy_noise_warden.sh noise-warden-v7
+    ```
+
+    The deploy script will: stop the service, swing the `current` symlink, rebuild/update the venv, install the new systemd unit, and restart the service. `shared/` is untouched.
+
+4. Verify:
+    ```bash
+    sudo systemctl status noise-warden
+    ```
+
+### Rollback
+
+If something goes sideways:
+```bash
+cd /opt/noise-warden
+./deploy_noise_warden.sh noise-warden-v6
+```
+
+That's it. Previous version is still on disk, data is still in `shared/`.
 
 ## Configuration (IMPORTANT!)
 
@@ -130,13 +218,57 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
   - Config editor — edit YAML configuration without SSH
   - Build documentation — upload photos and notes documenting physical setup
 - **Day/night ordinance enforcement** — separate thresholds and behavior; nighttime is record-only
-- **GPIO relay + audio playback response** (optional, disabled by default) — powers amplifier and plays audio during daytime threshold violations
 - **REST API** — full programmatic access to status, incidents, controls, and configuration
 - **CSV export** of incident history for external analysis or evidence submission
 - **Home Assistant integration** — REST endpoint examples provided for status polling and control commands
 - **Noise exclusion profiles** for common false positives (lawn mower, thunder, rain, drive-bys, etc.)
-- **Multi-mic scaffolding** — optional secondary mic for differential rejection and reference input for adaptive subtraction (experimental)
+- **GPIO relay + audio playback response** (optional, disabled by default) — powers amplifier and plays audio during daytime threshold violations
+- **Multi-mic scaffolding** — optional secondary mic for differential rejection and reference input for adaptive subtraction (rabbit hole--not yet implemented)
 
+## Testing
+
+Tests use [pytest](https://docs.pytest.org/) and run entirely without audio hardware — all capture and MQTT interactions are mocked.
+
+### Setup (one time, from the repo root)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[test]"
+```
+
+### Running the suite
+
+```bash
+# All tests, verbose output
+pytest tests/ -v
+
+# A single test file
+pytest tests/test_engine.py -v
+
+# A single test class or method
+pytest tests/test_engine.py::TestDriveByDetection -v
+pytest tests/test_storage.py::TestStaleIncidentRepair::test_repairs_incident_without_end_ts -v
+
+# Stop on first failure (useful when debugging)
+pytest tests/ -x -v
+
+# Show print() output from the code under test
+pytest tests/ -v -s
+```
+
+### What's covered
+
+| File | Covers |
+|------|--------|
+| `test_config.py` | YAML loading, validation, required sections, error paths |
+| `test_dsp.py` | RMS/dBFS math, A-weighting, spectrum features, beat confidence, music score, exclusion filters |
+| `test_engine.py` | Lifecycle, incident creation, disarmed skip, error recovery, drive-by detection, disk quota, weighted avg dB |
+| `test_ordinance.py` | Threshold lookups, day/night boundary edge cases, ordinance data integrity |
+| `test_response.py` | PlaylistPlayer file selection, shlex command parsing, RelayController |
+| `test_state.py` | StateStore get/set, snapshot isolation, thread safety |
+| `test_storage.py` | Incident CRUD, soft delete, pagination, CSV export, snippet cleanup, stale repair, vacuum |
+| `test_web.py` | All GET pages, API endpoints, POST mutations, auth enforcement, recording toggle, calibration apply |
 
 ## Notes on legal / practical reality
 
@@ -156,10 +288,17 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 - ~~TODO: Restore "Clear All Incidents" action — RESOLVED in v5: POST `/incidents/clear` with soft-delete-all and confirmation dialog in template.~~
 - ~~TODO: Throttle MQTT `publish_state()` — RESOLVED in v5: fires every ~5 seconds instead of every 0.5s loop (~12 msgs/min vs. ~120).~~
 - TODO: Re-integrate GPIO relay control — `RelayController` is currently a boolean flag with no hardware interaction (`gpiozero` dependency removed)
+- TODO: Visual timeline redesign — vertical Google Calendar-style view with day/week/month spreads, incident blocks labeled by start dB and duration. Clicking an event should open a detail popup showing exact start/stop time, duration, ordinance vs. violation comparison (excess dB called out), and playback controls for associated WAV snippets. Current template is text-only cards.
 - ~~TODO: Wire `sustain_blocks_required` and `release_blocks_required` config values — RESOLVED in v5: dead config keys removed.~~
-- TODO: Drive-by homie detection (even if noise violation is detected, if the sound gets louder, then fades out, or just fades out in less than 30 seconds, just strike it from the record)
-- TODO: Recording space quota with warnings (cleanup method exists, but no quota enforcement or alerts)
-- TODO: Elegant dashboard auto-refresh solution (currently manual reload only; v3 had JS polling every 5s, but a more sophisticated approach is desired)
+- ~~TODO: Drive-by homie detection — RESOLVED in v6: `_looks_like_driveby()` checks short incidents for fade-out pattern and auto-soft-deletes matches. Configurable via `driveby_max_duration_sec` and `driveby_fade_tail_fraction`.~~
+- ~~TODO: Recording space quota with warnings — RESOLVED in v6: `_check_disk_quota()` runs at startup and daily; warns when free space drops below `disk_quota_warn_mb` (default 500 MB). Publishes `disk_free_mb` and `disk_warning` to state.~~
+- ~~TODO: Elegant dashboard auto-refresh solution — RESOLVED in v6: JS polls `/api/state` every 5 seconds and updates pill elements in-place. Zero database reads (in-memory StateStore).~~
+- TODO: `disk_free_mb` and `disk_warning` are not in the `StateStore` initial schema — they get added dynamically after the first quota check, so `/api/state` consumers see an inconsistent shape until then
+- TODO: Dashboard polling does not surface `disk_warning` — a low-disk situation logs to stdout but is invisible in the web UI (add a pill or banner)
+- ~~TODO: Drive-by filter fires even on `force=True` shutdown finalization — RESOLVED in v6: `_finalize_incident(force=True)` now skips drive-by check.~~
+- TODO: Thresholds page `zone_thresholds` table includes `commerce_industry_A1` which the engine never uses — filter to only relevant categories, or clearly label which rows are active
+- TODO: Dashboard `setInterval` never pauses when tab is backgrounded — use `document.visibilitychange` to pause/resume polling (minor Pi resource courtesy)
+- TODO: `_looks_like_driveby` docstring says "monotonically" but inline comment says "Count how many consecutive pairs are decreasing" when it actually counts _increases_ — minor wording cleanup
 
 ### Stability (crash/data-loss risks, courtesy of Claude Opus 4.6)
 
@@ -187,7 +326,7 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 - **`music_like_score` formula still uses undocumented magic numbers** — Same formula as v3 (`0.6 * low + 0.4 * tonal_window`). Now documented inline as "strong low-band energy + not-too-flat spectrum" which is better, but the specific weights (0.6, 0.4, 1.6, 0.35) remain unvalidated.
 - ~~**`cleanup_old_snippets()` defined but never invoked** — RESOLVED in v5: called at engine startup and once daily via periodic timer.~~
 - ~~**Auth blocks the web UI when enabled** — RESOLVED in v5: LAN-trust model adopted; GET pages are unauthenticated, POST mutation endpoints require bearer token when configured.~~
-- **Incident average dB is still a simple running mean** — `np.mean(self.active["dbs"])` over the entire incident. For long incidents, early readings dominate.
+- ~~**Incident average dB is still a simple running mean** — RESOLVED in v6: exponentially-weighted mean (decay=0.95) gives sustained readings more weight than the initial onset ramp.~~
 
 ### Performance
 
@@ -198,7 +337,7 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 - ~~**No WAV cleanup or rotation** — RESOLVED in v5: `cleanup_old_snippets()` called at engine startup and daily via periodic timer.~~
 - **Blocking `sd.rec()` prevents multi-mic support** — v2 used non-blocking callback streams. v4 still uses blocking `sd.rec()` + `sd.wait()`. Plugin stubs for reference subtraction and dual-mic exist but cannot work with this capture model.
 - ~~**MQTT publishes on every engine loop** — RESOLVED in v5: throttled to every ~5 seconds (~12 msgs/min).~~
-- **Snippet serving holds file handle for HTTP response duration** — `StreamingResponse(open(path, "rb"))` on large WAV files keeps a file descriptor open. Not critical at home-network scale but not great.
+- ~~**Snippet serving holds file handle for HTTP response duration** — RESOLVED in v6: `FileResponse` manages the file handle lifecycle properly.~~
 - ~~**`get_snippet()` does a full `list_incidents(limit=100000)`** — RESOLVED in v5: dedicated `Storage.get_incident(id)` method restored.~~
 
 ### Usability
@@ -212,15 +351,15 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 - **Build page only stores one photo** — Uploading a new photo still overwrites the previous one.
 - ~~**Calibration page is now just instructions** — RESOLVED in v5: wizard restored (compute form + saved profiles table) alongside manual calibration instructions.~~
 - ~~**No "Clear All Incidents" action** — RESOLVED in v5: POST `/incidents/clear` with soft-delete-all and confirmation dialog.~~
-- **Dashboard lacks auto-refresh** — v3 had JS polling every 5 seconds. v4 dashboard is fully server-rendered with no auto-refresh. Users must manually reload to see updated dB readings and incident status.
-- **Thresholds page removed** — Ordinance reference is now on the dashboard, but the detailed threshold-vs-config comparison table is gone. Users can't easily see if their configured thresholds differ from the ordinance.
+- ~~**Dashboard lacks auto-refresh** — RESOLVED in v6: JS polls `/api/state` every 5 seconds and updates pill elements in-place. No database overhead.~~
+- ~~**Thresholds page removed** — RESOLVED in v6: `/thresholds` page restored with ordinance limits, active config comparison, and measurement notes.~~
 
 ### Security
 
 - ~~**No authentication whatsoever** — RESOLVED in v4: optional bearer token auth via `app.auth_token` config. `must_auth()` enforced on all mutation and page endpoints.~~
 - ~~**Photo upload has no file-type validation** — RESOLVED in v4: server-side extension check rejects non-image files.~~
 - ~~**Service runs as `User=root`** — RESOLVED in v4: dedicated `noisewarden` system user with `audio` + `gpio` group membership.~~
-- **Player command injection** — `PlaylistPlayer.start()` still uses `.split()` on the command string. If `player_command` config contains shell metacharacters or quoted paths with spaces, behavior is undefined. With auth now in place, the attack surface is reduced but not eliminated.
+- ~~**Player command injection** — RESOLVED in v6: `PlaylistPlayer.start()` uses `shlex.split()` for proper shell-safe tokenization of `player_command`.~~
 - **Auth token transmitted in cleartext** — Bearer token sent over HTTP (no TLS). On a home LAN this is low-risk, but anyone sniffing the network can capture it. Consider documenting TLS proxy setup for security-conscious deployments.
 - ~~**Auth breaks web UI** — RESOLVED in v5: LAN-trust model; GET pages unauthenticated, only POST mutations require bearer token.~~
 - **`/api/state` and `/api/health` have no auth** — These endpoints bypass `must_auth()`. Low-risk read-only data on LAN, but noted for awareness.

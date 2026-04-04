@@ -78,13 +78,13 @@ class TestApplicableThreshold:
         cfg = self._make_cfg("continuous_music_focus")
         rule, threshold = applicable_threshold(cfg, datetime(2026, 4, 1, 14, 0))
         assert rule == "continuous_A2_A3"
-        assert threshold == 65.0
+        assert threshold == pytest.approx(65.0)
 
     def test_continuous_night(self):
         cfg = self._make_cfg("continuous_music_focus")
         rule, threshold = applicable_threshold(cfg, datetime(2026, 4, 1, 23, 0))
         assert rule == "continuous_A2_A3"
-        assert threshold == 55.0
+        assert threshold == pytest.approx(55.0)
 
     # -- Intermittent mode --
 
@@ -92,13 +92,13 @@ class TestApplicableThreshold:
         cfg = self._make_cfg("intermittent")
         rule, threshold = applicable_threshold(cfg, datetime(2026, 4, 1, 14, 0))
         assert rule == "intermittent_A2_A3"
-        assert threshold == 70.0
+        assert threshold == pytest.approx(70.0)
 
     def test_intermittent_night(self):
         cfg = self._make_cfg("intermittent")
         rule, threshold = applicable_threshold(cfg, datetime(2026, 4, 1, 23, 0))
         assert rule == "intermittent_A2_A3"
-        assert threshold == 60.0
+        assert threshold == pytest.approx(60.0)
 
     # -- Plain continuous mode (same thresholds as continuous_music_focus) --
 
@@ -106,19 +106,19 @@ class TestApplicableThreshold:
         cfg = self._make_cfg("continuous")
         rule, threshold = applicable_threshold(cfg, datetime(2026, 4, 1, 14, 0))
         assert rule == "continuous_A2_A3"
-        assert threshold == 65.0
+        assert threshold == pytest.approx(65.0)
 
     # -- Night boundary edge cases --
 
     def test_boundary_7am_gets_day_threshold(self):
         cfg = self._make_cfg("continuous_music_focus")
         _, threshold = applicable_threshold(cfg, datetime(2026, 4, 1, 7, 0))
-        assert threshold == 65.0
+        assert threshold == pytest.approx(65.0)
 
     def test_boundary_10pm_gets_night_threshold(self):
         cfg = self._make_cfg("continuous_music_focus")
         _, threshold = applicable_threshold(cfg, datetime(2026, 4, 1, 22, 0))
-        assert threshold == 55.0
+        assert threshold == pytest.approx(55.0)
 
 
 # ---------------------------------------------------------------------------

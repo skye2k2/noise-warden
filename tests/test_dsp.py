@@ -126,14 +126,14 @@ class TestSpectrumFeatures:
 
 class TestBeatConfidence:
     def test_short_history_returns_zero(self):
-        assert beat_confidence_from_history([60, 62, 61]) == 0.0
+        assert beat_confidence_from_history([60, 62, 61]) == pytest.approx(0.0)
 
     def test_constant_returns_base_value(self):
         """Flat dB history → no periodicity → confidence at baseline (0.5ish)."""
         flat = [65.0] * 24
         result = beat_confidence_from_history(flat)
         # With all-zero delta, allclose check returns 0.0
-        assert result == 0.0
+        assert result == pytest.approx(0.0)
 
     def test_periodic_pattern_higher_than_random(self):
         """An oscillating pattern should show higher beat confidence than random."""

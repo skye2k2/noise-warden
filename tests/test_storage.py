@@ -204,7 +204,7 @@ class TestSnippetCleanup:
         old_incident["snippet_path"] = snippet_file
         tmp_storage.create_incident(old_incident)
 
-        removed = tmp_storage.cleanup_old_snippets(snippets_dir, retention_days=30)
+        removed = tmp_storage.cleanup_old_snippets(retention_days=30)
         assert removed == 1
         assert not os.path.exists(snippet_file)
 
@@ -221,6 +221,61 @@ class TestSnippetCleanup:
         recent_incident["snippet_path"] = snippet_file
         tmp_storage.create_incident(recent_incident)
 
-        removed = tmp_storage.cleanup_old_snippets(snippets_dir, retention_days=30)
+        removed = tmp_storage.cleanup_old_snippets(retention_days=30)
         assert removed == 0
         assert os.path.exists(snippet_file)
+
+
+# ---------------------------------------------------------------------------
+# Stale incident repair
+# ---------------------------------------------------------------------------
+
+class TestStaleIncidentRepair:
+
+    def test_repairs_incident_without_end_ts(self, tmp_storage, sample_incident):
+        """Incidents missing end_ts should be marked as crash-repaired."""
+        iid = tmp_storage.create_incident(sample_incident)
+        # create_incident leaves end_ts NULL — simulates a crash mid-incident
+        repaired = tmp_storage.repair_stale_incidents()
+        assert repaired == 1
+
+        row = tmp_storage.get_incident(iid)
+        assert row["end_ts"] is not None
+        assert "crash-repaired" in row["notes"]
+
+    def test_skips_already_finalized_incidents(self, tmp_storage, sample_incident):
+        """Finalized incidents (with end_ts) should not be touched."""
+        iid = tmp_storage.create_incident(sample_incident)
+        tmp_storage.finalize_incident(iid, "2026-04-01T13:00:00+00:00", 3600.0, 75.0, 70.0, None)
+
+        repaired = tmp_storage.repair_stale_incidents()
+        assert repaired == 0
+
+    def test_skips_soft_deleted_incidents(self, tmp_storage, sample_incident):
+        """Soft-deleted incidents should not be repaired."""
+        iid = tmp_storage.create_incident(sample_incident)
+        tmp_storage.soft_delete_incident(iid)
+
+        repaired = tmp_storage.repair_stale_incidents()
+        assert repaired == 0
+
+    def test_appends_to_existing_notes(self, tmp_storage, sample_incident):
+        """If the incident already has notes, crash-repair note should be appended."""
+        sample_incident["notes"] = "Loud bass at midnight"
+        iid = tmp_storage.create_incident(sample_incident)
+
+        tmp_storage.repair_stale_incidents()
+        row = tmp_storage.get_incident(iid)
+        assert "Loud bass at midnight" in row["notes"]
+        assert "crash-repaired" in row["notes"]
+
+
+# ---------------------------------------------------------------------------
+# Vacuum
+# ---------------------------------------------------------------------------
+
+class TestVacuum:
+
+    def test_vacuum_does_not_error(self, tmp_storage):
+        """VACUUM should complete without raising."""
+        tmp_storage.vacuum()

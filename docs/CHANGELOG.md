@@ -1,5 +1,77 @@
 # noise-warden CHANGELOG
 
+## v6 - 2026-04-04 — "Self-Aware Housekeeping Edition"
+
+Security hardening, operational polish, and closing the loop on several long-standing paper cuts. The engine now cleans up after itself on startup (stale incidents, expired snippets, DB vacuum, disk quota), the dashboard refreshes itself, drive-bys get auto-dismissed, calibration profiles can be applied with one click, and recording can be toggled from the UI.
+
+<details>
+
+<summary>Key details</summary>
+
+### Security
+
+- **Player command injection fixed** — `PlaylistPlayer.start()` uses `shlex.split()` instead of `.split()` for safe tokenization of `player_command`
+- **Snippet file handle leak fixed** — `FileResponse` replaces `StreamingResponse(open(...))` in the snippet serving route
+
+### Engine improvements
+
+- **Dashboard auto-refresh** — JS polls `/api/state` every 5 seconds and updates pill text in-place; zero database reads (reads from in-memory `StateStore`)
+- **Disk quota warnings** — `_check_disk_quota()` runs at startup and daily; publishes `disk_free_mb` and `disk_warning` to state. Configurable via `disk_quota_warn_mb` (default 500 MB)
+- **Exponentially-weighted avg dB** — `_finalize_incident()` uses decay factor 0.95 so sustained readings carry more weight than the onset ramp
+- **Drive-by auto-dismiss** — `_looks_like_driveby()` checks: duration < `driveby_max_duration_sec` (default 30) AND tail portion shows fade-out pattern. Auto-soft-deletes matches and removes the snippet file to prevent orphaning
+- **Stale incident repair** — `repair_stale_incidents()` runs at startup, finalizing any incidents left without an `end_ts` after a crash
+- **DB vacuum** — `VACUUM` runs at startup to reclaim space from soft-deleted rows and fragmentation
+- **Force-finalize skips drive-by** — `_finalize_incident(force=True)` (called during `engine.stop()`) no longer runs the drive-by filter, preventing false dismissal of active incidents during shutdown
+
+### Web UI
+
+- **Thresholds page restored** — `/thresholds` shows ordinance limits vs. active config, measurement notes, and ordinance footnotes; nav link added
+- **Calibration "Apply" button** — each saved profile row has an Apply button that updates the running config and saves to YAML in one click
+- **No-record mode toggle** — dashboard button toggles `recording_enabled` at runtime without a config file edit or restart
+
+### Config
+
+- New detection keys: `driveby_max_duration_sec`, `driveby_fade_tail_fraction`
+- New audio key: `disk_quota_warn_mb`
+
+### Maintenance
+
+- Removed unused `snippets_dir` parameter from `cleanup_old_snippets()`
+- Removed unused `rule_name` variable in engine loop
+- Static analysis warnings resolved across all source and test files (unused variables, float equality in tests, etc.)
+- Test suite expanded to 155 tests covering drive-by detection, disk quota, weighted avg dB, thresholds page, and calibration apply
+- README deployment instructions rewritten: deployment architecture diagram, first-time install, iterative upgrade workflow, and rollback procedure
+
+</details>
+
+## v5 - 2026-04-04 — "Operational Cleanup Edition"
+
+Bug fix round addressing 9 issues identified during v4 code review. Removed dead config keys, fixed PlaylistPlayer file selection, wired snippet cleanup schedule, adopted LAN-trust auth model, throttled MQTT publishing, fixed get_snippet query, restored Clear All Incidents, restored calibration wizard alongside manual instructions.
+
+<details>
+
+<summary>Key details</summary>
+
+### Fixed
+
+- **Dead config keys removed** — `sustain_blocks_required`, `release_blocks_required`, and `driveby_max_duration_sec` (which was dead code at the time) stripped from config
+- **`PlaylistPlayer.start()` fixed** — now globs audio files from `playlist_dir` and passes a random selection to the player command
+- **Snippet cleanup wired** — `cleanup_old_snippets()` called at engine startup and once daily via periodic timer
+- **LAN-trust auth model** — GET pages are unauthenticated (browser-friendly); POST mutation endpoints require bearer token when configured
+- **MQTT throttled** — `publish_state()` fires every ~5 seconds instead of every 0.5s loop (~12 msgs/min vs. ~120)
+- **`get_snippet()` query fixed** — uses dedicated `Storage.get_incident(id)` instead of scanning the full incident table
+- **Clear All Incidents restored** — `POST /incidents/clear` with `soft_delete_all_incidents()` and confirmation dialog
+- **Calibration page restored** — wizard (compute form + saved profiles table) alongside manual calibration instructions
+
+### Test infrastructure
+
+- Full pytest test suite created: 142 tests across 8 test files
+- `conftest.py` with `pytest_configure` hook for early `NOISE_WARDEN_CONFIG` bootstrapping (solving `web.py` module-level side effects)
+- `config.py` `load_yaml()` reads `NOISE_WARDEN_CONFIG` env var at call time (not import time)
+- `python-multipart` added as runtime dependency (required by FastAPI form parsing)
+
+</details>
+
 ## v4 - 2026-04-04 — "Secure-er Ordinance-Anchored Evidence Edition"
 
 Package renamed from `app` to `noise_warden`. Ordinance thresholds are now embedded and authoritative. Thread-safe state, config validation, MQTT Home Assistant integration, WAV chunk-to-disk recording (no unbounded RAM), `/api/health`, pause/resume controls, incident notes in UI, timeline date filtering, bearer token auth, dedicated `noisewarden` service user, and snippet retention cleanup.

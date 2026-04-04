@@ -207,7 +207,7 @@ class TestPostMutations:
 class TestAuth:
 
     def test_post_blocked_with_wrong_token(self, web_app, client):
-        app, storage, state, engine = web_app
+        _, _, _, _ = web_app  # Trigger fixture
         import noise_warden.web as web_mod
         # Enable auth
         web_mod.cfg["app"]["auth_token"] = "secret-test-token"
@@ -223,7 +223,7 @@ class TestAuth:
         web_mod.cfg["app"]["auth_token"] = ""
 
     def test_post_allowed_with_correct_token(self, web_app, client):
-        app, storage, state, engine = web_app
+        _, _, _, _ = web_app  # Trigger fixture
         import noise_warden.web as web_mod
         web_mod.cfg["app"]["auth_token"] = "secret-test-token"
 
@@ -304,3 +304,88 @@ class TestSnippetEndpoint:
         resp = client.get(f"/snippets/{iid}")
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "audio/wav"
+
+
+# ---------------------------------------------------------------------------
+# Thresholds page
+# ---------------------------------------------------------------------------
+
+class TestThresholdsPage:
+
+    def test_thresholds_returns_200(self, client):
+        resp = client.get("/thresholds")
+        assert resp.status_code == 200
+
+    def test_thresholds_contains_ordinance_data(self, client):
+        resp = client.get("/thresholds")
+        assert "Pleasant Grove" in resp.text
+        assert "Residential Agricultural" in resp.text
+
+    def test_thresholds_shows_active_config(self, client):
+        resp = client.get("/thresholds")
+        # Should display the active detection mode from config
+        assert "continuous_music_focus" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Recording toggle
+# ---------------------------------------------------------------------------
+
+class TestRecordingToggle:
+
+    def test_disable_recording(self, client, web_app):
+        _, _, _, _ = web_app
+        import noise_warden.web as web_mod
+        web_mod.cfg["audio"]["recording_enabled"] = True
+
+        resp = client.post(
+            "/control/recording",
+            data={"enabled": "false"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        assert web_mod.cfg["audio"]["recording_enabled"] is False
+
+    def test_enable_recording(self, client, web_app):
+        _, _, _, _ = web_app
+        import noise_warden.web as web_mod
+        web_mod.cfg["audio"]["recording_enabled"] = False
+
+        resp = client.post(
+            "/control/recording",
+            data={"enabled": "true"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        assert web_mod.cfg["audio"]["recording_enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# Calibration apply
+# ---------------------------------------------------------------------------
+
+class TestCalibrationApply:
+
+    def test_apply_updates_running_config(self, client, web_app, tmp_path):
+        _, _, _, _ = web_app
+        import noise_warden.web as web_mod
+
+        # Write a config file so the apply route can update it
+        import yaml
+        cfg_path = str(tmp_path / "noise_warden.yaml")
+        with open(cfg_path, "w") as f:
+            yaml.dump(web_mod.cfg, f)
+        import os
+        os.environ["NOISE_WARDEN_CONFIG"] = cfg_path
+
+        original = web_mod.cfg["detection"]["calibration_offset_db"]
+        resp = client.post(
+            "/calibration/apply",
+            data={"offset_db": "92.5"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        assert web_mod.cfg["detection"]["calibration_offset_db"] == 92.5
+
+        # Restore
+        web_mod.cfg["detection"]["calibration_offset_db"] = original

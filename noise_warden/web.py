@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -12,7 +12,7 @@ from .config import load_yaml, save_yaml_text_validated, ConfigError
 from .storage import Storage
 from .state import StateStore
 from .engine import Engine
-from .ordinance import ORDINANCE
+from .ordinance import ORDINANCE, applicable_threshold, is_night
 
 cfg = load_yaml()
 storage = Storage(os.path.join(cfg["app"]["shared_dir"], "noise_warden.db"))
@@ -98,7 +98,8 @@ def get_snippet(request: Request, incident_id: int):
     row = storage.get_incident(incident_id)
     if not row or not row.get("snippet_path") or not os.path.exists(row["snippet_path"]):
         raise HTTPException(status_code=404)
-    return StreamingResponse(open(row["snippet_path"], "rb"), media_type="audio/wav")
+    # FileResponse manages the file handle lifecycle properly
+    return FileResponse(row["snippet_path"], media_type="audio/wav")
 
 @app.get("/timeline", response_class=HTMLResponse)
 def timeline(request: Request, view: str = "day"):
@@ -164,17 +165,67 @@ async def calibration_compute(
     storage.add_calibration_profile(name, offset, datetime.now(timezone.utc).isoformat(timespec="seconds"))
     return JSONResponse({"offset_db": offset})
 
+@app.post("/calibration/apply")
+def calibration_apply(request: Request, offset_db: float = Form(...)):
+    """Apply a calibration profile by updating the running config and saving to YAML."""
+    must_auth(request)
+    cfg["detection"]["calibration_offset_db"] = offset_db
+
+    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        import re
+        # Replace the calibration_offset_db value in the raw YAML text
+        updated = re.sub(
+            r"(calibration_offset_db:\s*)[\d.\-]+",
+            rf"\g<1>{offset_db}",
+            raw
+        )
+        save_yaml_text_validated(cfg_path, updated)
+    except Exception as e:
+        return RedirectResponse(url=f"/calibration?msg=apply-error:{e}", status_code=303)
+
+    return RedirectResponse(url="/calibration?msg=applied", status_code=303)
+
 @app.post("/control/pause")
 def pause(request: Request):
     must_auth(request)
     engine.set_armed(False)
     return RedirectResponse(url="/?msg=paused", status_code=303)
 
+@app.get("/thresholds", response_class=HTMLResponse)
+def thresholds(request: Request):
+    zone = cfg["detection"].get("zone", "residential_agricultural")
+    zone_data = ORDINANCE.get(zone, ORDINANCE["residential_agricultural"])
+    now = datetime.now()
+    rule_name, threshold = applicable_threshold(cfg, now)
+    night = is_night(now, cfg["detection"]["night_start_hour"], cfg["detection"]["night_end_hour"])
+    return templates.TemplateResponse("thresholds.html", {
+        "request": request,
+        "ordinance": ORDINANCE,
+        "cfg": cfg,
+        "zone_label": zone.replace("_", " ").title(),
+        "zone_thresholds": zone_data,
+        "active_rule": rule_name,
+        "active_threshold": threshold,
+        "period": "night" if night else "day",
+    })
+
 @app.post("/control/resume")
 def resume(request: Request):
     must_auth(request)
     engine.set_armed(True)
     return RedirectResponse(url="/?msg=resumed", status_code=303)
+
+@app.post("/control/recording")
+def toggle_recording(request: Request, enabled: str = Form(...)):
+    """Toggle recording_enabled at runtime without requiring a config file edit or restart."""
+    must_auth(request)
+    new_val = enabled.lower() == "true"
+    cfg["audio"]["recording_enabled"] = new_val
+    msg = "recording-enabled" if new_val else "recording-disabled"
+    return RedirectResponse(url=f"/?msg={msg}", status_code=303)
 
 @app.get("/export.csv")
 def export_csv(request: Request):

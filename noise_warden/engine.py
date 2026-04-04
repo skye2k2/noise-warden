@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, threading, time, tempfile
+import os, shutil, threading, time, tempfile
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import soundfile as sf
@@ -36,6 +36,32 @@ class Engine:
         self._lock = threading.Lock()
         self._last_mqtt_publish = 0.0
         self._mqtt_interval = 5.0  # Seconds between MQTT state publishes
+        self._disk_warned = False   # Avoids spamming quota warnings every loop
+
+    def _check_disk_quota(self):
+        """Check available disk space in snippets directory and warn if below threshold.
+        Quota threshold defaults to 500 MB; configurable via audio.disk_quota_warn_mb."""
+        snippets_dir = os.path.join(self.cfg["app"]["shared_dir"], "snippets")
+        os.makedirs(snippets_dir, exist_ok=True)
+
+        warn_mb = float(self.cfg["audio"].get("disk_quota_warn_mb", 500))
+        try:
+            usage = shutil.disk_usage(snippets_dir)
+            free_mb = usage.free / (1024 * 1024)
+            self.state.set(disk_free_mb=round(free_mb, 1))
+
+            if free_mb < warn_mb:
+                if not self._disk_warned:
+                    print(f"[engine] WARNING: Disk space low — {free_mb:.0f} MB free (threshold: {warn_mb:.0f} MB)")
+                    self._disk_warned = True
+                self.state.set(disk_warning=f"Low disk: {free_mb:.0f} MB free")
+            else:
+                if self._disk_warned:
+                    print(f"[engine] Disk space recovered — {free_mb:.0f} MB free")
+                self._disk_warned = False
+                self.state.set(disk_warning=None)
+        except OSError as exc:
+            print(f"[engine] Disk quota check failed: {exc}")
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -108,6 +134,38 @@ class Engine:
             wf.seek(0, whence=2)
             wf.write(block)
 
+    def _looks_like_driveby(self, dbs, duration_sec):
+        """Determine if an incident matches a drive-by pattern: short duration with a
+        fade-out in the tail portion. A drive-by typically rises to a peak then
+        monotonically (or near-monotonically) decays as the vehicle passes.
+
+        Returns True if: duration is under the configured max AND the tail portion
+        of dB readings is predominantly decreasing (allowing 1 uptick for jitter)."""
+        max_dur = float(self.cfg["detection"].get("driveby_max_duration_sec", 30))
+        tail_frac = float(self.cfg["detection"].get("driveby_fade_tail_fraction", 0.5))
+
+        if duration_sec > max_dur:
+            return False
+
+        if len(dbs) < 3:
+            return False
+
+        # Check the tail portion for a fade-out pattern
+        tail_start = max(1, int(len(dbs) * (1.0 - tail_frac)))
+        tail = dbs[tail_start:]
+
+        if len(tail) < 2:
+            return False
+
+        # Count how many consecutive pairs are decreasing (or flat)
+        increases = 0
+        for i in range(1, len(tail)):
+            if tail[i] > tail[i - 1] + 1.0:  # 1 dB tolerance for noise jitter
+                increases += 1
+
+        # Allow at most 1 uptick in the tail — real fade-outs are noisy but generally downward
+        return increases <= 1
+
     def _finalize_incident(self, force=False):
         if not self.active:
             return
@@ -118,13 +176,43 @@ class Engine:
             snippet_path = self.active["tmp_wav"]
         else:
             snippet_path = None
+
+        # Compute average dB with exponential weighting so later (sustained) readings
+        # carry more weight than the initial onset ramp. For short incidents (<10 blocks),
+        # the weighting barely differs from a flat mean.
+        dbs = self.active["dbs"]
+        if dbs:
+            n = len(dbs)
+            # Decay factor: earlier readings get exponentially less weight
+            decay = 0.95
+            weights = np.array([decay ** (n - 1 - i) for i in range(n)])
+            weights /= weights.sum()
+            avg_db = float(np.dot(weights, dbs))
+        else:
+            avg_db = 0.0
+
         self.storage.finalize_incident(
             self.active["id"], end.isoformat(), dur,
             max(self.active["dbs"]) if self.active["dbs"] else 0.0,
-            float(np.mean(self.active["dbs"])) if self.active["dbs"] else 0.0,
+            avg_db,
             snippet_path
         )
         self.ha.publish_event({"type": "incident_end", "id": self.active["id"], "duration_sec": dur})
+
+        # Drive-by auto-dismiss: short incidents with a fade-out tail are likely passing
+        # vehicles, not sustained nuisance noise. Soft-delete and remove the snippet file
+        # so it doesn't orphan on disk (cleanup_old_snippets only scans non-deleted rows).
+        # Skip this check during forced shutdown — don't dismiss a legitimately active incident.
+        incident_id = self.active["id"]
+        if not force and self._looks_like_driveby(dbs, dur):
+            if snippet_path and os.path.exists(snippet_path):
+                try:
+                    os.remove(snippet_path)
+                except OSError as exc:
+                    print(f"[engine] Failed to remove drive-by snippet {snippet_path}: {exc}")
+            self.storage.soft_delete_incident(incident_id)
+            print(f"[engine] Auto-dismissed incident {incident_id} as drive-by ({dur:.1f}s, {len(dbs)} samples)")
+
         self.active = None
         self.relay.off()
         self.player.stop()
@@ -133,15 +221,31 @@ class Engine:
     def run(self):
         self.state.set(running=True, mode="idle")
 
+        # Repair any incidents left open by a previous crash
+        try:
+            repaired = self.storage.repair_stale_incidents()
+            if repaired:
+                print(f"[engine] Startup repaired {repaired} stale incident(s) from previous crash")
+        except Exception as e:
+            print(f"[engine] Stale incident repair error: {e}")
+
         # Run snippet cleanup at engine startup
-        snippets_dir = os.path.join(self.cfg["app"]["shared_dir"], "snippets")
         retention_days = int(self.cfg["audio"].get("retention_days", 30))
         try:
-            removed = self.storage.cleanup_old_snippets(snippets_dir, retention_days)
+            removed = self.storage.cleanup_old_snippets(retention_days)
             if removed:
                 print(f"[engine] Startup cleanup removed {removed} expired snippet(s)")
         except Exception as e:
             print(f"[engine] Startup cleanup error: {e}")
+
+        self._check_disk_quota()
+
+        # Periodic DB vacuum to reclaim space from soft-deleted rows
+        try:
+            self.storage.vacuum()
+            print("[engine] Startup DB vacuum complete")
+        except Exception as e:
+            print(f"[engine] DB vacuum error: {e}")
 
         last_cleanup = time.time()
         CLEANUP_INTERVAL = 86400  # Re-run cleanup once per day
@@ -164,7 +268,7 @@ class Engine:
                 bconf = beat_confidence_from_history(self.db_history)
                 mscore = music_like_score(features)
 
-                rule_name, threshold = applicable_threshold(self.cfg, datetime.now())
+                _, threshold = applicable_threshold(self.cfg, datetime.now())
                 self.state.set(current_db=round(db_now, 2), current_threshold_db=threshold)
 
                 prev = self.db_history[-2] if len(self.db_history) > 1 else db_now
@@ -217,11 +321,12 @@ class Engine:
                 # Periodic snippet cleanup (once per day)
                 if time.time() - last_cleanup >= CLEANUP_INTERVAL:
                     try:
-                        removed = self.storage.cleanup_old_snippets(snippets_dir, retention_days)
+                        removed = self.storage.cleanup_old_snippets(retention_days)
                         if removed:
                             print(f"[engine] Periodic cleanup removed {removed} expired snippet(s)")
                     except Exception as e:
                         print(f"[engine] Periodic cleanup error: {e}")
+                    self._check_disk_quota()
                     last_cleanup = time.time()
 
             except Exception as e:

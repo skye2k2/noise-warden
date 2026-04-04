@@ -149,7 +149,7 @@ class Storage:
         with self.conn() as c:
             return [dict(r) for r in c.execute("SELECT * FROM calibration_profiles ORDER BY id DESC").fetchall()]
 
-    def cleanup_old_snippets(self, snippets_dir: str, retention_days: int):
+    def cleanup_old_snippets(self, retention_days: int):
         cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
         removed = 0
         with self.conn() as c:
@@ -168,3 +168,29 @@ class Storage:
                         except Exception:
                             pass
         return removed
+
+    def repair_stale_incidents(self):
+        """Finalize any incidents left without an end_ts (abandoned after a crash).
+        Marks them with a sentinel end_ts and notes indicating they were crash-repaired."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT id, start_ts, start_db FROM incidents WHERE end_ts IS NULL AND deleted=0"
+            ).fetchall()
+            repaired = 0
+            for r in rows:
+                # Use the start_ts as a fallback end_ts — we can't know the real end
+                c.execute(
+                    "UPDATE incidents SET end_ts=?, duration_sec=0, notes=COALESCE(notes,'') || ? WHERE id=?",
+                    (r["start_ts"], " [crash-repaired: incident was active when engine stopped unexpectedly]", r["id"])
+                )
+                repaired += 1
+            return repaired
+
+    def vacuum(self):
+        """Reclaim disk space from soft-deleted rows and fragmentation.
+        Must run outside a transaction (SQLite requirement for VACUUM)."""
+        c = sqlite3.connect(self.db_path)
+        try:
+            c.execute("VACUUM")
+        finally:
+            c.close()

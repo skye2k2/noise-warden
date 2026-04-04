@@ -1,5 +1,5 @@
 from __future__ import annotations
-import glob, os, random, subprocess
+import glob, os, random, shlex, subprocess
 
 class RelayController:
     def __init__(self, gpio_pin: int):
@@ -36,7 +36,8 @@ class PlaylistPlayer:
         track = self._pick_file()
         if not track:
             return
-        args = self.player_command.split()
+        # shlex.split handles quoted paths and avoids shell metacharacter injection
+        args = shlex.split(self.player_command)
         args.append(track)
         self.proc = subprocess.Popen(args)
 
