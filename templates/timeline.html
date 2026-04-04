@@ -1,0 +1,4 @@
+{% extends "base.html" %}{% block content %}
+<div class="card"><h2>Timeline</h2><p>Lightweight vertical review; each incident labeled by initial dB and duration.</p><div class="timeline">
+{% for i in incidents %}<div class="incident-block"><div><strong>{{ i.start_ts }}</strong></div><div>Initial: {{ "%.2f"|format(i.start_db or 0) }} dB | Duration: {{ "%.1f"|format(i.duration_sec or 0) }}s | Music: {{ "%.2f"|format(i.music_like_score or 0) }}</div><div>ID {{ i.id }} • {{ i.mode }} • {{ i.classification }}</div></div>{% endfor %}
+</div></div>{% endblock %}

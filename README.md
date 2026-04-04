@@ -154,59 +154,72 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 - TODO: Ability to completely turn off recordings for limited-space scenarios
 - TODO: Home Assistant integration beyond REST stubs (MQTT, etc.)
 - TODO: Config validation on web UI save (currently accepts invalid YAML)
+- TODO: Wire `engine.stop()` to FastAPI shutdown lifecycle (lifespan handler or `on_event("shutdown")`)
+- TODO: Add arm/disarm or pause/resume controls back (v3 removed them; engine is always active with no way to temporarily pause monitoring)
+- TODO: Expose incident `notes` field in the UI for annotation (column exists in DB, never surfaced)
+- TODO: Add `/api/health` endpoint that reports engine thread liveness and mic capture status
 
 ### Stability (crash/data-loss risks, courtesy of Claude Opus 4.6)
 
-- **No thread safety on shared `RuntimeState`** — The engine thread writes fields (`active`, `last_db`, `peak_db`, etc.) while FastAPI handler threads read them simultaneously. Python's GIL provides some protection for simple attribute reads, but compound operations (like the running average calculation `sum_db / count_db`) are not atomic. Use a `threading.Lock` or at minimum a thread-safe snapshot method.
-- **SQLite `check_same_thread=False` without connection locking** — The engine thread and the web server thread both call into `IncidentStore` concurrently. SQLite in multi-threaded mode requires serialized access. A single accidental concurrent write will raise `sqlite3.OperationalError: database is locked`. Wrap all DB operations with a `threading.Lock`.
-- **Silent audio capture failure loop** — In `controller._run()`, if `primary.read()` throws, the code does `time.sleep(0.1); continue` with no logging, no retry counter, and no state indication. A disconnected USB mic will spin silently forever, looking armed and healthy on the dashboard. At minimum, log the error and set a visible `state.last_classification` like `"mic_error"`.
-- **Config save accepts arbitrary text without validation** — The `/config` POST endpoint writes raw form input directly to `noise_warden.yaml`. Invalid YAML (or even non-YAML content) will crash the app on next config reload or restart. Validate with `yaml.safe_load()` before writing.
-- **Unguarded `int()` / `float()` casts on config values** — `controller.__init__` does things like `int(self.cfg.get("audio","sample_rate"))` with no `try/except`. A typo in the YAML (`sample_rate: "fast"`) will crash the entire app at startup with an unhelpful ValueError.
-- **`RuntimeState` uses bare class attributes for `current_incident_start` and `pending_gap_since`** — These are declared outside the `dataclass` field syntax (no type annotation or `field()` call), meaning they're class-level attributes shared across instances. This works by accident with a single instance but is a latent bug if the class is ever instantiated more than once.
-- **No graceful shutdown** — `controller.stop()` is never called. The engine thread is daemonic so it dies on process exit, but active incidents are never closed, relay is never explicitly turned off, and the SQLite connection is never closed. A mid-incident kill leaves an open-ended incident in the DB and potentially a relay stuck on.
-- **Ring buffer `push()` is O(n) per sample** — `AudioRingBuffer.push()` iterates each sample individually via `.tolist()` and appends one at a time to a `deque`. At 48kHz with 1-second blocks, that's 48,000 `deque.append()` calls per block. This should use `deque.extend()` or better yet, a pre-allocated NumPy circular buffer.
+- ~~**SQLite `check_same_thread=False` without connection locking** — RESOLVED in v3: each operation opens its own connection via `Storage.conn()`.~~
+- ~~**`RuntimeState` uses bare class attributes** — RESOLVED in v3: replaced with plain dict `engine.state`.~~
+- ~~**Ring buffer `push()` is O(n) per sample** — RESOLVED in v3: replaced with block-level deque in `AudioCapture`.~~
+- **No thread safety on shared engine state** — The `engine.state` dict is mutated by the engine thread via `state.update()` while FastAPI handlers read it. `dict.update()` with multiple keys is not atomic — a reader can see a partially-updated snapshot. Use a `threading.Lock` or copy-on-write snapshot.
+- **Silent audio capture failure** — `AudioCapture.read_block()` uses `sd.rec()` + `sd.wait()` with no error handling. If the mic disconnects, the exception propagates unhandled in `engine.run()` — the `while self.running` loop has no `try/except`, so the thread dies silently. The dashboard continues showing stale data with no error indication.
+- **Config save accepts arbitrary text without validation** — The `/config/save` POST endpoint writes raw form input directly to `noise_warden.yaml`. Invalid YAML will crash the app on next config reload or restart. Validate with `yaml.safe_load()` before writing.
+- ~~**Unguarded `int()` / `float()` casts on config values** — Partially mitigated in v3: config access is simpler, but still no validation on load.~~
+- **`engine.stop()` defined but never called** — The method exists and correctly joins the thread, stops the player, and turns off the relay. But nothing in the web app lifecycle invokes it. SIGTERM still kills the daemon thread without cleanup, leaving open-ended incidents and potentially a stuck relay.
+- **Event audio frames accumulate unbounded in RAM** — `self.active['audio']` appends every block for the entire incident duration. At 16kHz × 0.5s blocks, a 4-hour incident accumulates ~230MB of float32 audio. On a 4GB Pi with other processes, this is a real OOM risk. Should write to disk in chunks or cap the in-memory buffer.
 
 ### Functionality (things that don't work as expected)
 
-- **Timeline view is cosmetic only** — The day/week/month selector in `loadTimeline()` changes a label string but performs no actual date filtering. All incidents are always shown regardless of the selected view mode.
-- **`snippet_post_seconds` config is never used** — The config declares it but the controller never reads it. Post-trigger frames are accumulated into `event_frames` indefinitely until the incident ends, meaning snippet length is determined entirely by incident duration, not the configured post-buffer.
-- **`driveby_max_duration_sec` and `thunder_taper_window_sec` config values are dead** — Declared in config but never referenced in `ExclusionEngine`. The drive-by filter uses a simple 3-sample peak-then-decay heuristic with no duration check.
-- **Incident average dB is a running mean, not a windowed mean** — `sum_db / count_db` accumulates over the entire incident. For a 4-hour incident, the average will be heavily weighted toward the early readings. A sliding window or exponential moving average would be more representative.
-- **`requests` in requirements.txt is unused** — Imported nowhere in the codebase. Likely a leftover from planned HA integration.
-- **Build photo `src` path has no leading separator normalization** — `build.html` renders `src="/{{ build.photo_path }}"` but `photo_path` is stored as `"data/uploads/build_photo.jpg"`, producing `src="/data/uploads/..."` which relies on the `/uploads` static mount being at a different path. The photo will 404. The `src` should reference `/uploads/build_photo{ext}` instead.
-- **Exclusion engine history is only 8 frames deep** — With 1-second blocks, the engine can only look back 8 seconds. The mower filter checks 4 frames and the thunder filter checks 4 frames, but a real mower or thunder event may need 15–30 seconds of context to confidently classify.
-- **`night_end` is used as `night_start` semantically** — `is_night_mode` uses `rules.night_end` as the "end" parameter which is `07:00`, but the actual config field name `night_end` is confusing because 07:00 is when night _ends_ and day _starts_. Consider renaming to `day_start` / `day_end` or `night_start` / `night_end` with consistent semantics, and add a comment explaining the boundary behavior.
+- ~~**`snippet_post_seconds` config never used** — RESOLVED in v3: config key removed.~~
+- ~~**`requests` in requirements.txt unused** — RESOLVED in v3: removed.~~
+- ~~**Build photo `src` path 404** — RESOLVED in v3: copies to `static/build/build_photo.jpg`.~~
+- ~~**`night_end` semantic confusion** — RESOLVED in v3: renamed to `night_start_hour` / `night_end_hour` integers.~~
+- **Timeline view still has no date filtering** — Now server-rendered but still shows all incidents with no day/week/month filtering. The view mode selector was removed, but no filtering was added.
+- **`driveby_max_duration_sec` config is dead code** — The drive-by exclusion filter was removed from `classify_noise()` but the config key persists, doing nothing.
+- **`music_like_score` formula uses undocumented magic numbers** — `0.6 * clamp(lowband_ratio * 1.6) + 0.4 * clamp(1.0 - abs(flatness - 0.35))` — the weights and constants appear hand-tuned with no documentation of what audio characteristics they target or how they were validated. This is the core detection mechanism.
+- **`beat_confidence` measures volatility, not rhythm** — `np.mean(np.abs(np.diff(arr))) / 8.0` on recent dB readings measures general level fluctuation, not rhythmic periodicity. A steady HVAC hum with fluctuating amplitude would score similarly to bass-heavy music. True beat detection needs autocorrelation or onset detection.
+- **Mower filter is broader than v2** — v3 uses `flatness >= 0.55 AND centroid > 500` which will match many broadband noise sources. v2's filter was more constrained (300–3000 Hz centroid range + multi-frame envelope stability). Expect more false rejections of legitimate nuisance noise.
+- **`engine.py` directly calls `self.storage.conn()`** — Line 56 reaches through the `Storage` abstraction to run raw SQL for updating `snippet_path`. Should be a `Storage` method.
+- **Incident average dB is still a simple running mean** — `sum(dbs)/len(dbs)` over the entire incident. For long incidents, early readings dominate. A sliding window or EMA would be more representative of recent conditions.
 
 ### Performance
 
-- **Ring buffer is the primary bottleneck** — As noted above, sample-by-sample Python-level iteration for 48,000 samples per second is orders of magnitude slower than it needs to be. A pre-allocated numpy array with a write pointer would eliminate this.
-- **`list(self.history_db)` called up to 4 times per frame in exclusion engine** — Each `list()` call copies the entire deque. Cache it once at the top of `decide()`.
-- **`spectral_features()` is called in `ExclusionEngine.decide()` unconditionally** — Even when all exclusion filters are disabled, the FFT is still computed. Short-circuit if no filters are enabled.
-- **`list_incidents()` returns the entire table every time** — No `LIMIT`, no pagination, no date filter. The dashboard slices to 25 client-side, but the full table is serialized and transferred on every 5-second poll. Add server-side `LIMIT` and offset params.
-- **CSV export writes all incidents to a file then serves it** — This creates a temp file on every export request. Use `StreamingResponse` with a generator instead, or at least clean up the file afterward. The file also accumulates if exported repeatedly under different names (though currently it's always the same filename, so it overwrites).
-- **No WAV cleanup or rotation** — Snippets accumulate in `data/snippets/` forever. On a Pi with a 32GB SD card recording multi-hour incidents at 48kHz mono, storage will fill up. This is already listed as a TODO but bears repeating: without rotation, this will eventually crash the system.
+- ~~**Ring buffer is the primary bottleneck** — RESOLVED in v3: block-level deque.~~
+- ~~**`list(self.history_db)` repeated copies** — RESOLVED in v3: `ExclusionEngine` removed.~~
+- ~~**CSV export writes temp file** — RESOLVED in v3: uses `StreamingResponse`.~~
+- **`list_incidents()` still returns the entire table** — No `LIMIT`, no pagination, no date filter. Dashboard slices to 20 server-side (improvement), but the incidents page and timeline load everything. For a home system running 24/7 over weeks, the incident count will grow and page load times will degrade.
+- **No WAV cleanup or rotation** — Snippets accumulate in `/opt/noise-warden/shared/snippets/` forever. On a Pi with limited storage, this will eventually fill the disk.
+- **Blocking `sd.rec()` prevents multi-mic support** — v2 used non-blocking callback streams that could handle multiple inputs concurrently. v3's blocking `sd.rec()` + `sd.wait()` serializes the engine thread — re-adding secondary/reference mic support would require the architecture to change again.
 
 ### Usability
 
-- **No confirmation on destructive actions** — "Clear All Incidents" and individual "Delete" buttons fire immediately with no confirmation dialog. One accidental tap deletes your evidence.
-- **No visible error state on dashboard** — If the mic disconnects, the dashboard continues showing the last known dB reading and "armed" status. There's no visual indicator that the system is deaf.
-- **Config page has no feedback on save** — After saving, the user is redirected back to the config page with no success/failure message. If the save failed (disk full, permissions), they'd never know.
-- **Dashboard "Disarm" button doubles as "Emergency Kill"** — The label says "Disarm / Emergency Kill" but functionally it just sets `armed = False`. There's no separate kill state, no confirmation for the emergency action, and no distinction between "pause monitoring" and "stop everything NOW."
-- **Build page only stores one photo** — The singleton `build_info` table (enforced by `CHECK (id = 1)`) means uploading a new photo silently overwrites the old one. For documenting a build over time, multiple photos would be valuable.
-- **No mobile-friendly touch targets** — Buttons use default `8px 12px` padding. On a phone screen (the most likely access method for checking status from inside), these are uncomfortably small.
+- ~~**No confirmation on destructive actions** — RESOLVED in v3: `onsubmit="return confirm(...)"` added to delete forms.~~
+- ~~**Dashboard "Disarm" doubles as "Emergency Kill"** — RESOLVED (by removal) in v3: arm/disarm controls removed entirely. Engine is always active.~~
+- **No visible error state on dashboard** — If the mic disconnects, the dashboard continues showing stale state JSON. There's no visual indicator that the system is deaf. The engine thread dies silently.
+- **Config page has no feedback on save** — After saving, the user is redirected back to the config page with no success/failure message.
+- **Build page only stores one photo** — Uploading a new photo overwrites the previous one. For documenting a build over time (or different angles/placements), multiple photos would be valuable.
+- **No mobile-friendly touch targets** — Buttons use default `8px` padding. On a phone screen (the most likely way to check status from inside the house), these are uncomfortably small.
 - **No incident detail/edit view** — The `notes` column exists in the DB but is never exposed in the UI. You can't annotate incidents with context like "this was the Wednesday party" or "false positive — garbage truck."
+- **No way to pause/resume monitoring** — v3 removed arm/disarm. The engine runs unconditionally. If you need to temporarily stop monitoring (e.g., you're the one making noise), the only option is stopping the systemd service via SSH.
+- **Calibration profiles are computed but not auto-applied** — The calibration wizard computes and saves an offset, but the user must manually edit `config/noise_warden.yaml` to apply it. A "use this profile" button would close the loop.
 
 ### Security
 
-- **No authentication whatsoever** — Any device on the network can arm/disarm the system, delete all incidents, or overwrite the config. The v0 bearer token auth was removed and not replaced. At minimum, add a simple shared secret or basic auth for mutation endpoints.
-- **Player command template is an injection vector** — `PlaylistPlayer.start()` uses `command_template.format(file=str(target)).split()` to build the subprocess args. If a filename contains spaces, the split will break the command. If the `player_command` config is modified by an attacker (since config has no auth), they can execute arbitrary commands via template injection.
-- **Photo upload has no file-type validation** — The build page accepts any file the browser sends, regardless of the `accept="image/*"` hint (which is client-side only). There's no server-side MIME type or extension check. A malicious upload could place executable content in the uploads directory.
-- **Static file mounts expose data directories** — `/snippets` and `/uploads` are mounted as static file directories, making all uploaded and recorded files browsable by anyone on the network.
+- **No authentication whatsoever** — Any device on the network can delete all incidents, overwrite the config, or upload files. The v0 bearer token auth was removed and never replaced.
+- **Player command injection** — `PlaylistPlayer.start()` uses `.split()` on the command template. While the filename is now passed as a separate arg (improvement over v2), `self.player_cmd.split()` still breaks on quoted args or paths with spaces. The config endpoint has no auth, so an attacker could inject arbitrary commands via the player_cmd field.
+- **Photo upload has no file-type validation** — No server-side MIME type or extension check. A malicious upload could place executable content in the static directory.
+- **Service runs as `User=root`** — v3 changed from `User=pi` to `User=root`. The entire web server, file writes, GPIO access, and subprocess execution now run with full root privileges. Should use a dedicated unprivileged user with GPIO group membership.
+- **Static file mounts expose data directories** — `/static/build/` serves uploaded photos to anyone on the network without authentication.
 
 ### Install / deploy
 
-- **Install script uses `sudo sed` write to `/etc/systemd/system/` with no permission check** — The intermediate step writes to `/tmp/noise-warden.service` then uses `sudo sed` to write to the system directory, but the `sed` redirect (`>`) runs in the calling shell's context, not under `sudo`. This will fail with "Permission denied." Should be `sudo cp` or `sudo tee`.
-- **Service file hardcodes `User=pi`** — Not all Pi setups use the `pi` user. The install script should either detect the current user or make it configurable.
-- **No health check endpoint** — There's no `/api/health` or similar for monitoring tools to check if the service is running and the audio pipeline is healthy. The systemd service will restart on crash but won't detect a hung audio thread.
+- ~~**Install script `sudo sed` permission failure** — RESOLVED in v3: uses `sudo cp`.~~
+- ~~**Service file hardcodes `User=pi`** — Changed in v3, but to `User=root` (see Security).~~
+- **`static/` and `static/build/` directories not created by install script** — The web app mounts `/static` and the photo upload copies to `static/build/`. Neither directory is created during install. First photo upload will fail with a FileNotFoundError.
+- **No health check endpoint** — No `/api/health` for monitoring tools to verify the service and audio pipeline are healthy. Systemd restarts on crash but cannot detect a hung engine thread.
+- **Install script enforces `/opt/noise-warden/` but config hardcodes paths** — Both `install_pi.sh` and `noise_warden.yaml` assume `/opt/noise-warden/shared/` paths. If someone changes the base path in one place, the other breaks silently.
 
 </details>

@@ -1,0 +1,7 @@
+{% extends "base.html" %}{% block content %}
+<div class="card"><h2>Calibration Wizard</h2><p>Enter a known reference SPL and the observed raw dBFS reading to compute an offset.</p>
+<form id="calform"><input type="text" name="name" placeholder="Profile name" required><br><input type="number" step="0.01" name="reference_spl_db" placeholder="Reference SPL dB" required><br><input type="number" step="0.01" name="observed_raw_dbfs" placeholder="Observed raw dBFS" required><br><button type="submit">Compute & Save Profile</button></form><pre id="calout"></pre></div>
+<div class="card"><h2>Saved Profiles</h2><table><tr><th>ID</th><th>Name</th><th>Offset dB</th><th>Created</th></tr>{% for p in profiles %}<tr><td>{{ p.id }}</td><td>{{ p.name }}</td><td>{{ "%.2f"|format(p.offset_db) }}</td><td>{{ p.created_ts }}</td></tr>{% endfor %}</table></div>
+<script>
+document.getElementById('calform').addEventListener('submit', async (e)=>{e.preventDefault();const fd=new FormData(e.target);const r=await fetch('/calibration/compute',{method:'POST',body:fd});const d=await r.json();document.getElementById('calout').innerText='Computed offset_db = '+d.offset_db.toFixed(2)+'\nSaved profile.\nApply it by editing config/noise_warden.yaml calibration_offset_db.';setTimeout(()=>location.reload(),1000);});
+</script>{% endblock %}

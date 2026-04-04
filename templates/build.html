@@ -1,0 +1,5 @@
+{% extends "base.html" %}{% block content %}
+<div class="grid"><div class="card"><h2>Build Photo</h2>{% if photo_exists %}<img src="/static/build/build_photo.jpg" alt="Build photo"><p>Static copy is cached in the web UI for resilient display.</p>{% else %}<p>No photo uploaded yet.</p>{% endif %}
+<form method="post" action="/build/upload_photo" enctype="multipart/form-data"><input type="file" name="photo" accept="image/*" required><button type="submit">Upload / Replace Photo</button></form></div>
+<div class="card"><h2>Build Notes + Ordinance Reference</h2><form method="post" action="/build/save_notes"><label>Build / Calibration / Placement Notes</label><textarea name="notes">{{ notes }}</textarea><label>Collapsed Ordinance Reference Excerpt</label><textarea name="excerpt">{{ excerpt }}</textarea><button type="submit">Save</button></form></div></div>
+{% endblock %}

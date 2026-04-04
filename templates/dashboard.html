@@ -1,0 +1,6 @@
+{% extends "base.html" %}{% block content %}
+<div class="grid"><div class="card"><h2>Live State</h2><pre id="live-state">{{ state | tojson(indent=2) }}</pre></div>
+<div class="card"><h2>Current Thresholds</h2><div>Day: {{ cfg.thresholds.residential_day_db }} dB</div><div>Night: {{ cfg.thresholds.residential_night_db }} dB</div><div>Night window: {{ cfg.thresholds.night_start_hour }}:00–{{ cfg.thresholds.night_end_hour }}:00</div></div></div>
+<div class="card"><h2>Recent Incidents</h2><table><tr><th>ID</th><th>Start</th><th>Initial dB</th><th>Music</th><th>Duration</th><th>Mode</th></tr>
+{% for i in incidents %}<tr><td>{{ i.id }}</td><td>{{ i.start_ts }}</td><td>{{ "%.2f"|format(i.start_db or 0) }}</td><td>{{ "%.2f"|format(i.music_like_score or 0) }}</td><td>{{ "%.1f"|format(i.duration_sec or 0) }}s</td><td>{{ i.mode }}</td></tr>{% endfor %}
+</table></div>{% endblock %}

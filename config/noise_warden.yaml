@@ -1,58 +1,53 @@
-site:
-  city_name: Pleasant Grove
-  ordinance_reference: "Pleasant Grove Code - Public Disturbances / Residential measurement section"
+app:
+  host: 0.0.0.0
+  port: 8787
+  refresh_interval_sec: 5
+
+paths:
+  shared_root: /opt/noise-warden/shared
+  db_path: /opt/noise-warden/shared/noise_warden.db
+  snippets_dir: /opt/noise-warden/shared/snippets
+  build_dir: /opt/noise-warden/shared/build
+  build_photo_path: /opt/noise-warden/shared/build/build_photo.jpg
+  build_notes_path: /opt/noise-warden/shared/build/build_notes.txt
+  ordinance_excerpt_path: /opt/noise-warden/shared/build/ordinance_excerpt.txt
 
 audio:
-  sample_rate: 48000
-  block_seconds: 1.0
-  channels_primary: 1
-  primary_device: null
-  channels_secondary: 1
-  secondary_device: null
-  channels_reference: 1
-  reference_device: null
-  enable_secondary_mic: false
-  enable_reference_input: false
-  snippet_pre_seconds: 15
-  snippet_post_seconds: 10
+  sample_rate: 16000
+  channels: 1
+  block_sec: 0.5
+  prebuffer_sec: 8
+  calibration_offset_db: 100.0
+  min_event_duration_sec: 8
+  song_gap_merge_sec: 10
+  hysteresis_db: 4.0
 
-gpio:
-  enable_relay: true
-  relay_pin: 17
-  relay_active_high: true
+thresholds:
+  residential_day_db: 55.0
+  residential_night_db: 50.0
+  night_start_hour: 22
+  night_end_hour: 7
+
+filters:
+  enable_impulse_reject: true
+  impulse_peak_delta_db: 18.0
+  enable_driveby_reject: true
+  driveby_max_duration_sec: 20
+  enable_mower_reject: true
+  mower_flatness_threshold: 0.55
+  enable_thunder_reject: true
+  thunder_peak_delta_db: 24.0
+  thunder_lowband_ratio_min: 0.40
+  enable_rain_reject: true
+  rain_flatness_threshold: 0.72
+
+detection:
+  min_music_like_score: 0.45
+  min_beat_confidence: 0.20
 
 response:
   enable_daytime_response: false
-  playlist_dir: "./media/playlist"
-  player_command: "ffplay -nodisp -autoexit -loglevel quiet {file}"
-  amp_power_on_delay_sec: 0.75
-
-rules:
-  night_start: "22:00"
-  night_end: "07:00"
-  residential_day_threshold_db: 60.0
-  residential_night_threshold_db: 55.0
-  evaluation_interval_sec: 10
-  release_below_threshold_sec: 20
-  song_gap_merge_sec: 10
-  min_event_duration_sec: 15
-  hysteresis_db: 3.0
-
-filters:
-  exclude_impulse: true
-  impulse_peak_delta_db: 18.0
-  exclude_driveby: true
-  driveby_max_duration_sec: 18
-  exclude_mower_like: true
-  exclude_thunder_like: true
-  thunder_impulse_delta_db: 22.0
-  thunder_low_band_hz_max: 120.0
-  thunder_taper_window_sec: 6
-  exclude_rain_like: true
-  rain_flatness_threshold: 0.65
-  rain_band_energy_spread_threshold: 0.75
-
-web:
-  host: "0.0.0.0"
-  port: 8787
-  refresh_seconds: 5
+  relay_gpio_pin: 17
+  playlist_path: /opt/noise-warden/shared/playlist
+  player_cmd: ffplay -nodisp -autoexit -loglevel quiet
+  max_response_minutes: 60
