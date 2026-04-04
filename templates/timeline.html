@@ -1,4 +1,19 @@
-{% extends "base.html" %}{% block content %}
-<div class="card"><h2>Timeline</h2><p>Lightweight vertical review; each incident labeled by initial dB and duration.</p><div class="timeline">
-{% for i in incidents %}<div class="incident-block"><div><strong>{{ i.start_ts }}</strong></div><div>Initial: {{ "%.2f"|format(i.start_db or 0) }} dB | Duration: {{ "%.1f"|format(i.duration_sec or 0) }}s | Music: {{ "%.2f"|format(i.music_like_score or 0) }}</div><div>ID {{ i.id }} • {{ i.mode }} • {{ i.classification }}</div></div>{% endfor %}
-</div></div>{% endblock %}
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Timeline ({{ view }})</h2>
+  <p>
+    <a href="/timeline?view=day">Day</a> |
+    <a href="/timeline?view=week">Week</a> |
+    <a href="/timeline?view=month">Month</a>
+  </p>
+  <div>
+    {% for r in rows %}
+      <div class="card" style="margin-bottom:8px;">
+        <b>#{{ r.id }}</b> {{ r.start_ts }}<br>
+        Start dB: {{ r.start_db }} | Duration: {{ r.duration_sec or "active" }} sec
+      </div>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

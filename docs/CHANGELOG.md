@@ -1,5 +1,106 @@
 # noise-warden CHANGELOG
 
+## v4 - 2026-04-04 — "Secure-er Ordinance-Anchored Evidence Edition"
+
+Package renamed from `app` to `noise_warden`. Ordinance thresholds are now embedded and authoritative. Thread-safe state, config validation, MQTT Home Assistant integration, WAV chunk-to-disk recording (no unbounded RAM), `/api/health`, pause/resume controls, incident notes in UI, timeline date filtering, bearer token auth, dedicated `noisewarden` service user, and snippet retention cleanup.
+
+<details>
+
+<summary>Key details</summary>
+
+### Architecture
+
+- Python package renamed: `app/` → `noise_warden/`
+- Entry point changed: `python -m app.main` → `uvicorn noise_warden.main:app`
+- New modules:
+  - `noise_warden/state.py` — `StateStore` with `threading.Lock` for thread-safe state snapshots
+  - `noise_warden/ordinance.py` — Pleasant Grove ordinance thresholds embedded as structured data; `applicable_threshold()` returns rule name + dB limit based on zone, mode, and time of day
+  - `noise_warden/ha.py` — `HAClient` with real MQTT publish via `paho-mqtt` (state + event topics)
+  - `noise_warden/plugins.py` — `ReferenceSubtractor` and `DualMicDifferential` placeholder classes for future adaptive filter work
+- `noise_warden/config.py` — `validate_config()` enforces required sections, positive numerics, valid detection mode, and boolean types at load time; `save_yaml_text_validated()` validates before writing
+- Service file moved from `services/` to `deploy/`
+
+### Added
+
+- **Thread-safe `StateStore`** — `threading.Lock` protects all reads and writes; `snapshot()` returns a `deepcopy` for safe cross-thread access
+- **Config validation** — `validate_config()` checks required sections, numeric ranges, detection mode enum, and boolean types. `save_yaml_text_validated()` validates YAML before writing to disk; invalid config returns an error message via query param redirect
+- **`/api/health` endpoint** — returns engine thread liveness, mic status, last error, and full state snapshot
+- **Pause / Resume controls** on dashboard — `POST /control/pause` and `POST /control/resume` toggle `state.armed`; engine loop skips processing when not armed
+- **Incident notes in UI** — each incident row has an inline textarea + "Save Notes" button that POSTs to `/incidents/{id}/notes`
+- **Timeline date filtering** — day/week/month links pass `?view=` query param; `since_for_view()` computes UTC cutoff; `list_incidents(since=...)` filters in SQL
+- **Bearer token authentication** — `app.auth_token` config field; `must_auth()` checks `Authorization: Bearer` header on all mutation and page endpoints; blank token disables auth (LAN-only mode)
+- **Photo upload file-type validation** — server-side extension check rejects files not ending in `.jpg`, `.jpeg`, `.png`, `.webp`
+- **WAV chunk-to-disk recording** — incident audio written to `soundfile.SoundFile` in append mode during capture; no unbounded RAM accumulation. Pre-roll blocks written at incident start.
+- **`recording_enabled` config toggle** — allows completely disabling snippet recording for limited-space scenarios
+- **Snippet retention cleanup** — `Storage.cleanup_old_snippets()` removes WAV files older than `retention_days`
+- **Home Assistant MQTT integration** — `HAClient` connects via `paho-mqtt`; publishes state (retained) and events (non-retained) to configurable topic prefix. Supports username/password auth.
+- **`home_assistant` config section** — `enabled`, `mode` (mqtt/rest_stub), host, port, topic prefix, credentials
+- **`plugins` config section** — feature flags for `enable_reference_subtraction` and `enable_dual_mic_diff`
+- **Dedicated `noisewarden` service user** — install script creates system user with `audio` + `gpio` group membership; service file runs as `noisewarden:noisewarden`
+- **Config path via environment variable** — `NOISE_WARDEN_CONFIG` env var overrides default path
+- **`soundfile` dependency re-added** — used for chunk-to-disk WAV writing (more capable than stdlib `wave` for append mode)
+- **`paho-mqtt` dependency added**
+- **`python-multipart` dependency removed** (FastAPI handles form parsing)
+- **Ordinance data structure** in `ordinance.py` — full Pleasant Grove residential/agricultural thresholds, measurement guidance (mic placement, A-weighting, slow/fast response), and legal notes embedded as a dict
+- **Detection mode** — config supports `continuous`, `intermittent`, and `continuous_music_focus`; threshold lookup adapts per mode
+- **Richer exclusion filter config** — `rain_low_variance_db`, `mower_centroid_min_hz`, `mower_centroid_max_hz` replace previous single-threshold approach
+- **`dba_estimate()` function** — replaces raw `+ offset` in engine; named for clarity
+- **Engine error handling** — `try/except` around entire loop body; on exception sets `state.mic_ok=False`, `last_error`, `mode="error"`, sleeps 1s and retries
+- **`spectrum_features` returns 3-band breakdown** — `lowband_ratio` (30–180 Hz), `midband_ratio` (180–1200 Hz), `highband_ratio` (>1200 Hz) in addition to centroid and flatness
+- **Pagination on incidents page** — `list_incidents(limit=50, offset=...)` with page navigation links
+- **Incident count** — `Storage.count_incidents()` for pagination math
+- **`static/` and `static/build/` directories** created by `web.py` at startup via `os.makedirs(..., exist_ok=True)`
+- **Flash-style messages** — config save, pause/resume, delete actions pass `?msg=` query params rendered in templates
+- **Mobile-friendly touch targets** — button padding increased to `12px 16px`
+- **`viewport` meta tag** — `<meta name="viewport" content="width=device-width, initial-scale=1">` added to `base.html`
+
+### Changed
+
+- **`beat_confidence_from_history()`** rewritten — now uses autocorrelation across lag windows (2–8 blocks) instead of mean absolute dB delta. Still heuristic, but measures periodicity rather than just volatility.
+- **Mower filter** — now uses configurable `centroid_min_hz` / `centroid_max_hz` (default 300–3000) and requires `env_std <= 3.5` over last 12 readings. Tighter than v3's `centroid > 500` single threshold.
+- **Rain filter** — added `rain_low_variance_db` check (dB standard deviation ≤ threshold over recent history) in addition to flatness. More precise than flatness alone.
+- **Thunder filter** — raised `lowband_ratio` threshold from 0.45 (implicit) to explicit config at 0.55; also checks `flatness > 0.45`
+- **`music_like_score()`** — now accepts features dict instead of raw block + sample rate; formula documented inline as "strong low-band energy + not-too-flat spectrum"
+- **Low-band analysis range** expanded from 20–120 Hz (v2) / 20–250 Hz (v3) to 30–180 Hz (aligns with typical bass music fundamentals)
+- **`calibration_offset_db` default** changed from 100.0 to 88.0
+- **Config structure** — `detection` section replaces combined `thresholds` + `filters` from v3; all filter params moved under `detection`
+- **Storage `conn()`** now uses `contextmanager` with explicit `commit()` and `close()` pattern
+- **`finalize_incident()`** — dedicated `Storage` method replaces raw SQL through `conn()` in engine
+- **Snippet audio** served via `/snippets/{incident_id}` route (stream from path) instead of static file mount
+- **`RelayController`** — `gpiozero` import removed entirely; now a simple boolean flag class (placeholder for real GPIO wiring)
+- **`PlaylistPlayer`** — no longer passes filename separately; just runs the player command. Switches back to `cvlc` from `ffplay`.
+- **Install script** — creates `noisewarden` user, sets ownership, uses `sudo cp` for service file
+- **Deploy script** — simplified; no longer creates venv from scratch on upgrade (reuses existing)
+- **Service file** — runs as `User=noisewarden`, uses `uvicorn` directly, sets `NOISE_WARDEN_CONFIG` env var
+- **UI theme** — reverted from dark theme to light (white background, white cards, dark nav)
+- **Thresholds page removed** — ordinance reference now displayed on dashboard directly
+
+### Removed
+
+- `app/` package directory (entire tree) — replaced by `noise_warden/`
+- `services/` directory — service file moved to `deploy/`
+- `templates/thresholds.html` — ordinance info moved to dashboard
+- `gpiozero` dependency — relay is now a flag-only placeholder
+- `scipy` dependency — FFT now uses `numpy.fft` exclusively
+- Calibration profiles table and wizard computation — replaced by simpler manual calibration instructions
+- `db_history` capping via list slice — now capped to 240 entries (was 20 in v3)
+- `python-multipart` dependency
+
+### Known issues & technical debt
+
+- **`RelayController` is a no-op** — `on()` and `off()` just toggle a boolean flag. No actual GPIO control. Needs `gpiozero` (or equivalent) integration to function.
+- **Snippet serving loads into memory via `StreamingResponse(open(..., "rb"))`** — for large WAV files (multi-hour incidents), this holds a file handle open for the duration of the HTTP response. Not a major risk at home-network scale, but not ideal.
+- **`cleanup_old_snippets()` is defined but never called** — the retention cleanup method exists but no scheduled invocation (e.g., periodic task or startup sweep) triggers it.
+- **`driveby_max_duration_sec` config key still dead** — declared in config but no drive-by filter exists in `dsp.py`
+- **`sustain_blocks_required` and `release_blocks_required` config keys unused** — declared in detection config but never referenced in `engine.py`; incident start/end is controlled by single-block threshold crossing + `song_gap_merge_sec` gap timer
+- **Auth is header-only (Bearer token)** — web UI forms don't send `Authorization` headers; browser page loads will fail auth if `auth_token` is set. Auth currently only works for API consumers, not the HTML UI. Need cookie/session-based auth for browser access, or bypass auth for GET pages.
+- **`PlaylistPlayer.start()` runs player command without the playlist file** — `self.proc = subprocess.Popen(args)` runs `cvlc --play-and-exit --no-video` with no file argument. The player will start and immediately exit (or wait for stdin). The playlist directory is stored but never used to select a file.
+- **No "Clear All Incidents" button** — v3 had it with confirmation; v4 removed it without replacement
+- **MQTT publishes on every engine loop iteration** — `publish_state()` called every 0.5s block. At low QoS this floods the broker with ~120 msgs/min for no benefit. Should throttle to every N seconds.
+- **Plugin classes are pure stubs** — `ReferenceSubtractor.process()` and `DualMicDifferential.process()` return the primary block unchanged and are never called from the engine
+
+</details>
+
 ## v3 - 2026-04-03 — "Redeployable Edition"
 
 Major architectural flattening, new DSP pipeline with music-likeness scoring and beat confidence, calibration wizard, symlink-based deployment model, and server-side rendering throughout. Sample rate dropped from 48kHz to 16kHz.

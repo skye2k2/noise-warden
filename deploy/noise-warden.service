@@ -1,0 +1,16 @@
+[Unit]
+Description=Noise Warden
+After=network.target sound.target
+
+[Service]
+Type=simple
+User=noisewarden
+Group=noisewarden
+WorkingDirectory=/opt/noise-warden/current
+Environment=NOISE_WARDEN_CONFIG=/opt/noise-warden/current/config/noise_warden.yaml
+ExecStart=/opt/noise-warden/venv/bin/uvicorn noise_warden.main:app --host 0.0.0.0 --port 8787
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

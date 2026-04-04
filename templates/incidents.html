@@ -1,6 +1,49 @@
-{% extends "base.html" %}{% block content %}
-<div class="card"><h2>Incident Table</h2>
-<form method="post" action="/incidents/clear" onsubmit="return confirm('Clear all incidents (soft delete)?');"><button type="submit">Clear All</button> <a href="/incidents/export.csv">Export CSV</a></form>
-<table><tr><th>ID</th><th>Start</th><th>End</th><th>Duration</th><th>Initial dB</th><th>Peak dB</th><th>Avg dB</th><th>Threshold</th><th>Music</th><th>Beat</th><th>Class</th><th>Mode</th><th>Merges</th><th>Audio</th><th>Actions</th></tr>
-{% for i in incidents %}<tr><td>{{ i.id }}</td><td>{{ i.start_ts }}</td><td>{{ i.end_ts }}</td><td>{{ "%.1f"|format(i.duration_sec or 0) }}s</td><td>{{ "%.2f"|format(i.start_db or 0) }}</td><td>{{ "%.2f"|format(i.peak_db or 0) }}</td><td>{{ "%.2f"|format(i.avg_db or 0) }}</td><td>{{ "%.2f"|format(i.threshold_db or 0) }}</td><td>{{ "%.2f"|format(i.music_like_score or 0) }}</td><td>{{ "%.2f"|format(i.beat_confidence or 0) }}</td><td>{{ i.classification }}</td><td>{{ i.mode }}</td><td>{{ i.merge_count }}</td><td>{% if i.snippet_path %}<audio controls preload="none" src="/incidents/{{ i.id }}/audio"></audio>{% endif %}</td><td><form method="post" action="/incidents/{{ i.id }}/delete" onsubmit="return confirm('Delete incident?');"><button type="submit">Delete</button></form></td></tr>{% endfor %}
-</table></div>{% endblock %}
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Incidents</h2>
+  <table>
+    <tr>
+      <th>ID</th><th>Start</th><th>End</th><th>Start dB</th><th>Peak</th><th>Avg</th><th>Duration</th>
+      <th>Music</th><th>Beat</th><th>Class</th><th>Snippet</th><th>Notes</th><th>Delete</th>
+    </tr>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.id }}</td>
+      <td>{{ r.start_ts }}</td>
+      <td>{{ r.end_ts or "" }}</td>
+      <td>{{ r.start_db }}</td>
+      <td>{{ r.peak_db }}</td>
+      <td>{{ r.avg_db }}</td>
+      <td>{{ r.duration_sec or "" }}</td>
+      <td>{{ r.music_like_score }}</td>
+      <td>{{ r.beat_confidence }}</td>
+      <td>{{ r.classification }}</td>
+      <td>{% if r.snippet_path %}<audio controls src="/snippets/{{ r.id }}"></audio>{% endif %}</td>
+      <td>
+        <form method="post" action="/incidents/{{ r.id }}/notes">
+          <textarea name="notes" style="min-height:70px;">{{ r.notes or "" }}</textarea>
+          <input type="submit" value="Save Notes">
+        </form>
+      </td>
+      <td>
+        <form method="post" action="/incidents/{{ r.id }}/delete" onsubmit="return confirm('Delete incident?')">
+          <button>Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p>
+    {% if page > 1 %}<a href="/incidents?page={{ page - 1 }}">Prev</a>{% endif %}
+    &nbsp; Page {{ page }} of {{ pages }} &nbsp;
+    {% if page < pages %}<a href="/incidents?page={{ page + 1 }}">Next</a>{% endif %}
+  </p>
+  <p><a href="/export.csv">Export CSV</a></p>
+  <p>
+    <form method="post" action="/incidents/clear" onsubmit="return confirm('Delete ALL incidents? This cannot be undone.')">
+      <button style="background:#c0392b;">Clear All Incidents</button>
+    </form>
+  </p>
+</div>
+{% endblock %}

@@ -1,6 +1,45 @@
-{% extends "base.html" %}{% block content %}
-<div class="grid"><div class="card"><h2>Live State</h2><pre id="live-state">{{ state | tojson(indent=2) }}</pre></div>
-<div class="card"><h2>Current Thresholds</h2><div>Day: {{ cfg.thresholds.residential_day_db }} dB</div><div>Night: {{ cfg.thresholds.residential_night_db }} dB</div><div>Night window: {{ cfg.thresholds.night_start_hour }}:00–{{ cfg.thresholds.night_end_hour }}:00</div></div></div>
-<div class="card"><h2>Recent Incidents</h2><table><tr><th>ID</th><th>Start</th><th>Initial dB</th><th>Music</th><th>Duration</th><th>Mode</th></tr>
-{% for i in incidents %}<tr><td>{{ i.id }}</td><td>{{ i.start_ts }}</td><td>{{ "%.2f"|format(i.start_db or 0) }}</td><td>{{ "%.2f"|format(i.music_like_score or 0) }}</td><td>{{ "%.1f"|format(i.duration_sec or 0) }}s</td><td>{{ i.mode }}</td></tr>{% endfor %}
-</table></div>{% endblock %}
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Dashboard</h2>
+  {% if message %}<p><b>{{ message }}</b></p>{% endif %}
+  <p>
+    <span class="pill">Running: {{ state.running }}</span>
+    <span class="pill">Armed: {{ state.armed }}</span>
+    <span class="pill">Mic OK: {{ state.mic_ok }}</span>
+    <span class="pill">Mode: {{ state.mode }}</span>
+    <span class="pill">Current dB: {{ state.current_db }}</span>
+    <span class="pill">Threshold: {{ state.current_threshold_db }}</span>
+  </p>
+  <p class="small">If Home Assistant is unavailable, cached browser state can still be shown; the local web app remains authoritative.</p>
+  <form method="post" action="/control/pause" style="display:inline-block;"><button>Pause</button></form>
+  <form method="post" action="/control/resume" style="display:inline-block;"><button>Resume</button></form>
+</div>
+
+<div class="card">
+  <h3>Residential Ordinance Reference (Pleasant Grove)</h3>
+  <ul>
+    <li>Day: 7:00 AM–10:00 PM; Night: 10:00 PM–7:00 AM</li>
+    <li>Continuous public disturbance (A2/A3): 65 dBA day / 55 dBA night</li>
+    <li>Intermittent public disturbance (A2/A3): 70 dBA day / 60 dBA night</li>
+    <li>Impulse: 75 dBA day / 60 dBA night (FAST) — excluded from retaliation logic</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h3>Recent Incidents</h3>
+  <table>
+    <tr><th>ID</th><th>Start</th><th>Start dB</th><th>Duration</th><th>Music Score</th><th>Mode</th></tr>
+    {% for r in incidents %}
+    <tr>
+      <td>{{ r.id }}</td>
+      <td>{{ r.start_ts }}</td>
+      <td>{{ r.start_db }}</td>
+      <td>{{ r.duration_sec or "" }}</td>
+      <td>{{ r.music_like_score }}</td>
+      <td>{{ r.mode }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

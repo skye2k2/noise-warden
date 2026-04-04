@@ -1,53 +1,56 @@
 app:
+  base_dir: /opt/noise-warden
+  shared_dir: /opt/noise-warden/shared
+  static_dir: /opt/noise-warden/current/static
   host: 0.0.0.0
   port: 8787
-  refresh_interval_sec: 5
-
-paths:
-  shared_root: /opt/noise-warden/shared
-  db_path: /opt/noise-warden/shared/noise_warden.db
-  snippets_dir: /opt/noise-warden/shared/snippets
-  build_dir: /opt/noise-warden/shared/build
-  build_photo_path: /opt/noise-warden/shared/build/build_photo.jpg
-  build_notes_path: /opt/noise-warden/shared/build/build_notes.txt
-  ordinance_excerpt_path: /opt/noise-warden/shared/build/ordinance_excerpt.txt
+  auth_token: ""  # optional bearer token; blank disables auth (LAN only)
 
 audio:
   sample_rate: 16000
-  channels: 1
-  block_sec: 0.5
-  prebuffer_sec: 8
-  calibration_offset_db: 100.0
-  min_event_duration_sec: 8
-  song_gap_merge_sec: 10
-  hysteresis_db: 4.0
-
-thresholds:
-  residential_day_db: 55.0
-  residential_night_db: 50.0
-  night_start_hour: 22
-  night_end_hour: 7
-
-filters:
-  enable_impulse_reject: true
-  impulse_peak_delta_db: 18.0
-  enable_driveby_reject: true
-  driveby_max_duration_sec: 20
-  enable_mower_reject: true
-  mower_flatness_threshold: 0.55
-  enable_thunder_reject: true
-  thunder_peak_delta_db: 24.0
-  thunder_lowband_ratio_min: 0.40
-  enable_rain_reject: true
-  rain_flatness_threshold: 0.72
+  block_seconds: 0.5
+  input_device: null
+  input_channels: 1
+  recording_enabled: true
+  snippet_pre_seconds: 12
+  snippet_post_seconds: 8
+  chunk_flush_seconds: 30
+  max_incident_record_hours: 6
+  retention_days: 30
 
 detection:
-  min_music_like_score: 0.45
-  min_beat_confidence: 0.20
+  zone: residential_agricultural
+  mode: continuous_music_focus   # continuous | intermittent | continuous_music_focus
+  calibration_offset_db: 88.0
+  night_start_hour: 22
+  night_end_hour: 7
+  song_gap_merge_sec: 12
+  min_music_like_score: 0.62
+  min_beat_confidence: 0.38
+  impulse_peak_delta_db: 14.0
+  thunder_peak_delta_db: 18.0
+  rain_flatness_threshold: 0.72
+  rain_low_variance_db: 2.5
+  mower_flatness_threshold: 0.60
+  mower_centroid_min_hz: 300
+  mower_centroid_max_hz: 3000
+  allow_response_night: false
 
 response:
   enable_daytime_response: false
-  relay_gpio_pin: 17
-  playlist_path: /opt/noise-warden/shared/playlist
-  player_cmd: ffplay -nodisp -autoexit -loglevel quiet
-  max_response_minutes: 60
+  relay_gpio_pin: 18
+  player_command: /usr/bin/cvlc --play-and-exit --no-video
+  playlist_dir: /opt/noise-warden/shared/playlist
+
+home_assistant:
+  enabled: false
+  mode: mqtt  # mqtt | rest_stub
+  mqtt_host: 127.0.0.1
+  mqtt_port: 1883
+  mqtt_topic_prefix: noise_warden
+  mqtt_username: ""
+  mqtt_password: ""
+
+plugins:
+  enable_reference_subtraction: false
+  enable_dual_mic_diff: false
