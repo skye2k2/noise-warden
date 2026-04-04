@@ -1,80 +1,49 @@
-async function fetchJson(url) {
-  const r = await fetch(url);
-  return await r.json();
-}
-
-async function post(url) {
-  const token = prompt("Bearer token (if enabled):", "");
-  const headers = token ? { "Authorization": "Bearer " + token } : {};
-  const r = await fetch(url, { method: "POST", headers });
-  if (!r.ok) alert("Request failed: " + r.status);
-  refresh();
-}
-
-async function clearIncidents() {
-  const token = prompt("Bearer token (if enabled):", "");
-  const headers = token ? { "Authorization": "Bearer " + token } : {};
-  const r = await fetch("/api/incidents", { method: "DELETE", headers });
-  if (!r.ok) alert("Clear failed: " + r.status);
-  refresh();
-}
-
-function downloadCsv() {
-  window.location = "/api/incidents/export";
-}
-
-function renderStatus(s) {
-  document.getElementById("status").innerHTML = `
-    <table>
-      <tr><th>Armed</th><td>${s.armed}</td></tr>
-      <tr><th>Manual Kill</th><td>${s.manual_kill}</td></tr>
-      <tr><th>Response Active</th><td>${s.response_active}</td></tr>
-      <tr><th>Current dB</th><td>${Number(s.current_db).toFixed(1)}</td></tr>
-      <tr><th>Slow dB</th><td>${Number(s.current_slow_db).toFixed(1)}</td></tr>
-      <tr><th>Fast dB</th><td>${Number(s.current_fast_db).toFixed(1)}</td></tr>
-      <tr><th>Classification</th><td>${s.last_classification}</td></tr>
-      <tr><th>Active Incident ID</th><td>${s.active_incident_id ?? ""}</td></tr>
-      <tr><th>Updated</th><td>${s.last_update ?? ""}</td></tr>
-    </table>
-  `;
-}
-
-function renderIncidents(rows) {
-  let html = "<table><tr><th>ID</th><th>Start</th><th>End</th><th>Period</th><th>Peak</th><th>Threshold</th><th>Mode</th></tr>";
-  for (const r of rows) {
-    html += `<tr>
-      <td>${r.id}</td>
-      <td>${r.started_at || ""}</td>
-      <td>${r.ended_at || ""}</td>
-      <td>${r.day_or_night || ""}</td>
-      <td>${Number(r.peak_db).toFixed(1)}</td>
-      <td>${Number(r.threshold_db).toFixed(1)}</td>
-      <td>${r.mode || ""}</td>
-    </tr>`;
+let currentSpan = 'day';
+async function getJSON(url) {
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    localStorage.setItem('nw_cache_' + url, JSON.stringify({ t: Date.now(), data }));
+    return data;
+  } catch (e) {
+    const cached = localStorage.getItem('nw_cache_' + url);
+    if (cached) return JSON.parse(cached).data;
+    throw e;
   }
-  html += "</table>";
-  document.getElementById("incidents").innerHTML = html;
 }
-
-function renderStateLog(rows) {
-  let html = "<table><tr><th>Time</th><th>Key</th><th>Value</th></tr>";
-  for (const r of rows) {
-    html += `<tr><td>${r.ts}</td><td>${r.key}</td><td>${r.value}</td></tr>`;
+async function post(url, body) {
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : '{}' });
+  return res.json();
+}
+async function loadStatus() {
+  const el = document.getElementById('status'); if (!el) return;
+  try {
+    const s = await getJSON('/api/status');
+    el.innerHTML = `<strong>Armed:</strong> ${s.armed}<br><strong>Emergency Kill:</strong> ${s.emergency_kill}<br><strong>Current dB (slow):</strong> ${s.current_db_slow}<br><strong>Current dB (fast):</strong> ${s.current_db_fast}<br><strong>Classification:</strong> ${s.classification}<br><strong>Incident Active:</strong> ${s.incident_active}<br><strong>Playback Active:</strong> ${s.playback_active}<br><strong>Record Only Now:</strong> ${s.record_only_now}<br><strong>Home Assistant:</strong> ${s.home_assistant_state}<br><strong>Last Error:</strong> ${s.last_error || ''}`;
+  } catch { el.textContent = 'Status unavailable (using cached data if present).'; }
+}
+async function loadIncidents() {
+  const tbody = document.querySelector('#incidents tbody'); if (!tbody) return;
+  const data = await getJSON('/api/incidents'); tbody.innerHTML = '';
+  for (const i of data.items) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${i.id}</td><td>${i.started_at || ''}</td><td>${Number(i.initial_db || 0).toFixed(1)}</td><td>${Number(i.duration_seconds || 0).toFixed(1)}s</td><td>${i.record_only ? 'record-only' : (i.action_taken ? 'responded' : 'logged')}</td><td>${i.snippet_path ? `<audio controls preload="none" src="/api/incidents/${i.id}/audio"></audio>` : ''}</td><td><button onclick="deleteIncident(${i.id})">Delete</button></td>`;
+    tbody.appendChild(tr);
   }
-  html += "</table>";
-  document.getElementById("stateLog").innerHTML = html;
 }
-
-async function refresh() {
-  const [status, incidents, stateLog] = await Promise.all([
-    fetchJson("/api/status"),
-    fetchJson("/api/incidents?limit=50"),
-    fetchJson("/api/state-log?limit=50"),
-  ]);
-  renderStatus(status);
-  renderIncidents(incidents);
-  renderStateLog(stateLog);
+async function deleteIncident(id) { await post(`/api/incidents/${id}/delete`); await loadIncidents(); if (document.getElementById('timeline')) loadTimeline(); }
+async function loadTimeline() {
+  const el = document.getElementById('timeline'); if (!el) return;
+  const data = await getJSON('/api/timeline?span=' + currentSpan); el.innerHTML = '';
+  for (const i of data.items) {
+    const div = document.createElement('div'); div.className = 'event';
+    div.innerHTML = `<strong>${i.started_at}</strong><br>Initial: ${Number(i.initial_db || 0).toFixed(1)} dB<br>Duration: ${Number(i.duration_seconds || 0).toFixed(1)} s<br>${i.record_only ? 'Night record-only' : 'Day active window'}`;
+    el.appendChild(div);
+  }
 }
-
-refresh();
-setInterval(refresh, 3000);
+function setSpan(span) { currentSpan = span; loadTimeline(); }
+async function loadThresholds() { const el = document.getElementById('thresholds'); if (!el) return; el.textContent = JSON.stringify(await getJSON('/api/thresholds'), null, 2); }
+async function loadConfig() { const box = document.getElementById('configBox'); if (!box) return; box.value = JSON.stringify(await getJSON('/api/config'), null, 2); }
+async function saveConfig() { const box = document.getElementById('configBox'); const payload = JSON.parse(box.value); const result = await post('/api/config/save', payload); alert(result.message || 'Saved'); }
+window.addEventListener('DOMContentLoaded', async () => { await loadStatus(); await loadIncidents(); await loadTimeline(); await loadThresholds(); await loadConfig(); setInterval(loadStatus, 5000); });

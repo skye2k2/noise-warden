@@ -1,35 +1,26 @@
-# Example Home Assistant REST commands / sensors
+rest:
+  - resource: "http://noise-warden.local:8787/api/status"
+    scan_interval: 5
+    sensor:
+      - name: "Noise Warden dB Slow"
+        value_template: "{{ value_json.current_db_slow }}"
+      - name: "Noise Warden Classification"
+        value_template: "{{ value_json.classification }}"
+      - name: "Noise Warden Incident Active"
+        value_template: "{{ value_json.incident_active }}"
+      - name: "Noise Warden HA State"
+        value_template: "{{ value_json.home_assistant_state }}"
 
 rest_command:
   noise_warden_arm:
-    url: "http://PI_IP:8787/api/arm"
+    url: "http://noise-warden.local:8787/api/control/arm"
     method: POST
-    headers:
-      Authorization: "Bearer change-me"
-
   noise_warden_disarm:
-    url: "http://PI_IP:8787/api/disarm"
+    url: "http://noise-warden.local:8787/api/control/disarm"
     method: POST
-    headers:
-      Authorization: "Bearer change-me"
-
   noise_warden_kill:
-    url: "http://PI_IP:8787/api/kill"
+    url: "http://noise-warden.local:8787/api/control/kill"
     method: POST
-    headers:
-      Authorization: "Bearer change-me"
-
-sensor:
-  - platform: rest
-    name: noise_warden_status
-    resource: "http://PI_IP:8787/api/status"
-    value_template: "{{ value_json.last_classification }}"
-    json_attributes:
-      - armed
-      - manual_kill
-      - response_active
-      - current_db
-      - current_slow_db
-      - current_fast_db
-      - active_incident_id
-      - last_update
+  noise_warden_kill_clear:
+    url: "http://noise-warden.local:8787/api/control/kill/clear"
+    method: POST

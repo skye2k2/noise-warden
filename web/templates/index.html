@@ -1,54 +1,8 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <title>Noise Warden</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <link rel="stylesheet" href="/static/style.css"/>
-</head>
-<body>
-  <div class="container">
-    <h1>Noise Warden</h1>
-    <p class="sub">Ordinance-aware residential monitor • day response / night record-only</p>
-
-    <div class="grid">
-      <section class="card">
-        <h2>Status</h2>
-        <div id="status"></div>
-        <div class="buttons">
-          <button onclick="post('/api/arm')">Arm</button>
-          <button onclick="post('/api/disarm')">Disarm</button>
-          <button class="danger" onclick="post('/api/kill')">Emergency Kill</button>
-          <button onclick="post('/api/kill/clear')">Clear Kill</button>
-        </div>
-      </section>
-
-      <section class="card">
-        <h2>Incidents</h2>
-        <div class="buttons">
-          <button onclick="downloadCsv()">Export CSV</button>
-          <button class="danger" onclick="clearIncidents()">Clear Log</button>
-        </div>
-        <div id="incidents"></div>
-      </section>
-
-      <section class="card">
-        <h2>State Log</h2>
-        <div id="stateLog"></div>
-      </section>
-
-      <section class="card">
-        <h2>Calibration Notes</h2>
-        <ol>
-          <li>Place a known SPL meter beside the mic.</li>
-          <li>Play pink noise / test tone at stable volume.</li>
-          <li>Adjust <code>calibration_offset_db</code> until slow dB roughly matches.</li>
-          <li>Tune trigger persistence upward until false positives disappear.</li>
-          <li>Only then enable playback.</li>
-        </ol>
-      </section>
-    </div>
-  </div>
-  <script src="/static/app.js"></script>
-</body>
-</html>
+<!doctype html><html><head><meta charset="utf-8"><title>Noise Warden v2</title><link rel="stylesheet" href="/static/style.css"></head><body>
+<header><h1>Noise Warden v2</h1><nav><a href="/">Dashboard</a> <a href="/timeline">Timeline</a> <a href="/thresholds">Thresholds</a> <a href="/config">Config</a> <a href="/calibration">Calibration</a></nav></header>
+<main><section class="card"><h2>Live Status</h2><div id="status">Loading...</div><div class="buttons">
+<button onclick="post('/api/control/arm')">Arm</button><button onclick="post('/api/control/disarm')">Disarm</button><button onclick="post('/api/control/kill')">Emergency Kill</button><button onclick="post('/api/control/kill/clear')">Clear Kill</button><button onclick="post('/api/control/test_playback')">Test Playback</button>
+</div></section>
+<section class="card"><h2>Incidents</h2><div class="buttons"><a class="button" href="/api/incidents/export.csv">Export CSV</a><button onclick="post('/api/incidents/clear').then(loadIncidents)">Clear All</button></div>
+<table id="incidents"><thead><tr><th>ID</th><th>Started</th><th>Initial dB</th><th>Duration</th><th>Mode</th><th>Audio</th><th>Delete</th></tr></thead><tbody></tbody></table></section></main>
+<script src="/static/app.js"></script></body></html>

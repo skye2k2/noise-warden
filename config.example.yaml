@@ -1,69 +1,94 @@
 app:
   host: "0.0.0.0"
   port: 8787
-  log_level: "INFO"
+  refresh_seconds: 5
+
+storage:
+  db_path: "./data/noise_warden.db"
+  snippet_dir: "./data/snippets"
+  export_dir: "./data/exports"
+  max_snippet_seconds: 45
+  pre_trigger_seconds: 8
 
 audio:
-  input_device_name: "USB Audio"
   sample_rate: 48000
   channels: 1
-  block_seconds: 0.125
-  calibration_offset_db: 0.0
-  # crude self-playback suppression by muting detection while output active + cooldown
-  suppress_detection_while_playing: true
-  suppress_after_stop_seconds: 2.0
+  frame_ms: 100
+  device_index: null
+  secondary_device_index: null
+  reference_device_index: null
+  mic_calibration_offset_db: 0.0
+  use_secondary_mic: false
+  use_reference_input: false
 
-classification:
-  # ordinance-aware thresholds (residential)
-  day_continuous_db: 65.0
-  night_continuous_db: 55.0
-  day_intermittent_db: 70.0
-  night_intermittent_db: 60.0
-
-  # your policy
-  ignore_impulse_noise: true
-  night_record_only: true
-
-  # trigger policy (tune carefully)
-  trigger_mode: "continuous_or_music"
-  trigger_persist_seconds: 8.0
-  clear_below_seconds: 12.0
-  min_event_seconds: 4.0
-
-  # "intermittent" suppression: likely drive-bys / passers
-  intermittent_max_on_cycle: 0.10
-  intermittent_max_continuous_seconds: 360.0
-
-  # spectral heuristics
-  music_min_spectral_flux: 0.02
-  music_min_bandwidth_hz: 250.0
-  bass_pulse_min_rate_hz: 0.8
-  bass_pulse_max_rate_hz: 4.5
-  bass_band_low_hz: 30.0
-  bass_band_high_hz: 180.0
-  mower_tonal_band_low_hz: 80.0
-  mower_tonal_band_high_hz: 500.0
-  mower_max_flatness: 0.20
-  mower_min_tonal_ratio: 2.8
+gpio:
+  enabled: false
+  relay_pin: 17
+  active_high: true
 
 playback:
   enabled: false
-  player: "vlc"
-  playlist_path: "/home/pi/noise-warden/media/playlist.m3u"
-  amp_gpio_pin: 17
-  amp_power_on_delay_ms: 300
-  amp_power_off_delay_ms: 0
-  max_play_minutes: 20
+  playlist_path: "./media/playlist.m3u"
+  vlc_binary: "/usr/bin/cvlc"
+  post_playback_suppress_seconds: 12
 
-logging:
-  db_path: "./data/noise_warden.db"
-  retention_days: 90
+mode:
+  armed: true
+  record_only_override: false
+  night_record_only: true
+  emergency_kill: false
 
-web:
-  static_dir: "./web/static"
-  templates_dir: "./web/templates"
+classification:
+  zoning: "residential"
+  merge_gap_seconds: 10
+  min_continuous_seconds: 8
+  min_music_band_ratio: 0.28
+  min_repetitive_confidence: 0.60
+  suppress_driveby_seconds_max: 120
+  suppress_weedwhacker_hz_low: 80
+  suppress_weedwhacker_hz_high: 350
+  suppress_weedwhacker_tonality_ratio: 0.55
+  suppress_impulse: true
+  suppress_intermittent_vehicle_like: true
+  ignore_during_playback: true
 
-home_assistant:
-  enabled: true
-  # optional simple bearer token for REST actions
-  api_token: "change-me"
+ordinance:
+  city: "Pleasant Grove, UT"
+  day_start: "07:00"
+  night_start: "22:00"
+  residential:
+    continuous_day_dba: 65.0
+    continuous_night_dba: 55.0
+    intermittent_day_dba: 70.0
+    intermittent_night_dba: 60.0
+    impulse_day_dba: 75.0
+    impulse_night_dba: 60.0
+
+thresholds:
+  trigger_margin_db: 1.5
+  release_margin_db: 4.0
+  release_below_seconds: 12
+  hold_min_seconds: 20
+  intermittent_window_seconds: 120
+  intermittent_on_cycle_threshold: 0.10
+  impulse_max_duration_seconds: 2.0
+
+integrations:
+  home_assistant:
+    enabled: false
+    base_url: "http://homeassistant.local:8123"
+    token: ""
+    ping_timeout_seconds: 2.0
+  mqtt:
+    enabled: false
+    host: "localhost"
+    port: 1883
+    topic_prefix: "noise_warden"
+
+experimental:
+  adaptive_subtraction:
+    enabled: false
+    learning_rate: 0.01
+  dual_mic_rejection:
+    enabled: false
+    directionality_bias: 0.25

@@ -1,49 +1,13 @@
-body {
-  font-family: system-ui, sans-serif;
-  margin: 0;
-  background: #111827;
-  color: #e5e7eb;
-}
-.container {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 20px;
-}
-h1 { margin-bottom: 4px; }
-.sub { color: #9ca3af; margin-top: 0; }
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 16px;
-}
-.card {
-  background: #1f2937;
-  border-radius: 12px;
-  padding: 16px;
-  box-shadow: 0 2px 12px rgba(0,0,0,0.25);
-}
-button {
-  margin: 4px;
-  padding: 8px 12px;
-  border-radius: 8px;
-  border: none;
-  cursor: pointer;
-}
-button.danger {
-  background: #991b1b;
-  color: white;
-}
-pre {
-  white-space: pre-wrap;
-  word-wrap: break-word;
-}
-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.9rem;
-}
-th, td {
-  border-bottom: 1px solid #374151;
-  padding: 6px;
-  text-align: left;
-}
+body { font-family: Arial, sans-serif; margin: 0; background: #f4f6f8; color: #222; }
+header { background: #1f2937; color: white; padding: 1rem; }
+nav a { color: #c7d2fe; margin-right: 1rem; text-decoration: none; }
+main { padding: 1rem; display: grid; gap: 1rem; }
+.card { background: white; padding: 1rem; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+.buttons { margin: 0.5rem 0; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+button, .button { padding: 0.5rem 0.8rem; border: 1px solid #999; background: #fff; border-radius: 8px; cursor: pointer; text-decoration: none; color: #111; }
+table { width: 100%; border-collapse: collapse; }
+th, td { border-bottom: 1px solid #ddd; padding: 0.5rem; text-align: left; font-size: 0.92rem; }
+.timeline { display: flex; flex-direction: column; gap: 0.5rem; }
+.event { border-left: 4px solid #4f46e5; padding: 0.5rem; background: #eef2ff; border-radius: 6px; }
+.config-box { width: 100%; min-height: 420px; font-family: monospace; }
+pre { white-space: pre-wrap; }

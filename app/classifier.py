@@ -1,99 +1,46 @@
-from __future__ import annotations
-from dataclasses import dataclass
-from datetime import datetime
-from collections import deque
 import numpy as np
+from collections import deque
 
-from app.models import AudioFeatures, ClassificationResult
-from app.utils.time_utils import is_day
-
-
-@dataclass
-class Thresholds:
-    day_continuous_db: float
-    night_continuous_db: float
-    day_intermittent_db: float
-    night_intermittent_db: float
-
-
-class NoiseClassifier:
-    def __init__(self, cfg):
+class DeterministicClassifier:
+    def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.thresholds = Thresholds(
-            day_continuous_db=cfg.day_continuous_db,
-            night_continuous_db=cfg.night_continuous_db,
-            day_intermittent_db=cfg.day_intermittent_db,
-            night_intermittent_db=cfg.night_intermittent_db,
+        self.on_window = deque(maxlen=max(1, int(cfg["thresholds"]["intermittent_window_seconds"] / max(0.1, cfg["audio"]["frame_ms"]/1000))))
+
+    def _band_energy_ratio(self, spectrum, low_bin, high_bin):
+        total = np.sum(spectrum) + 1e-9
+        band = np.sum(spectrum[low_bin:high_bin])
+        return float(band / total)
+
+    def classify(self, metrics: dict, active_thresholds: dict):
+        db_slow = metrics["db_slow"]
+        db_fast = metrics["db_fast"]
+        spectrum = metrics["spectrum"]
+
+        above_cont = db_slow >= active_thresholds["continuous"]
+        self.on_window.append(1 if above_cont else 0)
+        on_cycle = float(sum(self.on_window) / len(self.on_window)) if self.on_window else 0.0
+
+        is_impulse = db_fast >= active_thresholds["impulse"] and db_slow < active_thresholds["continuous"]
+        if self.cfg["classification"]["suppress_impulse"] and is_impulse:
+            return {"label": "suppressed_impulse", "confidence": 0.9, "trigger": False}
+
+        if self.cfg["classification"]["suppress_intermittent_vehicle_like"]:
+            if db_slow >= active_thresholds["intermittent"] and on_cycle <= self.cfg["thresholds"]["intermittent_on_cycle_threshold"]:
+                return {"label": "suppressed_driveby_like", "confidence": 0.7, "trigger": False}
+
+        ratio_weed = self._band_energy_ratio(
+            spectrum,
+            self.cfg["classification"]["suppress_weedwhacker_hz_low"] // 10,
+            self.cfg["classification"]["suppress_weedwhacker_hz_high"] // 10
         )
-        self.history = deque(maxlen=256)
+        if ratio_weed >= self.cfg["classification"]["suppress_weedwhacker_tonality_ratio"]:
+            return {"label": "suppressed_tool_like", "confidence": ratio_weed, "trigger": False}
 
-    def classify(self, feat: AudioFeatures, now: datetime) -> ClassificationResult:
-        day = is_day(now)
-        continuous_threshold = self.thresholds.day_continuous_db if day else self.thresholds.night_continuous_db
-        intermittent_threshold = self.thresholds.day_intermittent_db if day else self.thresholds.night_intermittent_db
+        music_band_ratio = self._band_energy_ratio(spectrum, 4, 120)
+        if db_slow >= active_thresholds["continuous"] and music_band_ratio >= self.cfg["classification"]["min_music_band_ratio"]:
+            return {"label": "music_like_continuous", "confidence": music_band_ratio, "trigger": True}
 
-        # Impulse heuristic: fast significantly above slow and very short behavior
-        is_impulse = (feat.fast_db - feat.slow_db) >= 6.0
+        if db_slow >= active_thresholds["continuous"]:
+            return {"label": "continuous_noise", "confidence": 0.6, "trigger": True}
 
-        # Mower/weedwhacker heuristic:
-        # strong energy in low-mid band + relatively tonal + low flatness + narrow-ish bandwidth
-        is_mower_like = (
-            feat.tonal_ratio >= 0.35
-            and feat.spectral_flatness <= self.cfg.mower_max_flatness
-            and feat.spectral_bandwidth_hz < 900
-        )
-
-        # Music-like heuristic:
-        is_music_like = (
-            feat.spectral_bandwidth_hz >= self.cfg.music_min_bandwidth_hz
-            and feat.spectral_flux >= self.cfg.music_min_spectral_flux
-            and feat.bass_energy_ratio >= 0.10
-        )
-
-        # Bass-pulse-like heuristic (simple deterministic proxy)
-        is_bass_pulse_like = (
-            feat.bass_energy_ratio >= 0.20
-            and feat.spectral_centroid_hz < 350
-            and feat.spectral_flux >= self.cfg.music_min_spectral_flux * 0.5
-        )
-
-        # Intermittent-like heuristic:
-        # above intermittent threshold but not sustained as continuous yet, and music-like false
-        is_above_cont = feat.slow_db >= continuous_threshold
-        is_above_int = feat.slow_db >= intermittent_threshold
-        is_intermittent_like = is_above_int and not is_above_cont and not is_music_like
-
-        # Policy:
-        # - ignore impulse
-        # - suppress mower-like
-        # - suppress likely intermittent passers
-        # - prefer continuous or music/bass-like
-        should_trigger = is_above_cont and (is_music_like or is_bass_pulse_like or not is_intermittent_like)
-
-        if self.cfg.ignore_impulse_noise and is_impulse:
-            should_trigger = False
-
-        if is_mower_like:
-            should_trigger = False
-
-        # Strong suppression of likely drive-by/intermittent non-music
-        if is_intermittent_like and not (is_music_like or is_bass_pulse_like):
-            should_trigger = False
-
-        mode = "continuous" if is_above_cont else ("intermittent" if is_above_int else "below")
-
-        return ClassificationResult(
-            is_above_threshold=is_above_cont or is_above_int,
-            is_impulse=is_impulse,
-            is_intermittent_like=is_intermittent_like,
-            is_mower_like=is_mower_like,
-            is_music_like=is_music_like,
-            is_bass_pulse_like=is_bass_pulse_like,
-            should_trigger=should_trigger,
-            threshold_db=continuous_threshold if is_above_cont else intermittent_threshold,
-            mode=mode,
-            notes={
-                "continuous_threshold": continuous_threshold,
-                "intermittent_threshold": intermittent_threshold,
-            },
-        )
+        return {"label": "below_threshold", "confidence": 0.2, "trigger": False}

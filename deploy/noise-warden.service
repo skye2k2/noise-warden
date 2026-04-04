@@ -1,16 +1,15 @@
 [Unit]
-Description=Noise Warden
-After=network-online.target sound.target
-Wants=network-online.target
+Description=Noise Warden v2
+After=network.target sound.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/noise-warden
-Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/pi/noise-warden/.venv/bin/python -m app.main
+WorkingDirectory=/opt/noise-warden-v2
+ExecStart=/usr/bin/python3 -m app.main
 Restart=always
 RestartSec=3
+User=pi
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
