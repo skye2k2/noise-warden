@@ -4,12 +4,14 @@ import yaml
 from dataclasses import dataclass
 from typing import Any, Dict
 
-DEFAULT_CONFIG_PATH = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+DEFAULT_CONFIG_PATH = "/opt/noise-warden/current/config/noise_warden.yaml"
 
 class ConfigError(Exception):
     pass
 
-def load_yaml(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
+def load_yaml(path: str | None = None) -> Dict[str, Any]:
+    if path is None:
+        path = os.environ.get("NOISE_WARDEN_CONFIG", DEFAULT_CONFIG_PATH)
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):

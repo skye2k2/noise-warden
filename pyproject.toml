@@ -1,0 +1,35 @@
+[project]
+name = "noise-warden"
+version = "0.5.0"
+description = "Pi-deployable nuisance noise incident logging and management"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.115.0",
+    "uvicorn[standard]==0.30.6",
+    "jinja2==3.1.4",
+    "pyyaml==6.0.2",
+    "numpy==2.1.1",
+    "sounddevice==0.5.0",
+    "soundfile==0.12.1",
+    "paho-mqtt==2.1.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "httpx>=0.27",       # Required by FastAPI TestClient
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["noise_warden*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "hardware: tests requiring physical audio hardware (deselect with '-m not hardware')",
+]
