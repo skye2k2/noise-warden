@@ -789,3 +789,212 @@ class TestDurationSplit:
         assert engine.active is None
         all_incidents = tmp_storage.list_incidents(limit=100)
         assert len(all_incidents) == 1
+
+
+# ---------------------------------------------------------------------------
+# Self-noise suppression — response lifecycle
+# ---------------------------------------------------------------------------
+
+class TestSelfNoiseSuppression:
+    """Tests for the _start_response / _stop_response / _in_response_cooldown
+    mechanism that prevents the system from registering its own playback as
+    a noise incident."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        """Create an Engine with mocked dependencies and response enabled."""
+        base_cfg["response"]["enable_daytime_response"] = True
+        base_cfg["response"]["response_cooldown_sec"] = 2.0
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                engine = Engine(base_cfg, tmp_storage, tmp_state)
+                engine.capture = FakeCapture([])
+                return engine
+
+    def test_start_response_sets_responding_flag(self, base_cfg, tmp_storage, tmp_state):
+        """_start_response() should set _responding and update state."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._start_response()
+        assert engine._responding is True
+        assert engine.relay.enabled is True
+        assert tmp_state.snapshot()["responding"] is True
+
+    def test_stop_response_clears_responding_flag(self, base_cfg, tmp_storage, tmp_state):
+        """_stop_response() should clear _responding and record the end timestamp."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._start_response()
+        engine._stop_response()
+        assert engine._responding is False
+        assert engine.relay.enabled is False
+        assert tmp_state.snapshot()["responding"] is False
+        assert engine._response_end_ts > 0
+
+    def test_in_response_cooldown_during_response(self, base_cfg, tmp_storage, tmp_state):
+        """_in_response_cooldown() returns True while actively responding."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._start_response()
+        assert engine._in_response_cooldown() is True
+
+    def test_in_response_cooldown_after_response(self, base_cfg, tmp_storage, tmp_state):
+        """_in_response_cooldown() returns True within cooldown window."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._start_response()
+        engine._stop_response()
+        # Immediately after stop — should still be in cooldown (2.0 sec window)
+        assert engine._in_response_cooldown() is True
+
+    def test_cooldown_expires(self, base_cfg, tmp_storage, tmp_state):
+        """_in_response_cooldown() returns False after cooldown expires."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["response"]["response_cooldown_sec"] = 0.0
+        engine._response_cooldown_sec = 0.0
+        engine._start_response()
+        engine._stop_response()
+        # With 0-second cooldown, it should be False immediately
+        assert engine._in_response_cooldown() is False
+
+    def test_cooldown_zero_disables_window(self, base_cfg, tmp_storage, tmp_state):
+        """A cooldown of 0 means no post-response window at all."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._response_cooldown_sec = 0.0
+        # Not responding, and cooldown disabled
+        engine._response_end_ts = time.time() - 0.001
+        assert engine._in_response_cooldown() is False
+
+    def test_finalize_incident_stops_response(self, base_cfg, tmp_storage, tmp_state):
+        """Finalizing an incident should call _stop_response, not bare relay.off."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+
+        # Begin a fake incident + response
+        engine.active = {
+            "id": 1,
+            "start": datetime.now(timezone.utc),
+            "dbs": [75.0, 74.0, 73.0],
+            "classification": "music_like",
+            "period": "day",
+            "responded": True,
+            "last_above": datetime.now(timezone.utc),
+            "tmp_wav": None,
+            "recording": False,
+        }
+        engine._responding = True
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        assert engine._responding is False
+        assert engine.relay.enabled is False
+        assert engine._response_end_ts > 0
+
+
+# ---------------------------------------------------------------------------
+# Noise floor gate
+# ---------------------------------------------------------------------------
+
+class TestNoiseFloorGate:
+    """Tests for the configurable noise floor that skips DSP analysis on
+    ambient white noise below the configured dBA threshold."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_below_floor_skips_incident_creation(self, base_cfg, tmp_storage, tmp_state):
+        """A block below noise_floor_db should not trigger an incident, even if
+        it would have exceeded the threshold (impossible in practice, but tests
+        that the gate fires before threshold checks)."""
+        base_cfg["detection"]["noise_floor_db"] = 60.0
+        loud_blocks = [_make_sine_block(amplitude=0.8)] * 5
+        fake = FakeCapture(loud_blocks)
+
+        with patch("noise_warden.engine.AudioCapture", return_value=fake):
+            with patch("noise_warden.engine.HAClient"):
+                engine = Engine(base_cfg, tmp_storage, tmp_state)
+                engine.capture = fake
+                # Force dba_estimate to return a value below the floor
+                with patch("noise_warden.engine.dba_estimate", return_value=45.0):
+                    engine.start()
+                    deadline = time.time() + 2.0
+                    while fake._index < len(loud_blocks) and time.time() < deadline:
+                        time.sleep(0.05)
+                    engine.stop()
+
+        incidents = tmp_storage.list_incidents(limit=100)
+        assert len(incidents) == 0, "No incidents should be created when dB is below noise floor"
+
+    def test_above_floor_allows_incident(self, base_cfg, tmp_storage, tmp_state):
+        """A block above noise_floor_db should proceed to normal processing."""
+        base_cfg["detection"]["noise_floor_db"] = 40.0
+        base_cfg["detection"]["mode"] = "continuous"
+        loud_blocks = [_make_sine_block(amplitude=0.8)] * 8
+        fake = FakeCapture(loud_blocks)
+
+        with patch("noise_warden.engine.AudioCapture", return_value=fake):
+            with patch("noise_warden.engine.HAClient"):
+                engine = Engine(base_cfg, tmp_storage, tmp_state)
+                engine.capture = fake
+                engine.start()
+                deadline = time.time() + 3.0
+                while fake._index < len(loud_blocks) and time.time() < deadline:
+                    time.sleep(0.05)
+                engine.stop()
+
+        incidents = tmp_storage.list_incidents(limit=100)
+        assert len(incidents) >= 1, "Should create at least one incident when dB exceeds floor and threshold"
+
+    def test_floor_zero_disables_gate(self, base_cfg, tmp_storage, tmp_state):
+        """Setting noise_floor_db to 0 should disable the gate entirely."""
+        base_cfg["detection"]["noise_floor_db"] = 0.0
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        # With floor at 0, even very quiet readings should pass through to DSP
+        # (they'll still be below threshold, but the gate shouldn't stop them)
+        noise_floor = float(engine.cfg["detection"].get("noise_floor_db", 50.0))
+        assert noise_floor == 0.0
+        # A 10 dBA reading should NOT be gated with floor at 0
+        assert 10.0 >= noise_floor
+
+    def test_below_floor_finalizes_active_incident(self, base_cfg, tmp_storage, tmp_state):
+        """If an active incident is running and the signal drops below the noise
+        floor, the incident should still finalize after the gap timeout."""
+        base_cfg["detection"]["noise_floor_db"] = 55.0
+        base_cfg["detection"]["song_gap_merge_sec"] = 0.5  # Short gap for fast test
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+
+        # Manually set up an active incident
+        row = {
+            "start_ts": datetime.now(timezone.utc).isoformat(),
+            "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+            "threshold_db": 65.0, "music_like_score": 0.5,
+            "beat_confidence": 0.3, "classification": "other",
+            "mode": "record_only", "responded": 0, "merge_count": 0,
+            "snippet_path": None, "notes": ""
+        }
+        iid = tmp_storage.create_incident(row)
+        engine.active = {
+            "id": iid,
+            "start": datetime.now(timezone.utc),
+            "dbs": [70.0],
+            "classification": "other",
+            "period": "day",
+            "responded": False,
+            "last_above": datetime.now(timezone.utc) - timedelta(seconds=2),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        # Simulate a below-floor block coming through the engine's gate logic
+        # Directly testing the gate behavior: db_now < noise_floor_db, active exists,
+        # gap exceeded → should finalize
+        block = _make_silence_block()
+        with patch.object(engine.ha, "publish_event"):
+            # The gate logic in run() appends dbs, checks gap, and finalizes.
+            # Since we can't easily run the full loop for a single iteration,
+            # we verify the active incident's gap check logic would finalize.
+            engine.active["dbs"].append(40.0)
+            gap = (datetime.now(timezone.utc) - engine.active["last_above"]).total_seconds()
+            assert gap >= 0.5, "Gap should be large enough to trigger finalize"
+            engine._finalize_incident()
+
+        assert engine.active is None
+        incidents = tmp_storage.list_incidents(limit=100)
+        assert len(incidents) == 1

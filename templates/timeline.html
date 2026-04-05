@@ -295,6 +295,7 @@ function buildDayColumn(dayStart, hourPx, gridPx, showLabels) {
 
   // Incidents overlapping this day
   var visibleCount = 0;
+  var visibleDuration = 0;
   for (var i = 0; i < INCIDENTS.length; i++) {
     var inc = INCIDENTS[i];
     var start = new Date(inc.start_ts);
@@ -303,6 +304,7 @@ function buildDayColumn(dayStart, hourPx, gridPx, showLabels) {
 
     if (start >= dayEnd || end <= dayStart) { continue; }
     visibleCount++;
+    visibleDuration += safeNum(inc.duration_sec, 0);
 
     var clampStart = Math.max(start.getTime(), dayStart.getTime());
     var clampEnd = Math.min(end.getTime(), dayEnd.getTime());
@@ -346,8 +348,8 @@ function buildDayColumn(dayStart, hourPx, gridPx, showLabels) {
 
   col.appendChild(body);
 
-  // Accumulate incident count for the status display
-  accumulateCount(visibleCount);
+  // Accumulate incident count and duration for the status display
+  accumulateCount(visibleCount, visibleDuration);
 
   return col;
 }
@@ -569,18 +571,23 @@ function setViewLabel(text) {
  * debounced timeout fires after all columns have rendered in the same frame.
  */
 var _renderCount = 0;
+var _renderDuration = 0;
 var _countTimer = null;
-function accumulateCount(count) {
+function accumulateCount(count, durationSec) {
   _renderCount += count;
+  _renderDuration += durationSec;
   clearTimeout(_countTimer);
   _countTimer = setTimeout(function () {
     var n = _renderCount;
+    var dur = _renderDuration;
     _renderCount = 0;
+    _renderDuration = 0;
     var countEl = document.getElementById('tl-count');
     if (n === 0) {
       countEl.textContent = 'No incidents in this period';
     } else {
-      countEl.textContent = n + ' incident' + (n !== 1 ? 's' : '');
+      countEl.textContent = n + ' incident' + (n !== 1 ? 's' : '') +
+        ' \u00B7 ' + formatDuration(dur) + ' total';
     }
   }, 0);
 }

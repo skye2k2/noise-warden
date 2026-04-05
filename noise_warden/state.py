@@ -7,14 +7,17 @@ class StateStore:
     def __init__(self):
         self._lock = threading.Lock()
         self._state = {
+            "active_incident_id": None,
             "armed": True,
-            "running": False,
-            "mic_ok": False,
-            "last_error": None,
             "current_db": 0.0,
             "current_threshold_db": 0.0,
+            "disk_free_mb": None,
+            "disk_warning": None,
+            "last_error": None,
+            "mic_ok": False,
             "mode": "idle",
-            "active_incident_id": None,
+            "responding": False,
+            "running": False,
             "updated_at": None,
         }
 

@@ -11,6 +11,7 @@ audio:
   block_seconds: 0.5
   input_device: null
   input_channels: 1
+  # reference_device: null   # Secondary mic device for dual-mic reference subtraction (see plugins)
   recording_enabled: true
   snippet_pre_seconds: 12
   snippet_post_seconds: 8
@@ -21,6 +22,7 @@ audio:
 detection:
   zone: residential_agricultural
   mode: continuous_music_focus   # continuous | intermittent | continuous_music_focus
+  noise_floor_db: 50.0           # Ambient gate — signals below this dBA skip DSP analysis entirely
   calibration_offset_db: 88.0
   # Day/night thresholds use the Pi's system clock. Ensure `timedatectl set-timezone`
   # matches the ordinance jurisdiction (e.g. America/Denver for Pleasant Grove, UT).
@@ -45,6 +47,9 @@ detection:
 response:
   enable_daytime_response: false
   relay_gpio_pin: 18
+  relay_active_high: true          # Most opto-isolated relay modules are active-high
+  amp_power_on_delay_sec: 1.0      # Seconds to wait after relay on before starting playback
+  response_cooldown_sec: 5.0       # Seconds after response stops before resuming detection
   player_command: /usr/bin/cvlc --play-and-exit --no-video
   playlist_dir: /opt/noise-warden/shared/playlist
 

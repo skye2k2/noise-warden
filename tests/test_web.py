@@ -396,6 +396,46 @@ class TestCalibrationApply:
 
 
 # ---------------------------------------------------------------------------
+# Noise floor gate
+# ---------------------------------------------------------------------------
+
+class TestNoiseFloorRoute:
+
+    def test_set_noise_floor_updates_config(self, client, web_app, tmp_path):
+        _, _, _, _ = web_app
+        import noise_warden.web as web_mod
+        import yaml, os
+
+        cfg_path = str(tmp_path / "noise_warden.yaml")
+        with open(cfg_path, "w") as f:
+            yaml.dump(web_mod.cfg, f)
+        os.environ["NOISE_WARDEN_CONFIG"] = cfg_path
+
+        original = web_mod.cfg["detection"].get("noise_floor_db", 50.0)
+        resp = client.post(
+            "/calibration/noise-floor",
+            data={"noise_floor_db": "45.0"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        assert web_mod.cfg["detection"]["noise_floor_db"] == 45.0
+
+        # Restore
+        web_mod.cfg["detection"]["noise_floor_db"] = original
+
+    def test_rejects_out_of_range(self, client, web_app):
+        _, _, _, _ = web_app
+        resp = client.post(
+            "/calibration/noise-floor",
+            data={"noise_floor_db": "95.0"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        # Should redirect with error message
+        assert "error" in resp.headers.get("location", "").lower()
+
+
+# ---------------------------------------------------------------------------
 # Timeline (offline-first visual calendar)
 # ---------------------------------------------------------------------------
 

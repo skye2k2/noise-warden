@@ -27,7 +27,11 @@ class Engine:
             channels=int(a.get("input_channels", 1)),
             device=a.get("input_device")
         )
-        self.relay = RelayController(int(r["relay_gpio_pin"]))
+        self.relay = RelayController(
+            int(r["relay_gpio_pin"]),
+            active_high=bool(r.get("relay_active_high", True)),
+            amp_power_on_delay_sec=float(r.get("amp_power_on_delay_sec", 0.0)),
+        )
         self.player = PlaylistPlayer(r["player_command"], r["playlist_dir"])
         self.ha = HAClient(cfg)
         self.running = False
@@ -38,6 +42,13 @@ class Engine:
         self._last_mqtt_publish = 0.0
         self._mqtt_interval = 5.0  # Seconds between MQTT state publishes
         self._disk_warned = False   # Avoids spamming quota warnings every loop
+        # Self-noise suppression: when the system is playing a response through
+        # the relay/amp, we must not register our own playback as a noise incident.
+        # _response_end_ts tracks when the last response stopped so we can apply
+        # a cooldown window (response_cooldown_sec) before resuming detection.
+        self._responding = False
+        self._response_end_ts = 0.0
+        self._response_cooldown_sec = float(r.get("response_cooldown_sec", 5.0))
 
     def _check_disk_quota(self):
         """Check available disk space in snippets directory and warn if below threshold.
@@ -85,11 +96,41 @@ class Engine:
         self.running = False
         if self.thread:
             self.thread.join(timeout=5)
-        self.player.stop()
-        self.relay.off()
+        self._stop_response()
+        self.relay.cleanup()
         if self.active:
             self._finalize_incident(force=True)
         self.state.set(running=False, mode="stopped")
+
+    def _start_response(self):
+        """Activate the relay and start audio playback. Marks the system as
+        responding so self-noise suppression knows to skip detection."""
+        self.relay.on()
+        self.player.start()
+        self._responding = True
+        self.state.set(responding=True)
+        print("[engine] Response activated — self-noise suppression engaged")
+
+    def _stop_response(self):
+        """Deactivate relay and stop playback. Starts the cooldown timer so
+        residual speaker/amp noise doesn't immediately trigger a new incident."""
+        if self._responding:
+            print("[engine] Response deactivated — cooldown period starting")
+        self.player.stop()
+        self.relay.off()
+        self._responding = False
+        self._response_end_ts = time.time()
+        self.state.set(responding=False)
+
+    def _in_response_cooldown(self):
+        """Return True if the system is actively responding OR still within
+        the post-response cooldown window. During this period, detected noise
+        is our own playback (or its echo/reverb tail) and should be ignored."""
+        if self._responding:
+            return True
+        if self._response_cooldown_sec <= 0:
+            return False
+        return (time.time() - self._response_end_ts) < self._response_cooldown_sec
 
     def set_armed(self, armed: bool):
         self.state.set(armed=armed)
@@ -157,10 +198,10 @@ class Engine:
     def _looks_like_driveby(self, dbs, duration_sec):
         """Determine if an incident matches a drive-by pattern: short duration with a
         fade-out in the tail portion. A drive-by typically rises to a peak then
-        monotonically (or near-monotonically) decays as the vehicle passes.
+        decays (near-monotonically) as the vehicle passes.
 
         Returns True if: duration is under the configured max AND the tail portion
-        of dB readings is predominantly decreasing (allowing 1 uptick for jitter)."""
+        of dB readings shows at most 1 uptick (predominantly decreasing)."""
         max_dur = float(self.cfg["detection"].get("driveby_max_duration_sec", 30))
         tail_frac = float(self.cfg["detection"].get("driveby_fade_tail_fraction", 0.5))
 
@@ -177,7 +218,8 @@ class Engine:
         if len(tail) < 2:
             return False
 
-        # Count how many consecutive pairs are decreasing (or flat)
+        # Count upticks (dB increases) in the tail — a true fade-out should have
+        # almost none. We allow 1 for jitter tolerance.
         increases = 0
         for i in range(1, len(tail)):
             if tail[i] > tail[i - 1] + 1.0:  # 1 dB tolerance for noise jitter
@@ -236,8 +278,7 @@ class Engine:
             print(f"[engine] Auto-dismissed incident {incident_id} as drive-by ({dur:.1f}s, {len(dbs)} samples)")
 
         self.active = None
-        self.relay.off()
-        self.player.stop()
+        self._stop_response()
         self.state.set(active_incident_id=None, mode="idle")
 
     def _check_period_split(self, db_now, threshold, mscore, bconf, classification, block):
@@ -281,8 +322,7 @@ class Engine:
             self._append_audio(block)
 
             if mode == "respond" and self.cfg["response"].get("enable_daytime_response", False):
-                self.relay.on()
-                self.player.start()
+                self._start_response()
                 self.active["responded"] = True
 
             print(
@@ -340,8 +380,7 @@ class Engine:
             self._append_audio(block)
 
             if mode == "respond" and self.cfg["response"].get("enable_daytime_response", False):
-                self.relay.on()
-                self.player.start()
+                self._start_response()
                 self.active["responded"] = True
 
             print(f"[engine] Continued as new incident {self.active['id']}")
@@ -422,12 +461,29 @@ class Engine:
                 self.db_history.append(db_now)
                 self.db_history = self.db_history[-240:]
 
+                # Noise floor gate: if the computed dBA is below the configured
+                # floor (default 50 dB), the signal is ambient white noise and
+                # not worth analyzing. Skip the expensive DSP pipeline (spectrum
+                # features, beat confidence, music classification, exclusion
+                # filters) and go straight to gap-timeout / finalize checks.
+                noise_floor_db = float(self.cfg["detection"].get("noise_floor_db", 50.0))
+                _, threshold = applicable_threshold(self.cfg, datetime.now())
+                self.state.set(current_db=round(db_now, 2), current_threshold_db=threshold)
+
+                if db_now < noise_floor_db:
+                    # Still append to an active incident's recording (captures the
+                    # tail-off), and check gap-timeout for finalization.
+                    if self.active:
+                        self.active["dbs"].append(db_now)
+                        self._append_audio(block)
+                        gap = (datetime.now(timezone.utc) - self.active["last_above"]).total_seconds()
+                        if gap >= float(self.cfg["detection"]["song_gap_merge_sec"]):
+                            self._finalize_incident()
+                    continue
+
                 features = spectrum_features(block, self.capture.sr)
                 bconf = beat_confidence_from_history(self.db_history)
                 mscore = music_like_score(features)
-
-                _, threshold = applicable_threshold(self.cfg, datetime.now())
-                self.state.set(current_db=round(db_now, 2), current_threshold_db=threshold)
 
                 prev = self.db_history[-2] if len(self.db_history) > 1 else db_now
                 impulse = is_impulse(db_now, prev, float(self.cfg["detection"]["impulse_peak_delta_db"]))
@@ -457,6 +513,15 @@ class Engine:
                 ):
                     continue
 
+                # Self-noise suppression: when we are playing a response (or within the
+                # post-response cooldown window), any detected noise is likely our own
+                # playback bouncing off surfaces. Skip incident creation/extension to avoid
+                # registering our own retaliation as a noise violation.
+                # HOWEVER, comma, we still capture audio blocks to the active incident's
+                # WAV if one is already in progress — just don't start NEW incidents.
+                if self._in_response_cooldown() and not self.active:
+                    continue
+
                 if db_now >= threshold and not impulse and not thunder and not rain and not mower:
                     if classify == "music_like" or self.cfg["detection"]["mode"] != "continuous_music_focus":
                         if not self.active:
@@ -464,8 +529,7 @@ class Engine:
                             self._begin_incident(db_now, threshold, mscore, bconf, classify, mode)
 
                             if mode == "respond" and self.cfg["response"].get("enable_daytime_response", False):
-                                self.relay.on()
-                                self.player.start()
+                                self._start_response()
                                 self.active["responded"] = True
                         else:
                             self.active["dbs"].append(db_now)

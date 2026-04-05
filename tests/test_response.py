@@ -13,7 +13,9 @@ from noise_warden.response import PlaylistPlayer, RelayController
 
 
 # ---------------------------------------------------------------------------
-# RelayController (boolean stub — tests are trivial but prevent regressions)
+# RelayController — tests cover both the boolean-fallback path (default) and
+# the gpiozero-backed path via mocking. _RELAY_HW_ENABLED is False in CI,
+# so GPIO hardware is never touched.
 # ---------------------------------------------------------------------------
 
 class TestRelayController:
@@ -36,6 +38,78 @@ class TestRelayController:
     def test_stores_pin(self):
         relay = RelayController(gpio_pin=23)
         assert relay.gpio_pin == 23
+
+    def test_stores_active_high(self):
+        relay = RelayController(gpio_pin=18, active_high=False)
+        assert relay.active_high is False
+
+    def test_cleanup_safe_when_no_device(self):
+        """cleanup() should not error when no gpiozero device is present."""
+        relay = RelayController(gpio_pin=18)
+        relay.on()
+        relay.cleanup()
+        assert relay.enabled is False
+
+    def test_cleanup_idempotent(self):
+        """Calling cleanup() twice should not raise."""
+        relay = RelayController(gpio_pin=18)
+        relay.cleanup()
+        relay.cleanup()
+
+    def test_amp_power_on_delay_stored(self):
+        relay = RelayController(gpio_pin=18, amp_power_on_delay_sec=1.5)
+        assert relay.amp_power_on_delay_sec == 1.5
+
+    @patch("noise_warden.response._gpiozero_available", True)
+    @patch("noise_warden.response._RELAY_HW_ENABLED", True)
+    def test_gpio_device_created_when_enabled(self):
+        """When gpiozero is available and enabled, OutputDevice is instantiated."""
+        mock_device = MagicMock()
+        mock_output_cls = MagicMock(return_value=mock_device)
+        # Inject the mock OutputDevice into the module namespace (it won't exist
+        # on non-Pi systems where gpiozero is not installed)
+        import noise_warden.response as resp_mod
+        resp_mod.OutputDevice = mock_output_cls
+        try:
+            relay = RelayController(gpio_pin=17, active_high=False)
+            mock_output_cls.assert_called_once_with(17, active_high=False, initial_value=False)
+            assert relay._device is mock_device
+        finally:
+            delattr(resp_mod, "OutputDevice")
+
+    @patch("noise_warden.response._gpiozero_available", True)
+    @patch("noise_warden.response._RELAY_HW_ENABLED", True)
+    def test_gpio_on_off_delegates_to_device(self):
+        """on()/off() should call the gpiozero device methods."""
+        mock_device = MagicMock()
+        mock_output_cls = MagicMock(return_value=mock_device)
+        import noise_warden.response as resp_mod
+        resp_mod.OutputDevice = mock_output_cls
+        try:
+            relay = RelayController(gpio_pin=18)
+            relay.on()
+            mock_device.on.assert_called_once()
+            relay.off()
+            mock_device.off.assert_called_once()
+        finally:
+            delattr(resp_mod, "OutputDevice")
+
+    @patch("noise_warden.response._gpiozero_available", True)
+    @patch("noise_warden.response._RELAY_HW_ENABLED", True)
+    def test_gpio_cleanup_closes_device(self):
+        """cleanup() should off() and close() the gpiozero device."""
+        mock_device = MagicMock()
+        mock_output_cls = MagicMock(return_value=mock_device)
+        import noise_warden.response as resp_mod
+        resp_mod.OutputDevice = mock_output_cls
+        try:
+            relay = RelayController(gpio_pin=18)
+            relay.cleanup()
+            mock_device.off.assert_called()
+            mock_device.close.assert_called_once()
+            assert relay._device is None
+        finally:
+            delattr(resp_mod, "OutputDevice")
 
 
 # ---------------------------------------------------------------------------

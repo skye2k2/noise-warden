@@ -248,6 +248,42 @@ def set_sample_rate(request: Request, sample_rate: int = Form(...)):
 
     return RedirectResponse(url="/calibration?msg=sample-rate-updated-restart-required", status_code=303)
 
+@app.post("/calibration/noise-floor")
+def set_noise_floor(request: Request, noise_floor_db: float = Form(...)):
+    """Update the ambient noise floor gate. Takes effect immediately (no restart needed)
+    because the engine reads this from cfg on every loop iteration."""
+    must_auth(request)
+    if not (0.0 <= noise_floor_db <= 80.0):
+        return RedirectResponse(
+            url=f"/calibration?msg=error:noise floor must be 0–80 dBA", status_code=303
+        )
+
+    cfg["detection"]["noise_floor_db"] = noise_floor_db
+
+    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    try:
+        import re
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        # If the key already exists in YAML, update it; otherwise insert after "mode:" line
+        if "noise_floor_db" in raw:
+            updated = re.sub(
+                r"(noise_floor_db:\s*)[\d.\-]+",
+                rf"\g<1>{noise_floor_db}",
+                raw
+            )
+        else:
+            updated = re.sub(
+                r"(mode:\s*\S+[^\n]*\n)",
+                rf"\g<1>  noise_floor_db: {noise_floor_db}           # Ambient gate — signals below this dBA skip DSP analysis entirely\n",
+                raw
+            )
+        save_yaml_text_validated(cfg_path, updated)
+    except Exception as e:
+        return RedirectResponse(url=f"/calibration?msg=apply-error:{e}", status_code=303)
+
+    return RedirectResponse(url="/calibration?msg=noise-floor-updated", status_code=303)
+
 @app.post("/control/pause")
 def pause(request: Request):
     must_auth(request)

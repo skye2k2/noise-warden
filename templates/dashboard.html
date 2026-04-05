@@ -10,6 +10,7 @@
     <span class="pill" id="pill-mode">Mode: {{ state.mode }}</span>
     <span class="pill" id="pill-db">Current dB: {{ state.current_db }}</span>
     <span class="pill" id="pill-threshold">Threshold: {{ state.current_threshold_db }}</span>
+    <span class="pill" id="pill-disk" style="{% if state.disk_warning %}background:#e74c3c;color:#fff{% endif %}">Disk: {{ state.disk_warning or ('%.0f MB free' | format(state.disk_free_mb|default(0, true))) }}</span>
   </p>
   <p class="small">Status updates every 5 seconds from in-memory state (no database reads).</p>
   <form method="post" action="/control/pause" style="display:inline-block;"><button>Pause</button></form>
@@ -62,6 +63,8 @@
     current_threshold_db: { el: document.getElementById('pill-threshold'), label: 'Threshold' },
   };
 
+  const diskPill = document.getElementById('pill-disk');
+
   async function pollState() {
     try {
       const resp = await fetch('/api/state');
@@ -73,12 +76,35 @@
           info.el.textContent = info.label + ': ' + data[key];
         }
       }
+
+      // Disk warning gets special treatment: red background when warning is active
+      if (diskPill) {
+        if (data.disk_warning) {
+          diskPill.textContent = data.disk_warning;
+          diskPill.style.background = '#e74c3c';
+          diskPill.style.color = '#fff';
+        } else if (data.disk_free_mb != null) {
+          diskPill.textContent = 'Disk: ' + Math.round(data.disk_free_mb) + ' MB free';
+          diskPill.style.background = '';
+          diskPill.style.color = '';
+        }
+      }
     } catch (err) {
       // Network error — silently skip this cycle
     }
   }
 
-  setInterval(pollState, POLL_INTERVAL);
+  // Pause polling when the tab is backgrounded (Pi resource courtesy)
+  let pollTimer = setInterval(pollState, POLL_INTERVAL);
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    } else if (!pollTimer) {
+      pollState();
+      pollTimer = setInterval(pollState, POLL_INTERVAL);
+    }
+  });
 })();
 </script>
 {% endblock %}

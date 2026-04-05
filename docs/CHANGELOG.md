@@ -1,5 +1,46 @@
 # noise-warden CHANGELOG
 
+## v8 - 2026-04-05 — "Stop Hitting Yourself Retaliation Edition"
+
+Response system overhaul with real GPIO relay control, self-noise suppression (don't log your own retaliation as a noise incident), non-blocking callback audio streams for future dual-mic support, ambient noise floor gate to skip DSP on white noise, and a batch of UI/operational polish.
+
+<details>
+
+<summary>Key details</summary>
+
+### Noise floor gate
+
+- **Configurable ambient noise floor** — new `detection.noise_floor_db` config key (default 50 dBA). Signals below this threshold skip the entire DSP pipeline (spectrum analysis, beat confidence, music classification, all exclusion filters). Reduces CPU load on the Pi and avoids processing blocks of data that could never approach an incident threshold. Set to 0 to disable. Configurable via calibration page UI or YAML; takes effect immediately (no restart needed)
+
+### Response system
+
+- **GPIO relay control re-integrated** — `RelayController` now drives a physical GPIO pin via `gpiozero.OutputDevice` when `_RELAY_HW_ENABLED = True` in `response.py`. Configurable `active_high` polarity and `amp_power_on_delay_sec` (default 1s) for amplifier PSU stabilization. Graceful fallback to boolean-only on non-Pi systems or when gpiozero is not installed
+- **Self-noise suppression** — new `_start_response()` / `_stop_response()` / `_in_response_cooldown()` methods in the engine. While the system is playing a response (or within the `response_cooldown_sec` window afterward), incident detection is suppressed to prevent logging our own retaliation as a noise violation. State key `responding` added to StateStore for dashboard visibility
+- **Centralized response lifecycle** — all relay.on/player.start/relay.off/player.stop calls consolidated into `_start_response()` and `_stop_response()` (was duplicated in 3+ call sites). `relay.cleanup()` releases GPIO on shutdown
+
+### Audio capture
+
+- **Non-blocking callback stream support** — `AudioCapture` now supports `sd.InputStream` with a callback that pushes blocks into a `queue.Queue`, selectable via `_CALLBACK_STREAMS_ENABLED = True` in `audio.py`. Same `read_block()` API — no caller changes needed. Enables concurrent multi-device capture for future dual-mic reference subtraction. Disabled by default; blocking `sd.rec()` remains the default mode
+- **`AudioCapture.close()`** — new method releases the InputStream on shutdown
+- **`reinitialize()` drains callback queue** — prevents stale blocks from a previous device error from polluting the next capture session
+
+### Dual-microphone plugins
+
+- **`ReferenceSubtractor`** — NLMS (Normalized Least Mean Squares) adaptive filter for echo cancellation between the reference mic (our speaker output) and the primary mic. 256-tap filter, mu=0.1, documented algorithm in `plugins.py`
+- **`DualMicDifferential`** — spectral subtraction for directional noise rejection. Attenuates frequencies that are louder on the secondary mic (our side) than the primary mic (neighbor's side). Configurable aggressiveness via `alpha` parameter
+- **Strong dual-mic recommendation** — README hardware section now prominently recommends two separate USB audio interfaces with two microphones for any deployment using the response feature. Single-mic setups work but rely solely on time-based cooldown for self-noise suppression
+
+### Maintenance
+
+- **StateStore consistent schema** — `disk_free_mb`, `disk_warning`, and `responding` now initialized in `StateStore._state` so `/api/state` always returns a complete shape
+- **Dashboard disk warning pill** — low-disk situations now surface visually as a red "Disk" pill on the dashboard, instead of only logging to stdout
+- **Dashboard visibility-pause polling** — `setInterval` polling now pauses via `document.visibilitychange` when the tab is backgrounded and resumes with an immediate fetch when foregrounded (minor Pi resource courtesy)
+- **Timeline summary bar** — the pinned summary above the calendar now shows both incident count and total duration (e.g., "3 incidents · 12m 34s total")
+- **`_looks_like_driveby` docstring cleaned up** — removed misleading "monotonically" wording and corrected inline comment to say "Count upticks (dB increases)"
+- Test suite expanded to 221 tests (37 new: GPIO relay with mocked gpiozero, self-noise suppression lifecycle/cooldown, AudioCapture blocking/callback modes, NLMS adaptive filter convergence, spectral subtraction, noise floor gate, noise floor web route, plus prior session tests)
+
+</details>
+
 ## v7 - 2026-04-04 — "Show Me the Evidence Edition"
 
 Visual timeline redesign with offline-first architecture, plus a comprehensive deployment-hardening pass addressing silent failure modes, data integrity, and operational resilience. The primary use case is presenting cached noise incident data — including audio snippets — to authorities without network access, and having the system survive real-world Pi deployment conditions.

@@ -59,6 +59,27 @@
 </div>
 
 <div class="card">
+  <h2>Noise Floor Gate</h2>
+  <p class="small">
+    The ambient noise floor sets the minimum dBA level worth analyzing. Signals below this
+    threshold are treated as background white noise and skip the DSP pipeline entirely
+    (spectrum analysis, beat detection, classification filters). This reduces CPU usage on
+    the Pi and avoids processing blocks that could never trigger an incident.
+  </p>
+  <form method="post" action="/calibration/noise-floor">
+    <label for="nf-input"><b>Noise floor (dBA):</b></label>
+    <input type="number" id="nf-input" name="noise_floor_db" step="0.5" min="20" max="80"
+           value="{{ cfg.detection.noise_floor_db|default(50.0, true) }}" style="width:80px">
+    <button type="submit">Apply</button>
+  </form>
+  <p class="small" style="margin-top:8px">
+    Current: <b>{{ cfg.detection.noise_floor_db|default(50.0, true) }} dBA</b>.
+    Default is 50 dBA (typical quiet residential ambient). If your environment has a higher
+    baseline (near a busy road, HVAC, etc.), raise this accordingly. Set to 0 to disable the gate.
+  </p>
+</div>
+
+<div class="card">
   <h2>Manual Calibration</h2>
   <p>If you prefer to calibrate without a reference source:</p>
   <ul>

@@ -55,6 +55,7 @@ def _minimal_cfg_dict(tmp_dir):
         "detection": {
             "zone": "residential_agricultural",
             "mode": "continuous_music_focus",
+            "noise_floor_db": 50.0,
             "calibration_offset_db": 88.0,
             "night_start_hour": 22,
             "night_end_hour": 7,
@@ -73,6 +74,9 @@ def _minimal_cfg_dict(tmp_dir):
         "response": {
             "enable_daytime_response": False,
             "relay_gpio_pin": 18,
+            "relay_active_high": True,
+            "amp_power_on_delay_sec": 0.0,
+            "response_cooldown_sec": 5.0,
             "player_command": "/usr/bin/cvlc --play-and-exit --no-video",
             "playlist_dir": os.path.join(tmp_dir, "playlist"),
         },
@@ -150,6 +154,7 @@ def base_cfg(tmp_path):
         "detection": {
             "zone": "residential_agricultural",
             "mode": "continuous_music_focus",
+            "noise_floor_db": 50.0,
             "calibration_offset_db": 88.0,
             "night_start_hour": 22,
             "night_end_hour": 7,
@@ -168,6 +173,9 @@ def base_cfg(tmp_path):
         "response": {
             "enable_daytime_response": False,
             "relay_gpio_pin": 18,
+            "relay_active_high": True,
+            "amp_power_on_delay_sec": 0.0,
+            "response_cooldown_sec": 5.0,
             "player_command": "/usr/bin/cvlc --play-and-exit --no-video",
             "playlist_dir": str(tmp_path / "playlist"),
         },
