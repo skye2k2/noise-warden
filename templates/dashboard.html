@@ -13,13 +13,38 @@
     <span class="pill" id="pill-disk" style="{% if state.disk_warning %}background:#e74c3c;color:#fff{% endif %}">Disk: {{ state.disk_warning or ('%.0f MB free' | format(state.disk_free_mb|default(0, true))) }}</span>
   </p>
   <p class="small">Status updates every 5 seconds from in-memory state (no database reads).</p>
-  <form method="post" action="/control/pause" style="display:inline-block;"><button>Pause</button></form>
-  <form method="post" action="/control/resume" style="display:inline-block;"><button>Resume</button></form>
-  {% if cfg.audio.recording_enabled %}
-  <form method="post" action="/control/recording" style="display:inline-block;"><input type="hidden" name="enabled" value="false"><button>Disable Recording</button></form>
-  {% else %}
-  <form method="post" action="/control/recording" style="display:inline-block;"><input type="hidden" name="enabled" value="true"><button>Enable Recording</button></form>
-  {% endif %}
+
+  <div style="margin-top:8px">
+    {% if state.armed %}
+    <form method="post" action="/control/pause" style="display:inline-block;"><button>Pause Detection</button></form>
+    {% else %}
+    <form method="post" action="/control/resume" style="display:inline-block;"><button>Resume Detection</button></form>
+    {% endif %}
+
+    {% if cfg.audio.recording_enabled %}
+    <form method="post" action="/control/recording" style="display:inline-block;"><input type="hidden" name="enabled" value="false"><button>Disable Recording</button></form>
+    {% else %}
+    <form method="post" action="/control/recording" style="display:inline-block;"><input type="hidden" name="enabled" value="true"><button>Enable Recording</button></form>
+    {% endif %}
+
+    {% if state.active_incident_id %}
+    <form method="post" action="/control/end-forced-incident" style="display:inline-block;"><button>End Incident</button></form>
+    {% else %}
+    <form method="post" action="/control/force-incident" style="display:inline-block;"><button>Force Test Incident</button></form>
+    {% endif %}
+  </div>
+
+  <div style="margin-top:8px">
+    <form method="post" action="/control/detection-mode" style="display:inline-block;">
+      <input type="hidden" name="redirect" value="/">
+      <label for="dm-select"><b>Detection mode:</b></label>
+      <select id="dm-select" name="detection_mode" onchange="this.form.submit()">
+        <option value="continuous" {% if cfg.detection.mode == 'continuous' %}selected{% endif %}>Continuous — all noise types</option>
+        <option value="continuous_music_focus" {% if cfg.detection.mode == 'continuous_music_focus' %}selected{% endif %}>Music focus — only music-like noise</option>
+        <option value="intermittent" {% if cfg.detection.mode == 'intermittent' %}selected{% endif %}>Intermittent — uses intermittent thresholds</option>
+      </select>
+    </form>
+  </div>
 </div>
 
 <div class="card">
@@ -33,23 +58,56 @@
 </div>
 
 <div class="card">
-  <h3>Recent Incidents</h3>
+  <h3>Recent Incidents ({{ incidents|length }})</h3>
   <table>
-    <tr><th>ID</th><th>Start</th><th>Start dB</th><th>Duration</th><th>Music Score</th><th>Mode</th></tr>
+    <tr><th>Start <span class="small" id="tz-offset-label"></span></th><th>Duration</th><th>Excess</th><th>Music Score</th><th>Mode</th><th></th></tr>
     {% for r in incidents %}
     <tr>
-      <td>{{ r.id }}</td>
-      <td>{{ r.start_ts }}</td>
-      <td>{{ r.start_db }}</td>
-      <td>{{ r.duration_sec or "" }}</td>
+      <td class="incident-ts" data-ts="{{ r.start_ts }}">{{ r.start_ts }}</td>
+      <td>{% if r.duration_sec is not none %}{% if r.duration_sec >= 3600 %}{{ "%.1f"|format(r.duration_sec / 3600) }}h{% elif r.duration_sec >= 60 %}{{ "%.1f"|format(r.duration_sec / 60) }}m{% else %}{{ r.duration_sec|int }}s{% endif %}{% endif %}</td>
+      <td>{% if r.start_db and r.threshold_db %}(+{{ "%.1f"|format(r.start_db - r.threshold_db) }}dB){% endif %}</td>
       <td>{{ r.music_like_score }}</td>
       <td>{{ r.mode }}</td>
+      <td>{% if r.snippet_path %}<button class="snippet-play-btn"
+        data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
+        title="Play audio snippet">&#9654;</button>{% endif %}</td>
     </tr>
     {% endfor %}
   </table>
 </div>
 
 <script>
+/* Format incident timestamps: strip the offset suffix (shown once in the heading)
+   and display just the date + time. Detect offset from first row for the heading label. */
+(function () {
+  var cells = document.querySelectorAll('.incident-ts');
+  var offsetLabel = document.getElementById('tz-offset-label');
+  var offsetShown = false;
+
+  cells.forEach(function (td) {
+    var raw = td.getAttribute('data-ts');
+    if (!raw) { return; }
+
+    /* Extract and display timezone offset once in the heading */
+    if (!offsetShown) {
+      var offsetMatch = raw.match(/([+-]\d{2}:\d{2})$/);
+      if (offsetMatch && offsetLabel) {
+        offsetLabel.textContent = '(UTC ' + offsetMatch[1] + ')';
+      }
+      offsetShown = true;
+    }
+
+    /* Render as locale-appropriate short date+time */
+    try {
+      var d = new Date(raw);
+      td.textContent = d.toLocaleDateString([], { month:'short', day:'numeric' })
+        + ' ' + d.toLocaleTimeString([], { hour:'numeric', minute:'2-digit', second:'2-digit' });
+    } catch (e) {
+      /* Fallback: just strip the offset */
+      td.textContent = raw.replace(/[+-]\d{2}:\d{2}$/, '');
+    }
+  });
+})();
 (function () {
   const POLL_INTERVAL = 5000;
 
@@ -106,5 +164,16 @@
     }
   });
 })();
+</script>
+
+{% include '_popup.html' %}
+
+<script>
+/* Wire play buttons to the shared popup */
+document.querySelectorAll('.snippet-play-btn').forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    showPopup(JSON.parse(btn.getAttribute('data-incident')));
+  });
+});
 </script>
 {% endblock %}

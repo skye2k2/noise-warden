@@ -1,16 +1,96 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="card">
+  <p>
+    <span class="pill" id="pill-db">Current dB: --</span>
+    <span class="pill" id="pill-raw" style="cursor:pointer" title="Click to fill Observed raw dBFS field">Raw dBFS: --</span>
+  </p>
+  <div class="small" style="margin-left:8px">Updates every second. Click raw dBFS to auto-fill Step 2.</div>
+
+  <form method="post" action="/calibration/apply" id="offset-form" style="margin-top:12px">
+    <label for="offset-slider"><b>Calibration offset:</b></label>
+    <span id="offset-value" style="font-weight:bold;min-width:60px;display:inline-block">{{ cfg.detection.calibration_offset_db }} dB</span>
+    <br>
+    <input type="range" id="offset-slider" name="offset_db"
+           min="0" max="150" step="0.5"
+           value="{{ cfg.detection.calibration_offset_db }}"
+           style="width:100%;max-width:500px;margin-top:4px">
+    <div style="display:flex;justify-content:space-between;max-width:500px">
+      <span class="small">0</span>
+      <span class="small">30</span>
+      <span class="small">60</span>
+      <span class="small">90</span>
+      <span class="small">120</span>
+      <span class="small">150</span>
+    </div>
+    <button type="submit" id="offset-apply" style="margin-top:4px" disabled>Apply offset</button>
+    <span class="small" id="offset-hint" style="margin-left:8px"></span>
+  </form>
+
+  <form method="post" action="/control/detection-mode" style="margin-top:12px">
+    <input type="hidden" name="redirect" value="/calibration">
+    <label for="cal-dm-select"><b>Detection mode:</b></label>
+    <select id="cal-dm-select" name="detection_mode" onchange="this.form.submit()">
+      <option value="continuous" {% if cfg.detection.mode == 'continuous' %}selected{% endif %}>Continuous — all noise types</option>
+      <option value="continuous_music_focus" {% if cfg.detection.mode == 'continuous_music_focus' %}selected{% endif %}>Music focus — only music-like noise</option>
+      <option value="intermittent" {% if cfg.detection.mode == 'intermittent' %}selected{% endif %}>Intermittent — uses intermittent thresholds</option>
+    </select>
+  </form>
+</div>
+
+<div class="card">
   <h2>Calibration Wizard</h2>
   {% if request.query_params.get("msg") %}<p><b>{{ request.query_params.get("msg") }}</b></p>{% endif %}
-  <p>Enter a known reference SPL and the observed raw dBFS reading to compute an offset.</p>
-  <form id="calform">
-    <input type="text" name="name" placeholder="Profile name" required>
-    <br><input type="number" step="0.01" name="reference_spl_db" placeholder="Reference SPL dB" required>
-    <br><input type="number" step="0.01" name="observed_raw_dbfs" placeholder="Observed raw dBFS" required>
-    <br><button type="submit">Compute &amp; Save Profile</button>
-  </form>
-  <pre id="calout"></pre>
+
+  <p>This wizard computes the <b>calibration offset</b> — the constant difference between your
+  microphone's raw digital reading (dBFS) and the actual sound pressure level (dB SPL) at the mic.
+  Once computed, all dB readings on the dashboard and in incident logs reflect real-world SPL.</p>
+
+  <details open>
+    <summary><b>Step 1: Get a reference sound level</b></summary>
+    <p style="margin-top:8px">You need a known SPL value from <i>any</i> of these methods:</p>
+    <ul>
+      <li><b>SPL meter</b> — Hold a calibrated meter (or phone app like NIOSH SLM) next to
+          your Noise Warden mic. Play a steady tone or pink noise. Read the SPL (e.g., 72.0 dB).</li>
+      <li><b>Calibrator</b> — Acoustic calibrators output a precise 94 or 114 dB tone directly
+          into the mic capsule. Use the printed value.</li>
+      <li><b>Known source</b> — A vacuum at 3 ft is roughly 70–75 dB. Less precise, but workable
+          for an initial rough calibration.</li>
+    </ul>
+    <p>Enter that number in <b>Reference SPL</b> below.</p>
+  </details>
+
+  <details open>
+    <summary><b>Step 2: Capture the raw dBFS</b></summary>
+    <p style="margin-top:8px">While the reference sound is playing, click the
+    <b>Raw dBFS</b> pill at the top of this page. It will auto-fill the
+    <b>Observed raw dBFS</b> field below with the current reading.</p>
+  </details>
+
+  <details open>
+    <summary><b>Step 3: Compute and save</b></summary>
+    <p style="margin-top:8px">Give this profile a name (e.g., "Living room BY-MM1") so you
+    can track different mic/placement combos over time.</p>
+
+    <form id="calform" style="margin-top:8px">
+      <table style="max-width:500px">
+        <tr>
+          <td><label for="cal-name"><b>Profile name</b></label></td>
+          <td><input type="text" id="cal-name" name="name" placeholder="e.g. Fence line RØDE" required style="width:100%"></td>
+        </tr>
+        <tr>
+          <td><label for="cal-ref"><b>Reference SPL (dB)</b></label></td>
+          <td><input type="number" id="cal-ref" step="0.01" name="reference_spl_db" placeholder="72.0" required style="width:100%"></td>
+        </tr>
+        <tr>
+          <td><label for="cal-raw"><b>Observed raw dBFS</b></label></td>
+          <td><input type="number" id="cal-raw" step="0.01" name="observed_raw_dbfs" placeholder="-16.5" required style="width:100%"></td>
+        </tr>
+      </table>
+      <button type="submit" style="margin-top:8px">Compute &amp; Save Profile</button>
+    </form>
+    <pre id="calout"></pre>
+  </details>
 </div>
 
 <div class="card">
@@ -23,11 +103,16 @@
       <td>{{ p.id }}</td>
       <td>{{ p.name }}</td>
       <td>{{ "%.2f"|format(p.offset_db) }}</td>
-      <td>{{ p.created_ts }}</td>
+      <td class="cal-ts" data-ts="{{ p.created_ts }}">{{ p.created_ts }}</td>
       <td>
         <form method="post" action="/calibration/apply" style="display:inline;">
           <input type="hidden" name="offset_db" value="{{ p.offset_db }}">
           <button type="submit">Apply</button>
+        </form>
+        <form method="post" action="/calibration/delete" style="display:inline;"
+              onsubmit="return confirm('Delete profile {{ p.name }}?')">
+          <input type="hidden" name="profile_id" value="{{ p.id }}">
+          <button type="submit" class="destructive">Delete</button>
         </form>
       </td>
     </tr>
@@ -85,12 +170,103 @@
   <ul>
     <li>Place mic according to ordinance guidance near intended measurement point</li>
     <li>Generate known tone/noise at known SPL (or use a calibrated SPL meter)</li>
-    <li>Observe current dB on dashboard</li>
-    <li>Adjust <code>detection.calibration_offset_db</code> in config until aligned</li>
+    <li>Watch the <b>Current dB</b> pill above while dragging the offset slider until the reading matches your reference</li>
+    <li>Click <b>Apply offset</b> to save</li>
   </ul>
 </div>
 
 <script>
+/* --- Format profile timestamps to locale-friendly display --- */
+(function () {
+  document.querySelectorAll('.cal-ts').forEach(function (td) {
+    var raw = td.getAttribute('data-ts');
+    if (!raw) { return; }
+    try {
+      var d = new Date(raw);
+      td.textContent = d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })
+        + ' ' + d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    } catch (e) {
+      td.textContent = raw.replace(/[+-]\d{2}:\d{2}$/, '');
+    }
+  });
+})();
+
+/* --- Live dB polling (1-second interval, visibility-aware) --- */
+(function () {
+  var pillDb = document.getElementById('pill-db');
+  var pillRaw = document.getElementById('pill-raw');
+  var rawInput = document.getElementById('cal-raw');
+  var slider = document.getElementById('offset-slider');
+  var offsetLabel = document.getElementById('offset-value');
+  var applyBtn = document.getElementById('offset-apply');
+  var hint = document.getElementById('offset-hint');
+  var savedOffset = {{ cfg.detection.calibration_offset_db }};
+
+  // Slider interaction — update label and enable apply button when changed
+  slider.addEventListener('input', function () {
+    var val = parseFloat(slider.value);
+    offsetLabel.textContent = val.toFixed(1) + ' dB';
+
+    if (val !== savedOffset) {
+      applyBtn.disabled = false;
+      hint.textContent = '(changed from ' + savedOffset.toFixed(1) + ')';
+    } else {
+      applyBtn.disabled = true;
+      hint.textContent = '';
+    }
+  });
+
+  // Use the slider's current value for raw dBFS so it reacts during drag
+  function currentOffset() {
+    return parseFloat(slider.value);
+  }
+
+  var latestRaw = null;
+
+  async function pollDb() {
+    try {
+      var resp = await fetch('/api/state');
+      if (!resp.ok) { return; }
+      var data = await resp.json();
+
+      if (data.current_db !== undefined) {
+        pillDb.textContent = 'Current dB: ' + data.current_db.toFixed(1);
+        // Raw dBFS = calibrated reading minus the active offset
+        latestRaw = Math.round((data.current_db - currentOffset()) * 10) / 10;
+        pillRaw.textContent = 'Raw dBFS: ' + latestRaw.toFixed(1);
+      }
+    } catch (err) {
+      // Network hiccup — skip this cycle
+    }
+  }
+
+  // Click the raw pill to auto-fill the observed dBFS input
+  pillRaw.addEventListener('click', function () {
+    if (latestRaw !== null && rawInput) {
+      rawInput.value = latestRaw;
+      // Brief visual confirmation
+      pillRaw.style.outline = '2px solid var(--now-line, #66d9ef)';
+      setTimeout(function () { pillRaw.style.outline = ''; }, 400);
+    }
+  });
+
+  // Initial fetch, then 1-second interval
+  pollDb();
+  var timer = setInterval(pollDb, 1000);
+
+  // Pause polling when tab is backgrounded to reduce Pi load
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      clearInterval(timer);
+      timer = null;
+    } else if (!timer) {
+      pollDb();
+      timer = setInterval(pollDb, 1000);
+    }
+  });
+})();
+
+/* --- Calibration wizard form submission --- */
 document.getElementById('calform').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);

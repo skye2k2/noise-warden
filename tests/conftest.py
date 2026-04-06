@@ -42,7 +42,7 @@ def _minimal_cfg_dict(tmp_dir):
         },
         "audio": {
             "sample_rate": 22050,
-            "block_seconds": 0.5,
+            "block_seconds": 1.0,
             "input_device": None,
             "input_channels": 1,
             "recording_enabled": True,
@@ -141,7 +141,7 @@ def base_cfg(tmp_path):
         },
         "audio": {
             "sample_rate": 22050,
-            "block_seconds": 0.5,
+            "block_seconds": 1.0,
             "input_device": None,
             "input_channels": 1,
             "recording_enabled": True,

@@ -23,13 +23,13 @@ from noise_warden.storage import Storage
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_sine_block(freq=440, sr=22050, duration=0.5, amplitude=0.5):
+def _make_sine_block(freq=440, sr=22050, duration=1.0, amplitude=0.5):
     """Generate a sine wave block matching the default capture config."""
     t = np.linspace(0, duration, int(sr * duration), endpoint=False, dtype=np.float32)
     return np.sin(2 * np.pi * freq * t) * amplitude
 
 
-def _make_silence_block(sr=22050, duration=0.5):
+def _make_silence_block(sr=22050, duration=1.0):
     """Generate a near-silent block."""
     return np.zeros(int(sr * duration), dtype=np.float32)
 
@@ -40,7 +40,7 @@ class FakeCapture:
     of reading from a real microphone.
     """
 
-    def __init__(self, blocks, sr=22050, block_seconds=0.5):
+    def __init__(self, blocks, sr=22050, block_seconds=1.0):
         self.sr = sr
         self.block_seconds = block_seconds
         self._blocks = list(blocks)
@@ -169,6 +169,7 @@ class TestEngineProcessing:
 
     def test_disarmed_engine_skips_processing(self, base_cfg, tmp_storage, tmp_state):
         """When armed=False, the engine should skip audio processing entirely."""
+        base_cfg["detection"]["armed"] = False
         tmp_state.set(armed=False)
         loud_blocks = [_make_sine_block(amplitude=0.8) for _ in range(3)]
 
@@ -463,6 +464,11 @@ class TestDiskFullRecordingStop:
             with patch("noise_warden.engine.HAClient"):
                 engine = Engine(base_cfg, tmp_storage, tmp_state)
 
+        # Mock a wav_handle whose write() raises OSError (simulates disk-full)
+        mock_handle = MagicMock()
+        mock_handle.closed = False
+        mock_handle.write.side_effect = OSError("No space left on device")
+
         # Set up an active incident with recording enabled
         engine.active = {
             "id": 1,
@@ -473,6 +479,7 @@ class TestDiskFullRecordingStop:
             "responded": False,
             "last_above": datetime(2026, 4, 1, 12, 0, 0, tzinfo=timezone.utc),
             "tmp_wav": "/nonexistent/path/will_fail.wav",
+            "wav_handle": mock_handle,
             "recording": True,
         }
 
@@ -505,9 +512,10 @@ class TestPeriodBoundarySplit:
         base_cfg["detection"]["driveby_max_duration_sec"] = 0
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
 
-        # Create a day incident in the DB
+        # Create a day incident in the DB (timestamp slightly in the past so
+        # the engine-created split incident sorts before it in DESC order)
         day_row = {
-            "start_ts": datetime.now(timezone.utc).isoformat(),
+            "start_ts": (datetime.now().astimezone() - timedelta(seconds=10)).replace(microsecond=0).isoformat(),
             "start_db": 70, "peak_db": 72, "avg_db": 70,
             "threshold_db": 65.0, "music_like_score": 0.5,
             "beat_confidence": 0.3, "classification": "other",
@@ -516,7 +524,7 @@ class TestPeriodBoundarySplit:
         day_id = tmp_storage.create_incident(day_row)
 
         # Start must be recent for a valid positive duration at finalization
-        recent_start = datetime.now(timezone.utc) - timedelta(seconds=30)
+        recent_start = datetime.now().astimezone() - timedelta(seconds=30)
         engine.active = {
             "id": day_id,
             "start": recent_start,
@@ -524,7 +532,7 @@ class TestPeriodBoundarySplit:
             "classification": "other",
             "period": "day",
             "responded": False,
-            "last_above": datetime.now(timezone.utc),
+            "last_above": datetime.now().astimezone(),
             "tmp_wav": None,
             "recording": False,
         }
@@ -667,7 +675,7 @@ class TestDurationSplit:
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
 
         row = {
-            "start_ts": datetime.now(timezone.utc).isoformat(),
+            "start_ts": (datetime.now().astimezone() - timedelta(seconds=10)).replace(microsecond=0).isoformat(),
             "start_db": 70, "peak_db": 72, "avg_db": 70,
             "threshold_db": 65.0, "music_like_score": 0.5,
             "beat_confidence": 0.3, "classification": "other",
@@ -678,12 +686,12 @@ class TestDurationSplit:
         # Start time is 3 hours ago — exceeds the 2-hour limit
         engine.active = {
             "id": iid,
-            "start": datetime.now(timezone.utc) - timedelta(hours=3),
+            "start": datetime.now().astimezone() - timedelta(hours=3),
             "dbs": [70, 71, 72],
             "classification": "other",
             "period": "day",
             "responded": False,
-            "last_above": datetime.now(timezone.utc),
+            "last_above": datetime.now().astimezone(),
             "tmp_wav": None,
             "recording": False,
         }

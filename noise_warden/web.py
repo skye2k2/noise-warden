@@ -44,7 +44,7 @@ def must_auth(request: Request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def since_for_view(view: str):
-    now = datetime.now(timezone.utc)
+    now = datetime.now().astimezone()
     if view == "day":
         return (now - timedelta(days=1)).isoformat()
     if view == "week":
@@ -52,6 +52,29 @@ def since_for_view(view: str):
     if view == "month":
         return (now - timedelta(days=30)).isoformat()
     return None
+
+def _persist_armed(armed: bool):
+    """Write the armed state to the YAML config so it survives watch-mode reloads."""
+    import re
+    cfg["detection"]["armed"] = armed
+    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        val = "true" if armed else "false"
+        if "armed:" in raw:
+            updated = re.sub(r"(armed:\s*)\S+", rf"\g<1>{val}", raw, count=1)
+        else:
+            # Insert after the mode: line in the detection block
+            updated = re.sub(
+                r"(mode:\s*\S+[^\n]*\n)",
+                rf"\g<1>  armed: {val}\n",
+                raw,
+                count=1
+            )
+        save_yaml_text_validated(cfg_path, updated)
+    except Exception as e:
+        print(f"[web] Failed to persist armed state: {e}")
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
@@ -61,6 +84,8 @@ def dashboard(request: Request):
         "state": state.snapshot(),
         "incidents": incidents,
         "ordinance": ORDINANCE,
+        "ordinance_json": json.dumps(ORDINANCE),
+        "borderline_margin_db": float(cfg["detection"].get("borderline_margin_db", 5.0)),
         "cfg": cfg,
         "message": request.query_params.get("msg")
     })
@@ -72,7 +97,9 @@ def incidents(request: Request, page: int = 1):
     total = storage.count_incidents()
     rows = storage.list_incidents(limit=per_page, offset=offset)
     return templates.TemplateResponse("incidents.html", {
-        "request": request, "rows": rows, "page": page, "pages": max(1, (total + per_page - 1)//per_page)
+        "request": request, "rows": rows, "page": page, "pages": max(1, (total + per_page - 1)//per_page),
+        "ordinance_json": json.dumps(ORDINANCE),
+        "borderline_margin_db": float(cfg["detection"].get("borderline_margin_db", 5.0)),
     })
 
 @app.post("/incidents/{incident_id}/notes")
@@ -106,10 +133,24 @@ def service_worker():
     """Serve the Service Worker from root scope so it can intercept /timeline and /snippets/ requests."""
     return FileResponse(os.path.join(static_dir, "sw.js"), media_type="application/javascript")
 
+@app.get("/favicon.ico")
+def favicon():
+    """Serve favicon from static/ — browsers request this automatically."""
+    path = os.path.join(static_dir, "favicon.svg")
+    if os.path.exists(path):
+        return FileResponse(path, media_type="image/svg+xml")
+    raise HTTPException(status_code=404)
+
+@app.get("/.well-known/{rest:path}")
+def well_known_sink(rest: str):
+    """Catch-all for .well-known requests (e.g., Chrome DevTools probes). Returns
+    an empty JSON object instead of a noisy 404 in the logs."""
+    return JSONResponse({})
+
 @app.get("/timeline", response_class=HTMLResponse)
 def timeline(request: Request, view: str = "day"):
     # Always load 30 days — all view switching is client-side (zero extra requests)
-    since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    since = (datetime.now().astimezone() - timedelta(days=30)).isoformat()
     rows = storage.list_incidents(limit=5000, since=since)
 
     # Build client-safe incident list (server-side paths excluded for security)
@@ -137,6 +178,7 @@ def timeline(request: Request, view: str = "day"):
         "view": view,
         "incidents_json": json.dumps(incidents),
         "ordinance_json": json.dumps(ORDINANCE),
+        "borderline_margin_db": float(cfg["detection"].get("borderline_margin_db", 5.0)),
     })
 
 @app.get("/config", response_class=HTMLResponse)
@@ -192,7 +234,7 @@ async def calibration_compute(
 ):
     must_auth(request)
     offset = reference_spl_db - observed_raw_dbfs
-    storage.add_calibration_profile(name, offset, datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    storage.add_calibration_profile(name, offset, datetime.now().astimezone().replace(microsecond=0).isoformat())
     return JSONResponse({"offset_db": offset})
 
 @app.post("/calibration/apply")
@@ -284,10 +326,18 @@ def set_noise_floor(request: Request, noise_floor_db: float = Form(...)):
 
     return RedirectResponse(url="/calibration?msg=noise-floor-updated", status_code=303)
 
+@app.post("/calibration/delete")
+def calibration_delete(request: Request, profile_id: int = Form(...)):
+    """Delete a saved calibration profile by ID."""
+    must_auth(request)
+    storage.delete_calibration_profile(profile_id)
+    return RedirectResponse(url="/calibration?msg=profile-deleted", status_code=303)
+
 @app.post("/control/pause")
 def pause(request: Request):
     must_auth(request)
     engine.set_armed(False)
+    _persist_armed(False)
     return RedirectResponse(url="/?msg=paused", status_code=303)
 
 @app.get("/thresholds", response_class=HTMLResponse)
@@ -312,6 +362,7 @@ def thresholds(request: Request):
 def resume(request: Request):
     must_auth(request)
     engine.set_armed(True)
+    _persist_armed(True)
     return RedirectResponse(url="/?msg=resumed", status_code=303)
 
 @app.post("/control/recording")
@@ -322,6 +373,48 @@ def toggle_recording(request: Request, enabled: str = Form(...)):
     cfg["audio"]["recording_enabled"] = new_val
     msg = "recording-enabled" if new_val else "recording-disabled"
     return RedirectResponse(url=f"/?msg={msg}", status_code=303)
+
+VALID_DETECTION_MODES = {"continuous", "intermittent", "continuous_music_focus"}
+
+@app.post("/control/detection-mode")
+def set_detection_mode(request: Request, detection_mode: str = Form(...), redirect: str = Form("/")):
+    """Switch detection mode at runtime. Takes effect immediately — the engine reads
+    cfg['detection']['mode'] on every loop iteration."""
+    must_auth(request)
+    if detection_mode not in VALID_DETECTION_MODES:
+        return RedirectResponse(url=f"{redirect}?msg=error:invalid mode {detection_mode}", status_code=303)
+    cfg["detection"]["mode"] = detection_mode
+
+    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    try:
+        import re
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        updated = re.sub(
+            r"(mode:\s*)\S+(\s*#.*)?",
+            rf"\g<1>{detection_mode}\2",
+            raw,
+            count=1
+        )
+        save_yaml_text_validated(cfg_path, updated)
+    except Exception as e:
+        return RedirectResponse(url=f"{redirect}?msg=mode-apply-error:{e}", status_code=303)
+
+    return RedirectResponse(url=f"{redirect}?msg=mode-set-{detection_mode}", status_code=303)
+
+@app.post("/control/force-incident")
+def force_incident(request: Request):
+    """Force-start a test incident for verifying recording and playback."""
+    must_auth(request)
+    engine.force_incident()
+    return RedirectResponse(url="/?msg=forced-incident-started", status_code=303)
+
+@app.post("/control/end-forced-incident")
+def end_forced_incident(request: Request):
+    """End a force-started test incident."""
+    must_auth(request)
+    engine.end_forced_incident()
+    return RedirectResponse(url="/?msg=forced-incident-ended", status_code=303)
 
 @app.get("/export.csv")
 def export_csv(request: Request):

@@ -14,6 +14,51 @@ from .ordinance import applicable_threshold, is_night
 from .response import RelayController, PlaylistPlayer
 from .ha import HAClient
 
+
+def _get_system_timezone():
+    """Detect the system's IANA timezone name using platform-appropriate methods.
+    Tries timedatectl (Linux/systemd) → /etc/timezone (Debian) → /etc/localtime
+    symlink (macOS/Linux). Returns None if all strategies fail."""
+    import subprocess
+
+    # Strategy 1: timedatectl (Linux with systemd)
+    try:
+        result = subprocess.run(
+            ["timedatectl", "show", "-p", "Timezone", "--value"],
+            capture_output=True, text=True, timeout=5
+        )
+        tz = result.stdout.strip()
+        if tz:
+            return tz
+    except (FileNotFoundError, OSError):
+        pass
+
+    # Strategy 2: /etc/timezone file (Debian/Ubuntu)
+    try:
+        with open("/etc/timezone") as f:
+            tz = f.read().strip()
+            if tz:
+                return tz
+    except (FileNotFoundError, OSError):
+        pass
+
+    # Strategy 3: /etc/localtime symlink (macOS, some Linux)
+    try:
+        link = os.readlink("/etc/localtime")
+        # e.g. /var/db/timezone/zoneinfo/America/Denver (macOS)
+        #   or /usr/share/zoneinfo/America/Denver (Linux)
+        marker = "zoneinfo/"
+        idx = link.find(marker)
+        if idx >= 0:
+            tz = link[idx + len(marker):]
+            if tz:
+                return tz
+    except (FileNotFoundError, OSError):
+        pass
+
+    return None
+
+
 class Engine:
     def __init__(self, cfg, storage, state):
         self.cfg = cfg
@@ -49,6 +94,9 @@ class Engine:
         self._responding = False
         self._response_end_ts = 0.0
         self._response_cooldown_sec = float(r.get("response_cooldown_sec", 5.0))
+        # Force-incident flags: set from web UI thread, consumed by engine loop
+        self._force_start_requested = False
+        self._force_end_requested = False
 
     def _check_disk_quota(self):
         """Check available disk space in snippets directory and warn if below threshold.
@@ -89,6 +137,9 @@ class Engine:
         if self.thread and self.thread.is_alive():
             return
         self.running = True
+        # Restore armed state from config so pauses survive server restarts
+        armed = bool(self.cfg["detection"].get("armed", True))
+        self.state.set(armed=armed)
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
@@ -134,17 +185,34 @@ class Engine:
 
     def set_armed(self, armed: bool):
         self.state.set(armed=armed)
+        # Finalize any active incident immediately when pausing, so the duration
+        # reflects actual monitoring time rather than wall-clock time through the pause.
+        if not armed and self.active:
+            print("[engine] Pausing — finalizing active incident")
+            self._finalize_incident(force=True)
+
+    def force_incident(self):
+        """Force-start a test incident from the web UI. The engine loop will append
+        audio blocks to it on subsequent iterations. Thread-safe: sets a flag that
+        the engine loop picks up on its next block read."""
+        self._force_start_requested = True
+
+    def end_forced_incident(self):
+        """Request the engine loop to finalize any active incident (forced or real).
+        Thread-safe: sets a flag consumed by the engine loop."""
+        self._force_end_requested = True
 
     def _begin_incident(self, db_now, threshold, mscore, bconf, classification, mode):
-        ts = datetime.now(timezone.utc).isoformat()
+        now = datetime.now().astimezone()
+        ts = now.replace(microsecond=0).isoformat()
         row = {
             "start_ts": ts,
-            "start_db": db_now,
-            "peak_db": db_now,
-            "avg_db": db_now,
+            "start_db": round(db_now, 1),
+            "peak_db": round(db_now, 1),
+            "avg_db": round(db_now, 1),
             "threshold_db": threshold,
-            "music_like_score": mscore,
-            "beat_confidence": bconf,
+            "music_like_score": round(mscore, 3),
+            "beat_confidence": round(bconf, 3),
             "classification": classification,
             "mode": mode,
             "responded": 0,
@@ -156,12 +224,12 @@ class Engine:
 
         self.active = {
             "id": iid,
-            "start": datetime.now(timezone.utc),
+            "start": now,
             "dbs": [db_now],
             "classification": classification,
             "period": "night" if is_night(datetime.now(), self.cfg["detection"]["night_start_hour"], self.cfg["detection"]["night_end_hour"]) else "day",
             "responded": False,
-            "last_above": datetime.now(timezone.utc),
+            "last_above": now,
             "tmp_wav": None,
             "recording": bool(self.cfg["audio"].get("recording_enabled", True)),
         }
@@ -172,28 +240,51 @@ class Engine:
             tmp = tempfile.NamedTemporaryFile(prefix=f"incident_{iid}_", suffix=".wav", dir=snippets_dir, delete=False)
             tmp.close()
             self.active["tmp_wav"] = tmp.name
+
+            # Open the WAV file once and keep the handle for the incident's lifetime.
+            # Previous approach opened/seeked/closed on every 1-second block, which
+            # caused write buffering issues on Pi SD cards (choppy audio).
+            wf = sf.SoundFile(tmp.name, mode="w", samplerate=self.capture.sr, channels=1, subtype="PCM_16")
+            self.active["wav_handle"] = wf
+
             pre = self.capture.get_preroll(float(self.cfg["audio"]["snippet_pre_seconds"]))
             if pre:
-                with sf.SoundFile(tmp.name, mode="w", samplerate=self.capture.sr, channels=1, subtype="PCM_16") as wf:
-                    for block in pre:
-                        wf.write(block)
+                for block in pre:
+                    wf.write(block)
+                wf.flush()
 
         self.state.set(active_incident_id=iid, mode="incident_active")
 
     def _append_audio(self, block):
         if not self.active or not self.active.get("recording") or not self.active.get("tmp_wav"):
             return
+        wf = self.active.get("wav_handle")
+        if wf is None or wf.closed:
+            return
         try:
-            with sf.SoundFile(self.active["tmp_wav"], mode="r+") as wf:
-                wf.seek(0, whence=2)
-                wf.write(block)
+            wf.write(block)
+            wf.flush()
         except (OSError, RuntimeError) as e:
             # Catches both OS-level I/O errors (disk full) and soundfile's LibsndfileError
             # (which inherits from RuntimeError). Stop recording for this incident but
             # keep the dB-level monitoring running. The partial WAV is preserved.
             print(f"[engine] Audio write failed (disk full?): {e}")
+            self._close_wav_handle()
             self.active["recording"] = False
             self.state.set(disk_warning=f"Recording stopped: {e}")
+
+    def _close_wav_handle(self):
+        """Close the persistent SoundFile handle if open. Safe to call multiple times."""
+        if not self.active:
+            return
+        wf = self.active.get("wav_handle")
+        if wf is not None and not wf.closed:
+            try:
+                wf.flush()
+                wf.close()
+            except (OSError, RuntimeError) as e:
+                print(f"[engine] WAV handle close failed: {e}")
+        self.active["wav_handle"] = None
 
     def _looks_like_driveby(self, dbs, duration_sec):
         """Determine if an incident matches a drive-by pattern: short duration with a
@@ -231,8 +322,13 @@ class Engine:
     def _finalize_incident(self, force=False):
         if not self.active:
             return
-        end = datetime.now(timezone.utc)
-        dur = (end - self.active["start"]).total_seconds()
+
+        # Close the WAV handle before anything else — ensures all audio data
+        # is flushed to disk before we reference the file path in the DB.
+        self._close_wav_handle()
+
+        end = datetime.now().astimezone()
+        dur = round((end - self.active["start"]).total_seconds())
         if self.active["recording"] and self.active.get("tmp_wav"):
             # pad post-roll with silence window placeholder by simply leaving last blocks already captured
             snippet_path = self.active["tmp_wav"]
@@ -254,9 +350,9 @@ class Engine:
             avg_db = 0.0
 
         self.storage.finalize_incident(
-            self.active["id"], end.isoformat(), dur,
-            max(self.active["dbs"]) if self.active["dbs"] else 0.0,
-            avg_db,
+            self.active["id"], end.replace(microsecond=0).isoformat(), dur,
+            round(max(self.active["dbs"]), 1) if self.active["dbs"] else 0.0,
+            round(avg_db, 1),
             snippet_path
         )
         self.ha.publish_event({"type": "incident_end", "id": self.active["id"], "duration_sec": dur})
@@ -354,7 +450,7 @@ class Engine:
         if max_hours <= 0:
             return False
 
-        elapsed_sec = (datetime.now(timezone.utc) - self.active["start"]).total_seconds()
+        elapsed_sec = (datetime.now().astimezone() - self.active["start"]).total_seconds()
         max_sec = max_hours * 3600
 
         if elapsed_sec < max_sec:
@@ -403,19 +499,15 @@ class Engine:
         # Pi's timezone doesn't match the ordinance jurisdiction, thresholds apply at wrong hours.
         expected_tz = self.cfg["detection"].get("expected_timezone")
         if expected_tz:
-            try:
-                import subprocess
-                result = subprocess.run(["timedatectl", "show", "-p", "Timezone", "--value"],
-                                        capture_output=True, text=True, timeout=5)
-                system_tz = result.stdout.strip()
-                if system_tz and system_tz != expected_tz:
-                    msg = f"System timezone [{system_tz}] does not match expected [{expected_tz}]. Day/night thresholds may be wrong!"
-                    print(f"[engine] WARNING: {msg}")
-                    self.state.set(last_error=msg)
-                else:
-                    print(f"[engine] Timezone validated: {system_tz}")
-            except Exception as e:
-                print(f"[engine] Timezone check skipped: {e}")
+            system_tz = _get_system_timezone()
+            if system_tz is None:
+                print("[engine] Timezone check skipped: could not determine system timezone")
+            elif system_tz != expected_tz:
+                msg = f"System timezone [{system_tz}] does not match expected [{expected_tz}]. Day/night thresholds may be wrong!"
+                print(f"[engine] WARNING: {msg}")
+                self.state.set(last_error=msg)
+            else:
+                print(f"[engine] Timezone validated: {system_tz}")
 
         # Repair any incidents left open by a previous crash
         try:
@@ -470,13 +562,34 @@ class Engine:
                 _, threshold = applicable_threshold(self.cfg, datetime.now())
                 self.state.set(current_db=round(db_now, 2), current_threshold_db=threshold)
 
+                # Force-incident handling: web UI can request start/stop of a test incident.
+                # Checked early so it takes priority over normal detection logic.
+                if self._force_end_requested:
+                    self._force_end_requested = False
+                    if self.active:
+                        print("[engine] Ending forced/active incident by user request")
+                        self._finalize_incident(force=True)
+                    continue
+
+                if self._force_start_requested:
+                    self._force_start_requested = False
+                    if not self.active:
+                        print(f"[engine] Force-starting test incident at {db_now:.1f} dB")
+                        mode = "record_only"
+                        self._begin_incident(db_now, threshold, 0.0, 0.0, "forced_test", mode)
+                    # Append this block to the forced incident
+                    if self.active:
+                        self.active["dbs"].append(db_now)
+                        self._append_audio(block)
+                    continue
+
                 if db_now < noise_floor_db:
                     # Still append to an active incident's recording (captures the
                     # tail-off), and check gap-timeout for finalization.
                     if self.active:
                         self.active["dbs"].append(db_now)
                         self._append_audio(block)
-                        gap = (datetime.now(timezone.utc) - self.active["last_above"]).total_seconds()
+                        gap = (datetime.now().astimezone() - self.active["last_above"]).total_seconds()
                         if gap >= float(self.cfg["detection"]["song_gap_merge_sec"]):
                             self._finalize_incident()
                     continue
@@ -533,7 +646,7 @@ class Engine:
                                 self.active["responded"] = True
                         else:
                             self.active["dbs"].append(db_now)
-                            self.active["last_above"] = datetime.now(timezone.utc)
+                            self.active["last_above"] = datetime.now().astimezone()
                             self._append_audio(block)
                     else:
                         if self.active:
@@ -543,7 +656,7 @@ class Engine:
                     if self.active:
                         self.active["dbs"].append(db_now)
                         self._append_audio(block)
-                        gap = (datetime.now(timezone.utc) - self.active["last_above"]).total_seconds()
+                        gap = (datetime.now().astimezone() - self.active["last_above"]).total_seconds()
                         if gap >= float(self.cfg["detection"]["song_gap_merge_sec"]):
                             self._finalize_incident()
 

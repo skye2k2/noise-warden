@@ -178,10 +178,15 @@ class Storage:
         with self.conn() as c:
             return [dict(r) for r in c.execute("SELECT * FROM calibration_profiles ORDER BY id DESC").fetchall()]
 
+    def delete_calibration_profile(self, profile_id: int):
+        """Delete a calibration profile by ID."""
+        with self.conn() as c:
+            c.execute("DELETE FROM calibration_profiles WHERE id = ?", (profile_id,))
+
     def cleanup_old_snippets(self, retention_days: int, snippets_dir: str = None):
         """Remove snippet files older than retention_days. Also purges the autodismissed/
         quarantine folder of files older than the same retention window."""
-        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        cutoff = datetime.now().astimezone() - timedelta(days=retention_days)
         removed = 0
         with self.conn() as c:
             rows = c.execute("SELECT id, snippet_path, start_ts FROM incidents WHERE deleted=0 AND snippet_path IS NOT NULL").fetchall()

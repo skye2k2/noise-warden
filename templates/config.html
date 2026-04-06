@@ -4,7 +4,7 @@
   <h2>Config</h2>
   {% if message %}<p><b>{{ message }}</b></p>{% endif %}
   <form method="post" action="/config/save">
-    <textarea name="raw">{{ raw }}</textarea>
+    <textarea name="raw" class="config-textarea">{{ raw }}</textarea>
     <p><input type="submit" value="Save Config"></p>
   </form>
 </div>

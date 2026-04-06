@@ -1,0 +1,191 @@
+/* ============================================================
+   Noise Warden — centralized stylesheet
+   Light/dark mode via [data-theme="dark"] on <html>.
+   Theme preference persisted in localStorage.
+   ============================================================ */
+
+/* ---- CSS custom properties (light = default) ---- */
+:root {
+  --bg: #f7f7f7;
+  --bg-card: #fff;
+  --bg-nav: #222;
+  --bg-nav-active: #333;
+  --bg-input: #fff;
+  --border: #ddd;
+  --border-light: #eee;
+  --text: #222;
+  --text-muted: #555;
+  --text-nav: #fff;
+  --text-nav-active: #f90;
+  --shadow: rgba(0,0,0,.08);
+  --pill-bg: #eee;
+  --pill-outline: #333;
+  --pill-text: #222;
+  --btn-border: #888;
+  --bg-col-header: #f8f8f8;
+  --hour-label: #888;
+  --hour-line: #f0f0f0;
+  --now-line: #3498db;
+  --popup-overlay: rgba(0,0,0,.5);
+
+  /* Borderline incident: slightly darker than card background */
+  --excess-borderline: #c8c8c8;
+}
+
+/* Monokai-inspired dark theme — charcoal grays, bright accents */
+[data-theme="dark"] {
+  --bg: #1e1e1e;
+  --bg-card: #272822;
+  --bg-nav: #1a1a1a;
+  --bg-nav-active: #333;
+  --bg-input: #2d2d2d;
+  --border: #444;
+  --border-light: #383830;
+  --text: #f8f8f2;
+  --text-muted: #8f908a;
+  --text-nav: #a6e22e;
+  --text-nav-active: #fd971f;
+  --shadow: rgba(0,0,0,.4);
+  --pill-bg: #3e3d32;
+  --pill-outline: #888;
+  --pill-text: #e6db74;
+  --btn-border: #555;
+  --bg-col-header: #3e3d32;
+  --hour-label: #8f908a;
+  --hour-line: #3e3d32;
+  --now-line: #66d9ef;
+  --popup-overlay: rgba(0,0,0,.75);
+
+  /* Borderline incident: muted olive, distinct from card bg */
+  --excess-borderline: #4e4d3a;
+}
+
+/* ---- Base ---- */
+body {
+  font-family: Arial, sans-serif;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* ---- Nav ---- */
+nav {
+  background: var(--bg-nav);
+  color: var(--text-nav);
+  padding: 1px;
+  display: flex;
+}
+
+nav a {
+  color: var(--text-nav);
+  margin-right: 0 8px;
+  padding: 12px;
+  text-decoration: none;
+}
+
+nav a.active {
+  background-color: var(--bg-nav-active);
+  color: var(--text-nav-active);
+  text-underline-offset: 4px;
+}
+
+/* Push the theme toggle to the right side of the nav */
+#theme-toggle {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--text-nav);
+  color: var(--text-nav);
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+/* ---- Layout ---- */
+.wrap {
+  padding: 16px;
+  max-width: 1200px;
+  margin: auto;
+}
+
+.card {
+  background: var(--bg-card);
+  padding: 16px;
+  border-radius: 12px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 4px var(--shadow);
+}
+
+/* ---- Tables ---- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+th {
+  text-align: left;
+}
+
+th, td {
+  border-bottom: 1px solid var(--border);
+  padding: 6px;
+  vertical-align: top;
+}
+
+/* ---- Form elements ---- */
+button, input[type=submit] {
+  padding: 12px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--btn-border);
+  cursor: pointer;
+  background: var(--bg-card);
+  color: var(--text);
+}
+
+button.destructive {
+  background: #c0392b;
+  color: #fff;
+  border-color: #922b21;
+}
+
+textarea, input[type=text], input[type=number], select {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+textarea {
+  width: 100%;
+  min-height: 180px;
+}
+
+/* Config page: textarea should use most of the vertical space */
+.config-textarea {
+  min-height: 70vh;
+  font-family: monospace;
+  font-size: 13px;
+  resize: vertical;
+}
+
+/* ---- Utility classes ---- */
+.small {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.pill {
+  display: inline-block;
+  margin: 4px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--pill-bg);
+  color: var(--pill-text);
+  border: 1px solid var(--pill-outline);
+  margin-right: 6px;
+}
+
+audio {
+  width: 220px;
+}

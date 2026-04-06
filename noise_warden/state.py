@@ -24,7 +24,7 @@ class StateStore:
     def set(self, **kwargs):
         with self._lock:
             self._state.update(kwargs)
-            self._state["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._state["updated_at"] = datetime.now().astimezone().replace(microsecond=0).isoformat()
 
     def snapshot(self):
         with self._lock:

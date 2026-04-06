@@ -19,7 +19,9 @@
       <td>{{ r.music_like_score }}</td>
       <td>{{ r.beat_confidence }}</td>
       <td>{{ r.classification }}</td>
-      <td>{% if r.snippet_path %}<audio controls src="/snippets/{{ r.id }}"></audio>{% endif %}</td>
+      <td>{% if r.snippet_path %}<button class="snippet-play-btn"
+        data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
+        title="Play audio snippet">&#9654;</button>{% endif %}</td>
       <td>
         <form method="post" action="/incidents/{{ r.id }}/notes">
           <textarea name="notes" style="min-height:70px;">{{ r.notes or "" }}</textarea>
@@ -28,7 +30,7 @@
       </td>
       <td>
         <form method="post" action="/incidents/{{ r.id }}/delete" onsubmit="return confirm('Delete incident?')">
-          <button>Delete</button>
+          <button  class="destructive">Delete</button>
         </form>
       </td>
     </tr>
@@ -42,8 +44,19 @@
   <p><a href="/export.csv">Export CSV</a></p>
   <p>
     <form method="post" action="/incidents/clear" onsubmit="return confirm('Delete ALL incidents? This cannot be undone.')">
-      <button style="background:#c0392b;">Clear All Incidents</button>
+      <button  class="destructive">Clear All Incidents</button>
     </form>
   </p>
 </div>
+
+{% include '_popup.html' %}
+
+<script>
+/* Wire play buttons to the shared popup */
+document.querySelectorAll('.snippet-play-btn').forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    showPopup(JSON.parse(btn.getAttribute('data-incident')));
+  });
+});
+</script>
 {% endblock %}

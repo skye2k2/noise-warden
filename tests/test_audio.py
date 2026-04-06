@@ -30,13 +30,13 @@ class TestBlockingMode:
     def test_read_block_returns_array(self, mock_sd):
         """read_block() should return a 1-D numpy array of the expected length."""
         mock_sd.query_devices.return_value = {"name": "FakeMic", "max_input_channels": 1, "default_samplerate": 22050}
-        block = np.random.randn(11025).astype(np.float32)
+        block = np.random.randn(22050).astype(np.float32)
         mock_sd.rec.return_value = block.reshape(-1, 1)
         mock_sd.wait.return_value = None
 
-        cap = AudioCapture(sample_rate=22050, block_seconds=0.5)
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
         result = cap.read_block()
-        assert result.shape == (11025,)
+        assert result.shape == (22050,)
         mock_sd.rec.assert_called_once()
         mock_sd.wait.assert_called_once()
 
@@ -44,11 +44,11 @@ class TestBlockingMode:
     def test_preroll_buffer_fills(self, mock_sd):
         """Successive read_block() calls should fill the pre-roll buffer."""
         mock_sd.query_devices.return_value = {"name": "FakeMic", "max_input_channels": 1, "default_samplerate": 22050}
-        block = np.zeros(11025, dtype=np.float32)
+        block = np.zeros(22050, dtype=np.float32)
         mock_sd.rec.return_value = block.reshape(-1, 1)
         mock_sd.wait.return_value = None
 
-        cap = AudioCapture(sample_rate=22050, block_seconds=0.5)
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
         for _ in range(5):
             cap.read_block()
         assert len(cap.pre_blocks) == 5
@@ -57,14 +57,14 @@ class TestBlockingMode:
     def test_get_preroll_returns_recent_blocks(self, mock_sd):
         """get_preroll(seconds) should return the most recent N blocks."""
         mock_sd.query_devices.return_value = {"name": "FakeMic", "max_input_channels": 1, "default_samplerate": 22050}
-        mock_sd.rec.return_value = np.zeros((11025, 1), dtype=np.float32)
+        mock_sd.rec.return_value = np.zeros((22050, 1), dtype=np.float32)
         mock_sd.wait.return_value = None
 
-        cap = AudioCapture(sample_rate=22050, block_seconds=0.5)
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
         for _ in range(10):
             cap.read_block()
-        pre = cap.get_preroll(2.0)  # 2 seconds = 4 blocks
-        assert len(pre) == 4
+        pre = cap.get_preroll(2.0)  # 2 seconds = 2 blocks at 1.0s
+        assert len(pre) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -83,13 +83,13 @@ class TestCallbackMode:
         mock_stream.active = True
         mock_sd.InputStream.return_value = mock_stream
 
-        cap = AudioCapture(sample_rate=22050, block_seconds=0.5)
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
         # Manually push a block into the queue (simulating callback)
-        test_block = np.random.randn(11025, 1).astype(np.float32)
+        test_block = np.random.randn(22050, 1).astype(np.float32)
         cap._queue.put(test_block)
 
         result = cap.read_block()
-        assert result.shape == (11025,)
+        assert result.shape == (22050,)
 
     @patch("noise_warden.audio._CALLBACK_STREAMS_ENABLED", True)
     @patch("noise_warden.audio.sd")
@@ -101,7 +101,7 @@ class TestCallbackMode:
         mock_stream.active = True
         mock_sd.InputStream.return_value = mock_stream
 
-        cap = AudioCapture(sample_rate=22050, block_seconds=0.5)
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
         # Empty queue, short timeout — should raise
         cap._queue = queue.Queue()
 
@@ -114,9 +114,9 @@ class TestCallbackMode:
         """The _audio_callback method should push data into the queue."""
         mock_sd.query_devices.return_value = {"name": "FakeMic", "max_input_channels": 1, "default_samplerate": 22050}
 
-        cap = AudioCapture(sample_rate=22050, block_seconds=0.5)
-        test_data = np.random.randn(11025, 1).astype(np.float32)
-        cap._audio_callback(test_data, 11025, None, None)
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
+        test_data = np.random.randn(22050, 1).astype(np.float32)
+        cap._audio_callback(test_data, 22050, None, None)
 
         assert not cap._queue.empty()
         result = cap._queue.get_nowait()
@@ -127,7 +127,7 @@ class TestCallbackMode:
         """reinitialize() should empty the callback queue."""
         mock_sd.query_devices.return_value = {"name": "FakeMic", "max_input_channels": 1, "default_samplerate": 22050}
 
-        cap = AudioCapture(sample_rate=22050, block_seconds=0.5)
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
         # Push stale data
         for _ in range(5):
             cap._queue.put(np.zeros(100))
@@ -144,7 +144,7 @@ class TestCallbackMode:
         mock_stream = MagicMock()
         mock_sd.InputStream.return_value = mock_stream
 
-        cap = AudioCapture(sample_rate=22050, block_seconds=0.5)
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
         cap._stream = mock_stream
         cap.close()
 

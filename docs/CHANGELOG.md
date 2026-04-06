@@ -1,5 +1,129 @@
 # noise-warden CHANGELOG
 
+## v9 - 2026-04-05 — "Fit and Finish Edition"
+
+UI/UX overhaul for evidence clarity, cross-platform timezone handling, data rounding, borderline threshold filtering, and calibration wizard improvements. After finally seeing the code running, there were definite improvements to be made.
+
+<details>
+
+<summary>Key details</summary>
+
+### Timestamp & data precision
+
+- **Local timezone everywhere** — All stored timestamps (incidents, calibration profiles, state `updated_at`) now use the system's local timezone with offset (e.g., `2026-04-05T14:23:17-06:00`) instead of UTC. Truncated to the nearest second to avoid sub-second clutter in logs and exports
+- **dB rounding at storage boundary** — `start_db`, `peak_db`, and `avg_db` rounded to 1 decimal place; `music_like_score` and `beat_confidence` to 3 decimals. Internal computation retains full float precision
+- **Cross-platform timezone validation** — Replaced Linux-only `timedatectl` subprocess with `_get_system_timezone()` that tries timedatectl → `/etc/timezone` → `/etc/localtime` symlink. No more startup warning on macOS
+
+### Audio recording reliability
+
+- **Block size reverted to 1.0s** — `block_seconds` changed from 0.5 back to 1.0. The v4 halving (alongside the switch from callback to blocking audio mode) doubled the WAV file I/O rate to 120 open/seek/write/close cycles per minute, which likely caused the choppy audio observed in the pilot. At 1.0s blocks, `beat_confidence_from_history` also gets a more useful 24-second autocorrelation window (was 12s). Config default, code default, and documentation now all agree on 1-second blocks
+- **Persistent WAV file handle** — `_begin_incident()` now opens the `SoundFile` once and stores the handle on `self.active["wav_handle"]`. `_append_audio()` writes + flushes to the already-open handle instead of reopening the file every block. Handle is closed in `_finalize_incident()` (or on write error). Eliminates the repeated open/seek/close cycle that was the strongest candidate for causing choppy recordings on Pi SD cards. The dual-mic callback path (`_CALLBACK_STREAMS_ENABLED`) is unaffected — it uses the same `read_block()` API and the WAV write path is shared
+
+### UI centralization & dark mode
+
+- **Centralized CSS** — Extracted all inline styles from `base.html` into `static/style.css` using CSS custom properties (`--bg`, `--text`, `--border`, etc.) for theme support
+- **Light/dark mode** — Toggle button floated right in the nav bar. Preference persisted in `localStorage` and applied before first paint to avoid flash of wrong theme
+- **Config textarea height** — `.config-textarea` class gives the YAML editor `min-height: 70vh` so the full config is visible without scrolling
+
+### Timeline improvements
+
+- **Wider severity color bands** — Thresholds shifted to: mild (5–14), low (15–24), mid (25–29), high (30–39), severe (40+). Adds a yellow band for mild excess that was previously lumped with amber
+- **Borderline incident filtering** — New `detection.borderline_margin_db` config key (default 5 dB). Incidents within this margin above threshold are still recorded but hidden on the timeline by default. "Show borderline" checkbox in the controls reveals them with a theme-aware grey color
+- **Incident summary as heading** — Count and total duration ("3 incidents — 12m 34s total") promoted from small inline text to an `<h3>` directly above the calendar grid
+- **Future navigation clamped** — Calendar navigation now stops 1 month into the future
+- **Audio scrubber fix** — Popup `<audio>` changed from `preload="none"` to `preload="metadata"` so the browser loads WAV duration headers, enabling seek bar functionality
+
+### Dashboard polish
+
+- **Incident table rework** — Timezone offset shown once in the "Start" column header (e.g., "UTC -06:00") instead of per-row; duration moved to second column; start dB displayed as relative excess "(+X.Y dB)"; timestamps formatted client-side for locale
+
+### Routing & browser fixes
+
+- **SVG favicon** — Bar-graph icon at `static/favicon.svg`; `/favicon.ico` route serves it; `<link rel="icon">` in base template
+- **`.well-known` catch-all** — `/.well-known/{rest:path}` returns empty JSON instead of polluting logs with Chrome DevTools probe 404s
+
+### Calibration
+
+- **Wizard UX rewrite** — Three expandable step-by-step sections: getting a reference SPL (meter, calibrator, or known source), reading raw dBFS from the dashboard, and computing/saving the profile. Labeled form fields with placeholder examples
+- **Portability documentation** — New README section explaining that calibration profiles are portable between machines if the same USB mic + audio interface hardware is used. Recommended local→Pi workflow documented
+
+### Resolved TODOs
+
+- Minimum disturbance length — confirmed unnecessary (song-gap merge + drive-by auto-dismiss cover short events)
+- Choppy audio from pilot — addressed via block size revert + persistent WAV handle (see "Audio recording reliability" above). Requires hardware verification on Pi
+- All pilot observations addressed
+
+### Operational controls
+
+- **Armed state persistence** — Pausing detection now writes `armed: false` to the YAML config. On server restart (including uvicorn watch-mode reloads), engine reads armed state from config instead of always defaulting to `true`. Prevents hot-reloads from immediately triggering incidents in loud environments while paused
+- **Pause finalizes active incidents** — Disarming the engine while an incident is in progress now calls `_finalize_incident(force=True)` so duration reflects actual monitoring time, not wall-clock time through the pause
+- **Detection mode switcher** — Both dashboard and calibration pages include a detection mode dropdown (continuous / music focus / intermittent) that persists to YAML on change
+- **Force incident controls** — Dashboard toggle to force-start a test incident and end it, for verifying recording and the full incident lifecycle without waiting for real noise
+- **Incident duration rounding** — Stored `duration_sec` rounded to nearest whole second in `_finalize_incident()`
+
+### Dark theme
+
+- **Monokai-inspired palette** — Dark mode switched from blue-violet to charcoal grays (`#1e1e1e` / `#272822`) with Monokai accent colors: lime nav links (`#a6e22e`), orange active nav (`#fd971f`), teal "now" line (`#66d9ef`), yellow pills (`#e6db74`), olive-gray comment text (`#8f908a`)
+
+### Incident popup consolidation
+
+- **Shared popup partial** — Extracted the timeline's incident detail popup (CSS, HTML, JS) into `templates/_popup.html`, now `{% include %}`'d by timeline, dashboard, and incidents pages. One popup implementation, consistent presentation everywhere
+- **Incident data via JSON** — Dashboard and incidents ▶ play buttons serialize the full incident object as a `data-incident` JSON attribute, feeding the same `showPopup(inc)` function the timeline uses. Zero extra API calls
+- **Excess badge coloring** — Dashboard and incidents popups now show the same color-coded excess dB badge with ordinance period detection (day/night) that previously only appeared on the timeline
+- **Ordinance data plumbed to all pages** — `ordinance_json` and `borderline_margin_db` added to both the dashboard and incidents routes so the shared popup can render threshold comparisons
+
+### Audio playback & evidence presentation
+
+- **Intensity waveform** — Canvas-based RMS envelope displayed above the `<audio>` controls in all incident popups. Each pixel column shows the amplitude of that slice, color-coded teal → lime → yellow → orange → red by intensity. Loud sections are immediately visible for scrubbing
+- **Click-to-seek on waveform** — Click anywhere on the waveform canvas to jump to that point; auto-starts playback if paused. Playback cursor (teal vertical line) tracks position via `timeupdate`. Time display (`m:ss / m:ss`) in the bottom-right corner
+- **Service worker range request fix** — Cached audio snippets now properly handle HTTP Range requests. The SW slices its cached `ArrayBuffer` and returns a `206 Partial Content` response with correct `Content-Range` headers, fixing audio scrubbing that was broken when snippets were served from cache. Cache version bumped to v8
+
+### Nav & layout
+
+- **Active link highlighting** — Nav links get bold + underline when `location.pathname` matches
+- **Destructive button styling** — `.destructive` CSS class (red background, white text) applied to delete/clear actions
+
+</details>
+
+## v8 Review
+
+Overall: v8 is deployment-ready for its primary use case (record-only monitoring). The codebase is well-hardened across 8 iterations.
+
+<details>
+
+HOWEVER, comma, there are a handful of items worth thinking through before you haul a Pi outside and declare it operational:
+
+### Genuine Concerns (address before or during deployment)
+
+1. _RELAY_HW_ENABLED = False is hardcoded in response.py:17 — If you plan to use the response feature, you'll need to manually flip this constant in the source file before deploying. It's not configurable via YAML. This means an upgrade via deploy_noise_warden.sh would reset it. Should probably be driven by a config key instead.
+2. _CALLBACK_STREAMS_ENABLED = False is similarly hardcoded in audio.py:22 — Same pattern, same concern if you ever want callback mode on a deployed Pi.
+3. Install script runs chown -R $USER... then later chown -R noisewarden — install_pi.sh:14-30 creates dirs as the current user, then reassigns everything to noisewarden. This works, but on re-runs or if a step fails midway, you could end up with mixed ownership. The venv is created/pip-installed as $USER, then chowned to noisewarden, which should be fine — just know that running deploy_noise_warden.sh for upgrades may hit permission issues if it runs pip install as a non-root user into a noisewarden-owned venv.
+4. web.py calls load_yaml() at module import time (web.py:17) — The config, storage, state, and engine are all instantiated as module-level globals. This means:
+    - If the YAML is missing or invalid, the service won't even start (no graceful error page — just a crash)
+    - Config hot-edit via /config saves to disk but the in-memory cfg dict used by the engine is the original load. Some values are re-read from self.cfg each loop iteration (noise floor, thresholds), so they'd update if the dict were mutated — but save_yaml_text_validated writes a file, it doesn't reload into the running cfg dict. Confirm whether hot-edit actually takes effect without a restart.
+5. No AudioCapture.close() call on the non-error path — engine.stop() calls relay.cleanup() but doesn't call self.capture.close(). If callback streams are ever enabled, this leaks the InputStream. Minor for blocking mode (sd.rec finishes naturally), but worth wiring up.
+
+### Operational Nits (not blockers, but worth noting)
+
+6. Storage math at 22,050 Hz — The CHANGELOG says ~2.6 MB/min. At 30-day retention with, say, 2 hours of incidents per day, that's ~9.4 GB/month. On a 16 GB SD card that's tight. A 32+ GB card or the disk quota system (which is implemented) covers this — just be aware.
+7. deploy_noise_warden.sh doesn't copy config forward — The README mentions manually copying the YAML, but if you forget, the new version's default config overwrites your tuned thresholds. Since the config lives under /opt/noise-warden/current/config/ (behind the symlink), swapping the symlink immediately points at the new version's default YAML. Consider symlinking the config to shared/ or adding a defensive copy to the deploy script.
+8. No structured logging — Everything goes through print() to stdout, which systemd captures in the journal. That's fine for a single-Pi deployment, but there's no log level control, no rotation, and no way to quiet the system short of editing code.
+9. Magic numbers in DSP — min_music_like_score: 0.62, min_beat_confidence: 0.38, the beat confidence autocorrelation formula, and the music-like score weighting (0.6/0.4) are all heuristics with no published validation. Expect a calibration period where you watch false positives/negatives and tune these values. The good news: they're all in the YAML.
+10. Dual-mic plugins exist but aren't wired — This is documented and expected. Just don't expect them to work by flipping the config flags — the engine loop doesn't call them.
+
+### Things That Look Solid
+
+- WAL mode + schema migrations + stale incident repair + vacuum — the DB layer is well-armored for Pi-scale deployment
+- Self-noise suppression lifecycle (response → cooldown → resume detection) is clean and centralized
+- The symlink deployment model with rollback capability is exactly right for iterating on a remote Pi
+- Exclusion filters (impulse, thunder, rain, mower, drive-by) with quarantine-not-delete is thoughtful
+- Systemd service hardening (rate-limited restarts, proper timeouts) is production-ready
+221 tests covering the critical paths
+
+**Bottom line**: For record-only mode (the default), deploy away. The biggest deployment-day risk is item #7 (accidentally losing your tuned config on upgrade) and item #4 (whether config edits via the web UI actually take effect at runtime). If you plan to use response mode, address #1 first — that hardcoded flag is the kind of thing that'll cost you an hour of "why isn't the relay firing" debugging after you've already hauled everything outside.
+
+</details>
+
 ## v8 - 2026-04-05 — "Stop Hitting Yourself Retaliation Edition"
 
 Response system overhaul with real GPIO relay control, self-noise suppression (don't log your own retaliation as a noise incident), non-blocking callback audio streams for future dual-mic support, ambient noise floor gate to skip DSP on white noise, and a batch of UI/operational polish.

@@ -33,7 +33,7 @@ class AudioCapture:
 
     The read_block() API is identical in both modes so callers need no changes."""
 
-    def __init__(self, sample_rate=22050, block_seconds=0.5, channels=1, device=None):
+    def __init__(self, sample_rate=22050, block_seconds=1.0, channels=1, device=None):
         self.sr = sample_rate
         self.block_seconds = block_seconds
         self.frames = int(sample_rate * block_seconds)

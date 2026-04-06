@@ -1,0 +1,353 @@
+{#
+  Shared incident detail popup — used by timeline, dashboard, and incidents pages.
+  Requires template variables: ordinance_json, borderline_margin_db
+  Requires the caller to invoke showPopup(inc) with an incident object containing:
+    id, start_ts, end_ts, duration_sec, start_db, peak_db, avg_db,
+    threshold_db, music_like_score, classification, mode, responded, notes, has_snippet
+#}
+<style>
+  #popup-overlay { position:fixed; inset:0; background:var(--popup-overlay); z-index:100; display:flex; align-items:center; justify-content:center; padding:16px; }
+  #popup-box { background:var(--bg-card); color:var(--text); border-radius:12px; max-width:500px; width:100%; max-height:90vh; overflow-y:auto; padding:24px; position:relative; box-shadow:0 8px 32px rgba(0,0,0,.2); }
+  #popup-close { position:absolute; top:10px; right:14px; background:none; border:none; font-size:24px; cursor:pointer; color:var(--text-muted); padding:4px 8px; }
+  .popup-section { margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid var(--border-light); }
+  .popup-section:last-child { border-bottom:none; margin-bottom:0; padding-bottom:0; }
+  .popup-lbl { color:var(--text-muted); font-size:13px; }
+  .popup-val { font-weight:bold; }
+  .excess-badge { display:inline-block; font-size:20px; font-weight:bold; padding:8px 16px; border-radius:8px; color:#fff; margin:6px 0; }
+  .excess-borderline { background:var(--excess-borderline); color:var(--text-muted); }
+  .excess-low { background:#f39c12; }
+  .excess-mid { background:#e67e22; }
+  .excess-high { background:#e74c3c; }
+  .excess-severe { background:#c0392b; }
+  .snippet-play-btn { background:none; border:none; cursor:pointer; font-size:18px; color:var(--text); padding:2px 6px; }
+
+  /* Waveform intensity display */
+  .waveform-wrap { position:relative; width:100%; height:64px; margin:6px 0 4px; cursor:pointer; border-radius:4px; overflow:hidden; background:var(--bg-input, #2d2d2d); }
+  .waveform-wrap canvas { display:block; width:100%; height:100%; }
+  .waveform-cursor { position:absolute; top:0; bottom:0; width:2px; background:var(--now-line, #66d9ef); pointer-events:none; transition:left 0.1s linear; }
+  .waveform-time { position:absolute; bottom:2px; right:4px; font-size:11px; color:var(--text-muted); pointer-events:none; }
+  .waveform-loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:12px; color:var(--text-muted); }
+</style>
+
+<div id="popup-overlay" style="display:none" onclick="hidePopup()">
+  <div id="popup-box" onclick="event.stopPropagation()">
+    <button id="popup-close" onclick="hidePopup()">&times;</button>
+    <div id="popup-content"></div>
+  </div>
+</div>
+
+<script>
+/* ======================================================================
+   SHARED POPUP — incident detail view used across all pages.
+   The primary deliverable for showing evidence to authorities.
+   ====================================================================== */
+var _POPUP_ORDINANCE = {{ ordinance_json | safe }};
+var _POPUP_BORDERLINE_DB = {{ borderline_margin_db }};
+
+/** Return the first non-null, non-NaN numeric argument, defaulting to 0. */
+function safeNum() {
+  for (var i = 0; i < arguments.length; i++) {
+    if (arguments[i] != null && !isNaN(arguments[i])) { return Number(arguments[i]); }
+  }
+  return 0;
+}
+
+function popupFormatDuration(sec) {
+  if (!sec || sec <= 0) { return '< 1s'; }
+  if (sec < 60) { return Math.round(sec) + 's'; }
+  var m = Math.floor(sec / 60);
+  if (m < 60) { return m + 'm ' + Math.round(sec % 60) + 's'; }
+  var hrs = Math.floor(m / 60);
+  return hrs + 'h ' + (m % 60) + 'm';
+}
+
+function popupFormatDateTime(d) {
+  return d.toLocaleDateString([], { weekday:'short', month:'short', day:'numeric', year:'numeric' })
+    + ' ' + d.toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+}
+
+function popupExcessClass(excessDb) {
+  if (excessDb <= 0) { return 'excess-borderline'; }
+  if (excessDb <= _POPUP_BORDERLINE_DB) { return 'excess-borderline'; }
+  if (excessDb >= 40) { return 'excess-severe'; }
+  if (excessDb >= 30) { return 'excess-high'; }
+  if (excessDb >= 25) { return 'excess-mid'; }
+  if (excessDb >= 15) { return 'excess-low'; }
+  return 'excess-low';
+}
+
+/** Determine day/night period from the start timestamp using ordinance hours. */
+function popupInferPeriod(startTs) {
+  var hour = new Date(startTs).getHours();
+  var nightStart = (_POPUP_ORDINANCE.measurement && _POPUP_ORDINANCE.measurement.night_start) || 22;
+  var dayStart = (_POPUP_ORDINANCE.measurement && _POPUP_ORDINANCE.measurement.day_start) || 7;
+  if (hour >= nightStart || hour < dayStart) { return 'night'; }
+  return 'day';
+}
+
+function popupEscapeHtml(str) {
+  var div = document.createElement('div');
+  div.textContent = str || '';
+  return div.innerHTML;
+}
+
+/**
+ * Show the shared incident detail popup.
+ * @param {Object} inc - Incident object with standard DB fields + has_snippet boolean.
+ */
+function showPopup(inc) {
+  var startDate = new Date(inc.start_ts);
+  var endDate = inc.end_ts ? new Date(inc.end_ts) : null;
+  var peakDb = safeNum(inc.peak_db, inc.start_db);
+  var avgDb = safeNum(inc.avg_db, inc.start_db);
+  var thresholdDb = safeNum(inc.threshold_db);
+  var excessPeak = peakDb - thresholdDb;
+  var period = popupInferPeriod(inc.start_ts);
+
+  var durationStr = '\u2014';
+  if (inc.duration_sec && inc.duration_sec > 0) {
+    durationStr = popupFormatDuration(inc.duration_sec);
+  } else if (endDate) {
+    durationStr = popupFormatDuration((endDate - startDate) / 1000);
+  }
+
+  var html = '';
+
+  // Header
+  html += '<div class="popup-section">';
+  html += '<h3 style="margin:0 0 4px">Incident #' + inc.id + '</h3>';
+  html += '<span class="popup-lbl">' + popupEscapeHtml(inc.classification || 'unclassified');
+  html += ' \u00B7 ' + popupEscapeHtml(inc.mode || '') + '</span>';
+  html += '</div>';
+
+  // Times
+  html += '<div class="popup-section">';
+  html += '<div><span class="popup-lbl">Start:</span> <span class="popup-val">' + popupFormatDateTime(startDate) + '</span></div>';
+  if (endDate) {
+    html += '<div><span class="popup-lbl">End:</span> <span class="popup-val">' + popupFormatDateTime(endDate) + '</span></div>';
+  } else {
+    html += '<div><span class="popup-lbl">End:</span> <span class="popup-val">In progress</span></div>';
+  }
+  html += '<div><span class="popup-lbl">Duration:</span> <span class="popup-val">' + durationStr + '</span></div>';
+  html += '</div>';
+
+  // Violation comparison — THE HERO ELEMENT for authority presentation
+  html += '<div class="popup-section">';
+  html += '<div class="excess-badge ' + popupExcessClass(excessPeak) + '">';
+  html += '+' + excessPeak.toFixed(1) + ' dB above ' + period + ' limit';
+  html += '</div>';
+  html += '<div style="margin-top:8px">';
+  html += '<div><span class="popup-lbl">Ordinance threshold (' + period + '):</span> <span class="popup-val">' + thresholdDb + ' dBA</span></div>';
+  html += '<div><span class="popup-lbl">Peak reading:</span> <span class="popup-val">' + peakDb.toFixed(1) + ' dBA</span></div>';
+  html += '<div><span class="popup-lbl">Average reading:</span> <span class="popup-val">' + avgDb.toFixed(1) + ' dBA</span></div>';
+  html += '</div>';
+  html += '</div>';
+
+  // Classification details (skip if no meaningful data)
+  if (inc.music_like_score != null) {
+    html += '<div class="popup-section">';
+    html += '<div><span class="popup-lbl">Music-like score:</span> <span class="popup-val">' + safeNum(inc.music_like_score).toFixed(2) + '</span></div>';
+    if (inc.responded) {
+      html += '<div><span class="popup-lbl">Response:</span> <span class="popup-val">Activated</span></div>';
+    }
+    html += '</div>';
+  }
+
+  // Notes
+  if (inc.notes) {
+    html += '<div class="popup-section">';
+    html += '<div class="popup-lbl">Notes:</div>';
+    html += '<div>' + popupEscapeHtml(inc.notes) + '</div>';
+    html += '</div>';
+  }
+
+  // Audio snippet player with intensity waveform
+  if (inc.has_snippet) {
+    html += '<div class="popup-section">';
+    html += '<div class="popup-lbl">Audio evidence:</div>';
+    html += '<div class="waveform-wrap" id="waveform-wrap">';
+    html += '<canvas id="waveform-canvas"></canvas>';
+    html += '<div class="waveform-cursor" id="waveform-cursor" style="left:0"></div>';
+    html += '<div class="waveform-time" id="waveform-time"></div>';
+    html += '<div class="waveform-loading" id="waveform-loading">Loading waveform\u2026</div>';
+    html += '</div>';
+    html += '<audio controls preload="metadata" id="popup-audio" style="width:100%">';
+    html += '<source src="/snippets/' + inc.id + '" type="audio/wav">';
+    html += '</audio>';
+    html += '</div>';
+  }
+
+  document.getElementById('popup-content').innerHTML = html;
+  document.getElementById('popup-overlay').style.display = 'flex';
+
+  // Initialize waveform visualization after DOM is populated
+  if (inc.has_snippet) {
+    _initWaveform(inc.id);
+  }
+}
+
+/* ======================================================================
+   WAVEFORM — intensity visualization with click-to-seek.
+   Fetches the WAV, decodes to PCM via Web Audio API, computes RMS
+   envelope per visual column, and draws color-coded intensity bars.
+   ====================================================================== */
+var _waveformAudioCtx = null;
+
+/**
+ * Fetch and decode an audio snippet, then render its intensity waveform.
+ * Wires up playback cursor tracking and click-to-seek on the canvas.
+ */
+function _initWaveform(incidentId) {
+  var canvas = document.getElementById('waveform-canvas');
+  var wrap = document.getElementById('waveform-wrap');
+  var cursor = document.getElementById('waveform-cursor');
+  var timeEl = document.getElementById('waveform-time');
+  var loadingEl = document.getElementById('waveform-loading');
+  var audio = document.getElementById('popup-audio');
+  if (!canvas || !audio || !wrap) { return; }
+
+  // Lazy-init AudioContext (one per page lifetime, reused across popups)
+  if (!_waveformAudioCtx) {
+    _waveformAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+
+  fetch('/snippets/' + incidentId)
+    .then(function (resp) {
+      if (!resp.ok) { throw new Error('Snippet fetch failed'); }
+      return resp.arrayBuffer();
+    })
+    .then(function (arrayBuf) {
+      return _waveformAudioCtx.decodeAudioData(arrayBuf);
+    })
+    .then(function (audioBuf) {
+      if (loadingEl) { loadingEl.style.display = 'none'; }
+      _drawWaveform(canvas, audioBuf);
+      _wireWaveformInteraction(wrap, cursor, timeEl, audio);
+    })
+    .catch(function () {
+      if (loadingEl) { loadingEl.textContent = 'Waveform unavailable'; }
+    });
+}
+
+/**
+ * Draw the RMS intensity envelope on a canvas. Each visual column represents
+ * the RMS amplitude of a slice of the audio, color-coded from cool (quiet)
+ * to warm (loud) to visually highlight the important scrub targets.
+ */
+function _drawWaveform(canvas, audioBuf) {
+  // Use devicePixelRatio for crisp rendering on HiDPI displays
+  var dpr = window.devicePixelRatio || 1;
+  var rect = canvas.getBoundingClientRect();
+  var w = Math.round(rect.width * dpr);
+  var h = Math.round(rect.height * dpr);
+  canvas.width = w;
+  canvas.height = h;
+
+  var ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+
+  // Use channel 0 (mono or left channel)
+  var raw = audioBuf.getChannelData(0);
+  var totalSamples = raw.length;
+
+  // Number of visual columns — one per CSS pixel for smoothness
+  var cols = Math.round(rect.width);
+  var samplesPerCol = Math.floor(totalSamples / cols);
+  if (samplesPerCol < 1) { samplesPerCol = 1; }
+
+  // Compute RMS per column, track the peak for normalization
+  var rmsValues = new Float32Array(cols);
+  var maxRms = 0;
+
+  for (var i = 0; i < cols; i++) {
+    var start = i * samplesPerCol;
+    var end = Math.min(start + samplesPerCol, totalSamples);
+    var sum = 0;
+
+    for (var j = start; j < end; j++) {
+      sum += raw[j] * raw[j];
+    }
+
+    var rms = Math.sqrt(sum / (end - start));
+    rmsValues[i] = rms;
+    if (rms > maxRms) { maxRms = rms; }
+  }
+
+  // Avoid division by zero on silent clips
+  if (maxRms === 0) { maxRms = 1; }
+
+  // Draw bars — height proportional to normalized RMS, color by intensity
+  var colW = w / cols;
+
+  for (var i = 0; i < cols; i++) {
+    var normalized = rmsValues[i] / maxRms;
+    var barH = Math.max(1, normalized * h);
+
+    ctx.fillStyle = _waveformColor(normalized);
+    // Center bars vertically for a balanced look
+    ctx.fillRect(i * colW, (h - barH) / 2, Math.ceil(colW), barH);
+  }
+}
+
+/**
+ * Map a 0–1 normalized intensity to a color.
+ * Uses the Monokai-adjacent severity palette: teal → yellow → orange → red.
+ */
+function _waveformColor(n) {
+  if (n < 0.25) { return '#66d9ef'; }  // Teal — quiet
+  if (n < 0.50) { return '#a6e22e'; }  // Lime — moderate
+  if (n < 0.70) { return '#f1c40f'; }  // Yellow — elevated
+  if (n < 0.85) { return '#e67e22'; }  // Orange — loud
+  return '#e74c3c';                     // Red — peak
+}
+
+/**
+ * Wire click-to-seek and playback cursor tracking between the waveform
+ * canvas and the <audio> element.
+ */
+function _wireWaveformInteraction(wrap, cursor, timeEl, audio) {
+  // Click/tap on waveform seeks the audio
+  wrap.addEventListener('click', function (e) {
+    var rect = wrap.getBoundingClientRect();
+    var fraction = (e.clientX - rect.left) / rect.width;
+    fraction = Math.max(0, Math.min(1, fraction));
+
+    if (audio.duration && isFinite(audio.duration)) {
+      audio.currentTime = fraction * audio.duration;
+      // If not already playing, start playback on seek
+      if (audio.paused) { audio.play(); }
+    }
+  });
+
+  // Update cursor position and timestamp during playback
+  audio.addEventListener('timeupdate', function () {
+    if (!audio.duration || !isFinite(audio.duration)) { return; }
+    var fraction = audio.currentTime / audio.duration;
+    cursor.style.left = (fraction * 100).toFixed(2) + '%';
+
+    if (timeEl) {
+      var cur = Math.floor(audio.currentTime);
+      var total = Math.floor(audio.duration);
+      timeEl.textContent = _formatSeconds(cur) + ' / ' + _formatSeconds(total);
+    }
+  });
+}
+
+/** Format seconds as m:ss for the waveform time display. */
+function _formatSeconds(sec) {
+  var m = Math.floor(sec / 60);
+  var s = sec % 60;
+  return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function hidePopup() {
+  document.getElementById('popup-overlay').style.display = 'none';
+  // Stop any playing audio when closing
+  var audio = document.querySelector('#popup-box audio');
+  if (audio) { audio.pause(); }
+}
+
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') { hidePopup(); }
+});
+</script>

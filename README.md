@@ -316,6 +316,20 @@ rm -rf .venv/
 
 After running the install script and starting the service, it is time to calibrate your system.
 
+### Calibration portability (local → Pi)
+
+> **Can I calibrate on my laptop and transfer the offset to the Pi?**
+>
+> **Yes, if** you use the same USB audio interface + microphone combo on both machines. The calibration offset compensates for the mic capsule's sensitivity and the USB ADC's gain — those are properties of the hardware, not the host computer. A MacBook and a Pi reading from the same USB dongle + mic will produce the same raw dBFS values (within ~1 dB of noise floor variation).
+>
+> **HOWEVER, comma,** the built-in microphones on a laptop and a Pi are completely different hardware. A calibration profile computed with your MacBook's internal mic is meaningless when you switch to an external USB mic on the Pi. Always calibrate with the exact mic + interface + cable you intend to deploy.
+>
+> **Recommended workflow:**
+> 1. Connect your USB mic + interface to your laptop
+> 2. Run Noise Warden locally, compute a calibration profile via the wizard
+> 3. Transfer the `calibration_offset_db` value to your Pi's `noise_warden.yaml`
+> 4. On the Pi, do a quick sanity check with a phone SPL meter to confirm the dashboard reading is in the right ballpark (±2 dB)
+
 Configuration is stored in `config/noise_warden.yaml` and can also be edited via the web UI at `/config`. Key sections:
 
 | Section | Purpose |
@@ -342,11 +356,14 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 - **WAV snippet evidence capture** — ring buffer preserves pre-trigger audio (15 sec default) plus post-trigger recording, saved per incident
 - **5 false-positive exclusion filters** — impulse, thunder-like, rain-like, mower-like, and drive-by patterns each with configurable tuning parameters
 - **Web UI** for calibration, customization, and incident review:
-  - Dashboard — live dB readout, arm/disarm controls, incident list with audio playback
-  - Timeline — day/week/month incident viewer
+  - Dashboard — live dB readout, arm/disarm/pause controls, detection mode switcher, force test incident, recording toggle, incident list with ▶ play buttons
+  - Timeline — day/week/month incident viewer with severity-colored blocks, borderline filtering, and click-to-inspect detail popups
+  - Incident detail popup — shared across all pages; shows ordinance violation badge, classification, timestamps, notes, and audio player with intensity waveform and click-to-seek
+  - Calibration — 3-step wizard with live dB/raw dBFS readouts, click-to-fill, offset slider, profile management, sample rate and detection mode controls
   - Thresholds — display current thresholds vs. ordinance limits
   - Config editor — edit YAML configuration without SSH
   - Build documentation — upload photos and notes documenting physical setup
+  - Light/dark mode — toggle in nav bar, preference persisted in localStorage. Dark theme uses a Monokai-inspired charcoal palette
 - **Day/night ordinance enforcement** — separate thresholds and behavior; nighttime is record-only
 - **REST API** — full programmatic access to status, incidents, controls, and configuration
 - **CSV export** of incident history for external analysis or evidence submission
@@ -357,6 +374,9 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 - **Self-noise suppression** — automatically skips incident detection while the system is playing a response (and for a configurable cooldown window afterward), preventing the system from logging its own retaliation as a noise violation
 - **Non-blocking callback audio streams** (optional, disabled by default) — `sd.InputStream` callback mode via `_CALLBACK_STREAMS_ENABLED = True` in `audio.py`. Enables concurrent multi-device capture for future dual-mic reference subtraction
 - **Dual-mic reference subtraction plugins** — `ReferenceSubtractor` (NLMS adaptive filter) and `DualMicDifferential` (spectral subtraction) in `plugins.py` with documented algorithms. Not yet wired into the engine loop — requires callback streams and a second `AudioCapture` instance
+- **Intensity waveform visualization** — Canvas-based RMS envelope displayed above the audio player in incident popups. Color-coded (teal → lime → yellow → orange → red) by amplitude so loud sections are immediately visible. Click anywhere on the waveform to seek; playback cursor tracks position in real-time
+- **Armed state persistence** — Pausing detection writes to YAML config so pauses survive server restarts and watch-mode reloads
+- **Offline-capable timeline** — Service worker caches the timeline page and audio snippets for offline review, with proper HTTP Range request handling for cached audio scrubbing
 
 ## Testing
 
@@ -442,6 +462,15 @@ Add to crontab (`crontab -e`):
 
 - TODO: Thresholds page `zone_thresholds` table includes `commerce_industry_A1` which the engine never uses — filter to only relevant categories, or clearly label which rows are active
 - TODO: What if someone wants to use this for identifying overall dog nuisance? Dog barks have a particular noise pattern, and could even be categorized with some spectrographic analysis into "dog1", "dog2", for individual incidents and later tagged with names/locations, etc. Would this just completely break _my_ use case?
+- TODO: Dashboard: I don't understand the meaning behind the Mode table column, or the entries of "respond"
+- TODO: Add warning states for nonstandard modes of the status buttons, for when detection is disabled, recording is disabled, or a force-test is active.
+- TODO: Config: We have an entire thresholds page and configuration yaml file with a detection section, but only a single entry that seems related to the noise ordinances we want to utilize in our configuration. We should probably have an ordinances section, which is deliberate and avoids magic numbers that are specific to my location in our threshold logic
+- TODO: Dashboard: Running: true doesn't make sense to include in the ui--I have also never seen it as any other value, and if we are connecting to the webapp, it is obviously running, right? I anticipate that this is because the web app is just surfacing the state that is surfaced to home assistant
+- TODO: Did maybe the data not update in the webapp quickly enough?
+
+### Observations from initial test pilot
+
+- Uncalibrated microphone test run recorded very regularly choppy audio with a wideband sample rate. don't know if the was due to some built-in aec, or our recording algorithm, or if that is what happens when we don't calibrate, but whatever it is, we will need it resolved
 
 ### Functionality
 
