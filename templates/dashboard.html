@@ -2,9 +2,7 @@
 {% block content %}
 <div class="card">
   <h2>Dashboard</h2>
-  {% if message %}<p><b>{{ message }}</b></p>{% endif %}
   <p>
-    <span class="pill" id="pill-running">Running: {{ state.running }}</span>
     <span class="pill" id="pill-armed">Armed: {{ state.armed }}</span>
     <span class="pill" id="pill-mic">Mic OK: {{ state.mic_ok }}</span>
     <span class="pill" id="pill-mode">Mode: {{ state.mode }}</span>
@@ -13,6 +11,19 @@
     <span class="pill" id="pill-disk" style="{% if state.disk_warning %}background:#e74c3c;color:#fff{% endif %}">Disk: {{ state.disk_warning or ('%.0f MB free' | format(state.disk_free_mb|default(0, true))) }}</span>
   </p>
   <p class="small">Status updates every 5 seconds from in-memory state (no database reads).</p>
+
+  <!-- Warning banners for nonstandard operating states -->
+  <div id="warning-banners">
+    {% if not state.armed %}
+    <p class="warning-banner" id="warn-paused">⚠ Detection is <strong>paused</strong> — no new incidents will be logged.</p>
+    {% endif %}
+    {% if not cfg.audio.recording_enabled %}
+    <p class="warning-banner" id="warn-no-record">⚠ Recording is <strong>disabled</strong> — incidents log dB data only, no audio snippets.</p>
+    {% endif %}
+    {% if state.active_incident_id %}
+    <p class="warning-banner warning-info" id="warn-force-test">ℹ A test incident is <strong>active</strong> — force-end it when finished testing.</p>
+    {% endif %}
+  </div>
 
   <div style="margin-top:8px">
     {% if state.armed %}
@@ -28,9 +39,9 @@
     {% endif %}
 
     {% if state.active_incident_id %}
-    <form method="post" action="/control/end-forced-incident" style="display:inline-block;"><button>End Incident</button></form>
+    <form method="post" action="/control/end-forced-incident" style="display:inline-block;"><button>End Test Incident</button></form>
     {% else %}
-    <form method="post" action="/control/force-incident" style="display:inline-block;"><button>Force Test Incident</button></form>
+    <form method="post" action="/control/force-incident" style="display:inline-block;"><button>Start Test Incident</button></form>
     {% endif %}
   </div>
 
@@ -60,14 +71,13 @@
 <div class="card">
   <h3>Recent Incidents ({{ incidents|length }})</h3>
   <table>
-    <tr><th>Start <span class="small" id="tz-offset-label"></span></th><th>Duration</th><th>Excess</th><th>Music Score</th><th>Mode</th><th></th></tr>
+    <tr><th>Start <span class="small" id="tz-offset-label"></span></th><th>Duration</th><th>Excess</th><th>Music Score</th><th></th></tr>
     {% for r in incidents %}
     <tr>
       <td class="incident-ts" data-ts="{{ r.start_ts }}">{{ r.start_ts }}</td>
       <td>{% if r.duration_sec is not none %}{% if r.duration_sec >= 3600 %}{{ "%.1f"|format(r.duration_sec / 3600) }}h{% elif r.duration_sec >= 60 %}{{ "%.1f"|format(r.duration_sec / 60) }}m{% else %}{{ r.duration_sec|int }}s{% endif %}{% endif %}</td>
       <td>{% if r.start_db and r.threshold_db %}(+{{ "%.1f"|format(r.start_db - r.threshold_db) }}dB){% endif %}</td>
       <td>{{ r.music_like_score }}</td>
-      <td>{{ r.mode }}</td>
       <td>{% if r.snippet_path %}<button class="snippet-play-btn"
         data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
         title="Play audio snippet">&#9654;</button>{% endif %}</td>
@@ -113,7 +123,6 @@
 
   // Map state keys → pill element IDs and display labels
   const pills = {
-    running:              { el: document.getElementById('pill-running'),   label: 'Running' },
     armed:                { el: document.getElementById('pill-armed'),     label: 'Armed' },
     mic_ok:               { el: document.getElementById('pill-mic'),       label: 'Mic OK' },
     mode:                 { el: document.getElementById('pill-mode'),      label: 'Mode' },
@@ -147,6 +156,22 @@
           diskPill.style.color = '';
         }
       }
+
+      // Update warning banners based on live state
+      var banners = document.getElementById('warning-banners');
+      if (banners) {
+        var html = '';
+        if (data.armed === false) {
+          html += '<p class="warning-banner">⚠ Detection is <strong>paused</strong> — no new incidents will be logged.</p>';
+        }
+        if (data.recording_enabled === false) {
+          html += '<p class="warning-banner">⚠ Recording is <strong>disabled</strong> — incidents log dB data only, no audio snippets.</p>';
+        }
+        if (data.active_incident_id) {
+          html += '<p class="warning-banner warning-info">ℹ A test incident is <strong>active</strong> — end it when finished testing.</p>';
+        }
+        banners.innerHTML = html;
+      }
     } catch (err) {
       // Network error — silently skip this cycle
     }
@@ -175,5 +200,23 @@ document.querySelectorAll('.snippet-play-btn').forEach(function (btn) {
     showPopup(JSON.parse(btn.getAttribute('data-incident')));
   });
 });
+
+/* Pre-cache visible snippets so they survive going offline.
+   Waits for the SW to be active so fetches actually go through it —
+   on first visit the SW may still be installing when this code runs. */
+(function precacheVisibleSnippets() {
+  if (!('serviceWorker' in navigator)) { return; }
+  navigator.serviceWorker.ready.then(function () {
+    var btns = document.querySelectorAll('.snippet-play-btn');
+    btns.forEach(function (btn) {
+      try {
+        var inc = JSON.parse(btn.getAttribute('data-incident'));
+        if (inc.has_snippet && inc.id) {
+          fetch('/snippets/' + inc.id).catch(function () { /* offline — skip */ });
+        }
+      } catch (e) { /* malformed JSON — skip */ }
+    });
+  });
+})();
 </script>
 {% endblock %}

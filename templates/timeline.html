@@ -17,7 +17,8 @@
 
   .tl-col { flex:1; position:relative; border-right:1px solid var(--hour-line); min-width:0; }
   .tl-col:last-child { border-right:none; }
-  .tl-col-header { text-align:center; font-size:12px; padding:4px 2px; background:var(--bg-col-header); border-bottom:1px solid var(--border); white-space:nowrap; overflow:hidden; color:var(--text); }
+  .tl-col-header { text-align:center; font-size:12px; padding:4px 2px; background:var(--bg-col-header); border-bottom:1px solid var(--border); white-space:nowrap; overflow:hidden; color:var(--text); cursor:pointer; }
+  .tl-col-header:hover { text-decoration:underline; }
   .tl-col-header.today { font-weight:bold; color:var(--now-line); }
   .tl-col-body { position:relative; }
 
@@ -33,8 +34,9 @@
   .tl-pip { position:absolute; left:2px; right:2px; border-radius:3px; cursor:pointer; min-height:5px; z-index:2; }
   .tl-pip:hover { opacity:.75; }
 
-  /* ---- Borderline toggle ---- */
+  /* ---- Borderline / zoom toggles ---- */
   #borderline-toggle { margin-left:12px; font-size:13px; }
+  #zoom-toggle { margin-left:8px; font-size:13px; }
 </style>
 
 <div class="card">
@@ -48,7 +50,8 @@
     <button onclick="navigate(1)" title="Next">&#8594;</button>
     <button onclick="goToday()">Today</button>
     <span id="tl-count" class="small" style="margin-left:8px"></span>
-    <label id="borderline-toggle"><input type="checkbox" id="show-borderline" onchange="render()"> Show borderline</label>
+    <label id="borderline-toggle"><input type="checkbox" id="show-borderline" onchange="render(); saveTimelineState()"> Show borderline</label>
+    <label id="zoom-toggle"><input type="checkbox" id="zoom-active" onchange="render(); saveTimelineState()"> Zoom to active hours</label>
   </div>
   <h3 id="tl-summary"></h3>
   <p class="small" id="tl-status"></p>
@@ -70,10 +73,8 @@ var ORDINANCE = {{ ordinance_json | safe }};
    ====================================================================== */
 var CACHE_NAME = 'noise-warden-timeline-v1';
 var HOUR_PX = 40;
-var GRID_PX = 24 * HOUR_PX;
-var MONTH_HOUR_PX = 16;
-var MONTH_GRID_PX = 24 * MONTH_HOUR_PX;
 var HDR_PX = 26;
+var MIN_GRID_PX = 300;
 var DAY_MS = 86400000;
 var DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 
@@ -83,18 +84,143 @@ var BORDERLINE_MARGIN_DB = {{ borderline_margin_db }};
 
 /* ======================================================================
    STATE
+   Restored from localStorage so refreshes / tab-switches land where you
+   left off instead of snapping back to today.
    ====================================================================== */
-var currentView = '{{ view }}' || 'day';
-var currentDate = new Date();
-currentDate.setHours(0, 0, 0, 0);
+var STORAGE_KEY = 'nw-timeline-state';
+var _restored = restoreTimelineState();
+var currentView = _restored.view;
+var currentDate = _restored.date;
+
+/**
+ * Read saved view + date from localStorage.
+ * Falls back to server-provided view (or 'day') and today.
+ */
+function restoreTimelineState() {
+  var fallbackView = '{{ view }}' || 'day';
+  var fallbackDate = new Date();
+  fallbackDate.setHours(0, 0, 0, 0);
+
+  try {
+    var raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) { return { view: fallbackView, date: fallbackDate }; }
+
+    var saved = JSON.parse(raw);
+    var view = (['day', 'week', 'month'].indexOf(saved.view) !== -1) ? saved.view : fallbackView;
+    var date = new Date(saved.date);
+
+    // Guard against invalid or wildly out-of-range dates
+    if (isNaN(date.getTime())) { return { view: view, date: fallbackDate }; }
+    date.setHours(0, 0, 0, 0);
+    if (view === 'month') { date.setDate(1); }
+
+    // Restore checkbox states after DOM is ready
+    document.addEventListener('DOMContentLoaded', function () {
+      if (saved.showBorderline) {
+        var borderEl = document.getElementById('show-borderline');
+        if (borderEl) { borderEl.checked = true; }
+      }
+      if (saved.zoomActive) {
+        var zoomEl = document.getElementById('zoom-active');
+        if (zoomEl) { zoomEl.checked = true; }
+      }
+    });
+
+    return { view: view, date: date };
+  } catch (e) {
+    return { view: fallbackView, date: fallbackDate };
+  }
+}
+
+/** Persist current view + date + checkbox states so the next page load resumes. */
+function saveTimelineState() {
+  try {
+    var borderEl = document.getElementById('show-borderline');
+    var zoomEl = document.getElementById('zoom-active');
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      date: currentDate.toISOString(),
+      showBorderline: borderEl ? borderEl.checked : false,
+      view: currentView,
+      zoomActive: zoomEl ? zoomEl.checked : false
+    }));
+  } catch (e) { /* storage full or disabled — non-critical */ }
+}
+
+/**
+ * Scan visible incidents for the earliest and latest active hours across the
+ * current view's date range. Returns { startHour, endHour } with ±1 hour
+ * padding (clamped 0–24). Falls back to full range if nothing is visible.
+ * @param {Date} rangeStart - First moment of the view
+ * @param {Date} rangeEnd   - Last moment of the view
+ */
+function getActiveHourRange(rangeStart, rangeEnd) {
+  var FULL_RANGE = { startHour: 0, endHour: 24 };
+  var zoomEl = document.getElementById('zoom-active');
+  if (!zoomEl || !zoomEl.checked) { return FULL_RANGE; }
+
+  var minHour = 24;
+  var maxHour = 0;
+  var found = false;
+
+  for (var i = 0; i < INCIDENTS.length; i++) {
+    var inc = INCIDENTS[i];
+    var start = new Date(inc.start_ts);
+    var end = inc.end_ts ? new Date(inc.end_ts) : new Date(start.getTime() + 1000);
+
+    // Skip incidents outside the visible date range entirely
+    if (start >= rangeEnd || end <= rangeStart) { continue; }
+
+    found = true;
+    minHour = Math.min(minHour, start.getHours());
+    // End hour: use the ceiling so a 10:45 end includes hour 10
+    var endHour = end.getHours() + (end.getMinutes() > 0 || end.getSeconds() > 0 ? 1 : 0);
+    maxHour = Math.max(maxHour, endHour);
+  }
+
+  if (!found) { return FULL_RANGE; }
+
+  // ±1 hour padding, clamped to valid range
+  return {
+    startHour: Math.max(0, minHour - 1),
+    endHour: Math.min(24, maxHour + 1)
+  };
+}
+
+/**
+ * Compute the grid pixel height and per-hour pixel size for the current view.
+ * When zoom is active, fills available viewport space (minus controls, header,
+ * status, and some breathing room). Enforces a minimum height for small screens.
+ * @param {number} numHours - Number of hours in the visible range
+ * @returns {Object} gridPx and hourPx for the current layout
+ */
+function computeGridLayout(numHours) {
+  var zoomEl = document.getElementById('zoom-active');
+  var isZoomed = zoomEl && zoomEl.checked;
+
+  if (isZoomed) {
+    // Measure available viewport space below the grid container
+    var gridEl = document.getElementById('tl-grid');
+    var rect = gridEl.getBoundingClientRect();
+    // Available = viewport bottom minus grid top, minus a bit of bottom margin
+    var available = window.innerHeight - rect.top - 16;
+    var gridPx = Math.max(MIN_GRID_PX, available - HDR_PX);
+    return { gridPx: gridPx, hourPx: gridPx / numHours };
+  }
+
+  // Default: fixed per-hour sizing
+  return { gridPx: numHours * HOUR_PX, hourPx: HOUR_PX };
+}
 
 /* ======================================================================
    INIT
    ====================================================================== */
 document.addEventListener('DOMContentLoaded', function () {
   render();
-  registerSW();
-  precacheSnippets();
+  /* Wait for SW to be active before precaching, otherwise on first visit
+     the fetches bypass the SW and nothing actually lands in the cache. */
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.ready.then(function () { precacheSnippets(); });
+  }
   updateOnlineStatus();
   window.addEventListener('online', updateOnlineStatus);
   window.addEventListener('offline', updateOnlineStatus);
@@ -109,6 +235,7 @@ function switchView(view) {
     currentDate.setDate(1);
   }
   render();
+  saveTimelineState();
   history.replaceState(null, '', '/timeline?view=' + view);
 }
 
@@ -131,6 +258,7 @@ function navigate(dir) {
     if (currentView === 'month') { currentDate.setDate(1); }
   }
   render();
+  saveTimelineState();
 }
 
 function goToday() {
@@ -140,6 +268,7 @@ function goToday() {
     currentDate.setDate(1);
   }
   render();
+  saveTimelineState();
 }
 
 /* ======================================================================
@@ -166,18 +295,25 @@ function renderDay() {
   dayStart.setHours(0, 0, 0, 0);
   setViewLabel(dayStart.toLocaleDateString([], { weekday:'long', month:'long', day:'numeric', year:'numeric' }));
 
+  var dayEnd = new Date(dayStart.getTime() + DAY_MS);
+  var range = getActiveHourRange(dayStart, dayEnd);
+  var numHours = range.endHour - range.startHour;
+  var layout = computeGridLayout(numHours);
+  var gridPx = layout.gridPx;
+  var hourPx = layout.hourPx;
+
   var gridEl = document.getElementById('tl-grid');
   gridEl.innerHTML = '';
 
   var wrapper = makeEl('div', 'tl-wrapper');
-  wrapper.style.height = (GRID_PX + HDR_PX) + 'px';
+  wrapper.style.height = (gridPx + HDR_PX) + 'px';
 
   // Hour labels column
-  wrapper.appendChild(buildHoursColumn(HOUR_PX, GRID_PX));
+  wrapper.appendChild(buildHoursColumn(hourPx, gridPx, range.startHour, range.endHour));
 
   // Single day column
   var columns = makeEl('div', 'tl-columns');
-  columns.appendChild(buildDayColumn(dayStart, HOUR_PX, GRID_PX, true));
+  columns.appendChild(buildDayColumn(dayStart, hourPx, gridPx, true, range.startHour, range.endHour));
   wrapper.appendChild(columns);
 
   gridEl.appendChild(wrapper);
@@ -192,20 +328,27 @@ function renderWeek() {
   sunday.setDate(sunday.getDate() + 6);
   setViewLabel(formatDateShort(monday) + ' \u2013 ' + formatDateShort(sunday));
 
+  var weekEnd = new Date(monday.getTime() + 7 * DAY_MS);
+  var range = getActiveHourRange(monday, weekEnd);
+  var numHours = range.endHour - range.startHour;
+  var layout = computeGridLayout(numHours);
+  var gridPx = layout.gridPx;
+  var hourPx = layout.hourPx;
+
   var gridEl = document.getElementById('tl-grid');
   gridEl.innerHTML = '';
 
   var wrapper = makeEl('div', 'tl-wrapper');
-  wrapper.style.height = (GRID_PX + HDR_PX) + 'px';
+  wrapper.style.height = (gridPx + HDR_PX) + 'px';
 
-  wrapper.appendChild(buildHoursColumn(HOUR_PX, GRID_PX));
+  wrapper.appendChild(buildHoursColumn(hourPx, gridPx, range.startHour, range.endHour));
 
   var columns = makeEl('div', 'tl-columns');
   for (var d = 0; d < 7; d++) {
     var dayStart = new Date(monday);
     dayStart.setDate(dayStart.getDate() + d);
     dayStart.setHours(0, 0, 0, 0);
-    columns.appendChild(buildDayColumn(dayStart, HOUR_PX, GRID_PX, false));
+    columns.appendChild(buildDayColumn(dayStart, hourPx, gridPx, false, range.startHour, range.endHour));
   }
   wrapper.appendChild(columns);
 
@@ -221,17 +364,26 @@ function renderMonth() {
   var numDays = new Date(year, month + 1, 0).getDate();
   setViewLabel(currentDate.toLocaleDateString([], { month:'long', year:'numeric' }));
 
+  var monthStart = new Date(year, month, 1, 0, 0, 0, 0);
+  var monthEnd = new Date(year, month + 1, 1, 0, 0, 0, 0);
+  var range = getActiveHourRange(monthStart, monthEnd);
+  var numHours = range.endHour - range.startHour;
+  var layout = computeGridLayout(numHours);
+  var gridPx = layout.gridPx;
+  var hourPx = layout.hourPx;
+
   var gridEl = document.getElementById('tl-grid');
   gridEl.innerHTML = '';
 
   var wrapper = makeEl('div', 'tl-wrapper');
-  wrapper.style.height = (MONTH_GRID_PX + HDR_PX) + 'px';
+  wrapper.style.height = (gridPx + HDR_PX) + 'px';
 
-  // No hour labels in month view (columns are too narrow)
+  wrapper.appendChild(buildHoursColumn(hourPx, gridPx, range.startHour, range.endHour));
+
   var columns = makeEl('div', 'tl-columns');
   for (var d = 1; d <= numDays; d++) {
     var dayStart = new Date(year, month, d, 0, 0, 0, 0);
-    var col = buildDayColumn(dayStart, MONTH_HOUR_PX, MONTH_GRID_PX, false);
+    var col = buildDayColumn(dayStart, hourPx, gridPx, false, range.startHour, range.endHour);
     // Override header to just the date number (saves horizontal space)
     col.querySelector('.tl-col-header').textContent = d;
     columns.appendChild(col);
@@ -244,7 +396,7 @@ function renderMonth() {
 /* ======================================================================
    SHARED: hour-label column (left gutter)
    ====================================================================== */
-function buildHoursColumn(hourPx, gridPx) {
+function buildHoursColumn(hourPx, gridPx, startHour, endHour) {
   var col = makeEl('div', 'tl-hours-col');
   col.style.height = (gridPx + HDR_PX) + 'px';
 
@@ -253,9 +405,9 @@ function buildHoursColumn(hourPx, gridPx) {
   spacer.style.height = HDR_PX + 'px';
   col.appendChild(spacer);
 
-  for (var h = 0; h < 24; h++) {
+  for (var h = startHour; h < endHour; h++) {
     var lbl = makeEl('div', 'tl-hour-label');
-    lbl.style.top = (HDR_PX + h * hourPx) + 'px';
+    lbl.style.top = (HDR_PX + (h - startHour) * hourPx) + 'px';
     lbl.textContent = formatHour(h);
     col.appendChild(lbl);
   }
@@ -265,16 +417,30 @@ function buildHoursColumn(hourPx, gridPx) {
 /* ======================================================================
    SHARED: Build one day's column (header + hour lines + incidents + now line)
    ====================================================================== */
-function buildDayColumn(dayStart, hourPx, gridPx, showLabels) {
+function buildDayColumn(dayStart, hourPx, gridPx, showLabels, startHour, endHour) {
   var dayEnd = new Date(dayStart.getTime() + DAY_MS);
   var today = new Date();
+  // Visible time window within this day (for zoom clipping)
+  var visibleStart = new Date(dayStart.getTime() + startHour * 3600000);
+  var visibleEnd = new Date(dayStart.getTime() + endHour * 3600000);
+  var numHours = endHour - startHour;
 
   var col = makeEl('div', 'tl-col');
 
   // Header (e.g. "Tue 8" or just "8" for month view — caller can override)
+  // Clicking a column header in week/month view drills into that day.
   var hdr = makeEl('div', 'tl-col-header');
   var dow = (dayStart.getDay() + 6) % 7; // 0=Mon .. 6=Sun
   hdr.textContent = DAYS[dow] + ' ' + dayStart.getDate();
+  hdr._dayDate = new Date(dayStart.getTime());
+  hdr.addEventListener('click', function () {
+    if (currentView === 'day') { return; }
+    currentDate = new Date(this._dayDate.getTime());
+    currentView = 'day';
+    render();
+    saveTimelineState();
+    history.replaceState(null, '', '/timeline?view=day');
+  });
   if (isSameDay(dayStart, today)) {
     hdr.className += ' today';
   }
@@ -284,10 +450,10 @@ function buildDayColumn(dayStart, hourPx, gridPx, showLabels) {
   var body = makeEl('div', 'tl-col-body');
   body.style.height = gridPx + 'px';
 
-  // Hour lines
-  for (var h = 1; h < 24; h++) {
+  // Hour lines (only within the visible hour range)
+  for (var h = startHour + 1; h < endHour; h++) {
     var line = makeEl('div', 'tl-hour-line');
-    line.style.top = (h * hourPx) + 'px';
+    line.style.top = ((h - startHour) * hourPx) + 'px';
     body.appendChild(line);
   }
 
@@ -304,9 +470,12 @@ function buildDayColumn(dayStart, hourPx, gridPx, showLabels) {
     visibleCount++;
     visibleDuration += safeNum(inc.duration_sec, 0);
 
-    var clampStart = Math.max(start.getTime(), dayStart.getTime());
-    var clampEnd = Math.min(end.getTime(), dayEnd.getTime());
-    var topMin = (clampStart - dayStart.getTime()) / 60000;
+    // Clamp to the visible hour window (not just the calendar day)
+    var clampStart = Math.max(start.getTime(), visibleStart.getTime());
+    var clampEnd = Math.min(end.getTime(), visibleEnd.getTime());
+    if (clampStart >= clampEnd) { continue; } // entirely outside zoomed range
+
+    var topMin = (clampStart - visibleStart.getTime()) / 60000;
     var durMin = (clampEnd - clampStart) / 60000;
 
     var top = (topMin / 60) * hourPx;
@@ -340,13 +509,17 @@ function buildDayColumn(dayStart, hourPx, gridPx, showLabels) {
     body.appendChild(block);
   }
 
-  // "Now" line
+  // "Now" line — only if today is visible and current time falls within the zoomed range
   if (isSameDay(dayStart, today)) {
     var nowMin = today.getHours() * 60 + today.getMinutes();
-    var nowTop = (nowMin / 60) * hourPx;
-    var nowLine = makeEl('div', 'tl-now-line');
-    nowLine.style.top = nowTop + 'px';
-    body.appendChild(nowLine);
+    var rangeStartMin = startHour * 60;
+    var rangeEndMin = endHour * 60;
+    if (nowMin >= rangeStartMin && nowMin <= rangeEndMin) {
+      var nowTop = ((nowMin - rangeStartMin) / 60) * hourPx;
+      var nowLine = makeEl('div', 'tl-now-line');
+      nowLine.style.top = nowTop + 'px';
+      body.appendChild(nowLine);
+    }
   }
 
   col.appendChild(body);
@@ -519,14 +692,11 @@ function updateOnlineStatus() {
 }
 
 /* ======================================================================
-   SERVICE WORKER REGISTRATION + SNIPPET PRE-CACHING
+   SNIPPET PRE-CACHING
+   SW registration is handled globally in base.html — no need to
+   register here. The precache function relies on the SW being active
+   to intercept and cache snippet fetches.
    ====================================================================== */
-function registerSW() {
-  if (!('serviceWorker' in navigator)) { return; }
-  navigator.serviceWorker.register('/sw.js').catch(function () {
-    // SW registration failed — page still functions, just no offline support
-  });
-}
 
 /**
  * Pre-cache audio snippets from the most recent 24 hours.

@@ -18,6 +18,7 @@ audio:
   chunk_flush_seconds: 30
   max_incident_record_hours: 6
   retention_days: 30
+  auto_purge_enabled: false     # Set to true to automatically delete snippets and incidents older than retention_days
 
 detection:
   zone: residential_agricultural

@@ -16,6 +16,7 @@ class StateStore:
             "last_error": None,
             "mic_ok": False,
             "mode": "idle",
+            "recording_enabled": True,
             "responding": False,
             "running": False,
             "updated_at": None,

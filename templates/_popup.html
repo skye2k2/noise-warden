@@ -19,7 +19,7 @@
   .excess-mid { background:#e67e22; }
   .excess-high { background:#e74c3c; }
   .excess-severe { background:#c0392b; }
-  .snippet-play-btn { background:none; border:none; cursor:pointer; font-size:18px; color:var(--text); padding:2px 6px; }
+
 
   /* Waveform intensity display */
   .waveform-wrap { position:relative; width:100%; height:64px; margin:6px 0 4px; cursor:pointer; border-radius:4px; overflow:hidden; background:var(--bg-input, #2d2d2d); }
@@ -171,9 +171,13 @@ function showPopup(inc) {
     html += '<div class="waveform-time" id="waveform-time"></div>';
     html += '<div class="waveform-loading" id="waveform-loading">Loading waveform\u2026</div>';
     html += '</div>';
-    html += '<audio controls preload="metadata" id="popup-audio" style="width:100%">';
-    html += '<source src="/snippets/' + inc.id + '" type="audio/wav">';
-    html += '</audio>';
+    // The <audio> element starts with NO src. _initWaveform() fetches the
+    // file once, draws the waveform from the decoded data, then creates a
+    // Blob URL and assigns it as the audio src. This avoids a duplicate
+    // network request (the browser would otherwise fetch the file separately
+    // for metadata/playback, racing against the waveform fetch and causing
+    // "plays for 1 second then stops" on first click).
+    html += '<audio controls preload="auto" id="popup-audio" style="width:100%"></audio>';
     html += '</div>';
   }
 
@@ -188,14 +192,29 @@ function showPopup(inc) {
 
 /* ======================================================================
    WAVEFORM — intensity visualization with click-to-seek.
-   Fetches the WAV, decodes to PCM via Web Audio API, computes RMS
-   envelope per visual column, and draws color-coded intensity bars.
+   Fetches the WAV once, decodes to PCM via Web Audio API for the
+   waveform visualization, then creates a Blob URL for the <audio>
+   element so both share a single network fetch.
+
+   IMPORTANT — single-fetch architecture:
+   ───────────────────────────────────────
+   The <audio> element intentionally starts with NO src attribute.
+   This function fetches the WAV, uses the ArrayBuffer for waveform
+   rendering, then creates a blob: URL for audio playback. This
+   eliminates a duplicate network request that caused race conditions:
+   the browser's metadata preload and the waveform fetch would fight
+   over the same file, resulting in "plays for 1 second then stops"
+   on first click. Do NOT add a src/source to the <audio> element
+   in the HTML — the Blob URL assignment here is the single source
+   of truth for audio data.
    ====================================================================== */
 var _waveformAudioCtx = null;
+var _currentBlobUrl = null;
 
 /**
- * Fetch and decode an audio snippet, then render its intensity waveform.
- * Wires up playback cursor tracking and click-to-seek on the canvas.
+ * Fetch and decode an audio snippet, render its intensity waveform, and
+ * assign the fetched data to the <audio> element via a Blob URL. This
+ * single fetch serves both the waveform canvas and audio playback.
  */
 function _initWaveform(incidentId) {
   var canvas = document.getElementById('waveform-canvas');
@@ -205,6 +224,12 @@ function _initWaveform(incidentId) {
   var loadingEl = document.getElementById('waveform-loading');
   var audio = document.getElementById('popup-audio');
   if (!canvas || !audio || !wrap) { return; }
+
+  // Revoke any previous Blob URL to avoid memory leaks across popup opens
+  if (_currentBlobUrl) {
+    URL.revokeObjectURL(_currentBlobUrl);
+    _currentBlobUrl = null;
+  }
 
   // Lazy-init AudioContext (one per page lifetime, reused across popups)
   if (!_waveformAudioCtx) {
@@ -217,7 +242,17 @@ function _initWaveform(incidentId) {
       return resp.arrayBuffer();
     })
     .then(function (arrayBuf) {
-      return _waveformAudioCtx.decodeAudioData(arrayBuf);
+      // Create a Blob URL from the fetched data and assign it to the
+      // <audio> element. This gives the audio player the full file
+      // immediately — no separate network request, no Range negotiation,
+      // no "plays then stops" race condition.
+      var blob = new Blob([arrayBuf], { type: 'audio/wav' });
+      _currentBlobUrl = URL.createObjectURL(blob);
+      audio.src = _currentBlobUrl;
+
+      // decodeAudioData consumes the buffer in some browsers, so we pass
+      // a copy to avoid invalidating the Blob we just created.
+      return _waveformAudioCtx.decodeAudioData(arrayBuf.slice(0));
     })
     .then(function (audioBuf) {
       if (loadingEl) { loadingEl.style.display = 'none'; }
@@ -319,8 +354,13 @@ function _wireWaveformInteraction(wrap, cursor, timeEl, audio) {
     }
   });
 
-  // Update cursor position and timestamp during playback
-  audio.addEventListener('timeupdate', function () {
+  /* Smooth cursor + timestamp updates via requestAnimationFrame.
+     The timeupdate event only fires ~4x/sec, producing jerky motion.
+     rAF gives us 60fps updates while audio is playing, and we do one
+     final update on pause/ended to nail the resting position. */
+  var rafId = null;
+
+  function updateCursor() {
     if (!audio.duration || !isFinite(audio.duration)) { return; }
     var fraction = audio.currentTime / audio.duration;
     cursor.style.left = (fraction * 100).toFixed(2) + '%';
@@ -330,6 +370,29 @@ function _wireWaveformInteraction(wrap, cursor, timeEl, audio) {
       var total = Math.floor(audio.duration);
       timeEl.textContent = _formatSeconds(cur) + ' / ' + _formatSeconds(total);
     }
+  }
+
+  function animateCursor() {
+    updateCursor();
+    rafId = requestAnimationFrame(animateCursor);
+  }
+
+  function stopAnimation() {
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+    updateCursor(); // Final position snap
+  }
+
+  audio.addEventListener('play', function () {
+    if (!rafId) { animateCursor(); }
+  });
+  audio.addEventListener('pause', stopAnimation);
+  audio.addEventListener('ended', stopAnimation);
+  // Also update on manual seeks while paused
+  audio.addEventListener('seeked', function () {
+    if (audio.paused) { updateCursor(); }
   });
 }
 
@@ -342,9 +405,16 @@ function _formatSeconds(sec) {
 
 function hidePopup() {
   document.getElementById('popup-overlay').style.display = 'none';
-  // Stop any playing audio when closing
+  // Stop any playing audio and revoke the Blob URL to free memory
   var audio = document.querySelector('#popup-box audio');
-  if (audio) { audio.pause(); }
+  if (audio) {
+    audio.pause();
+    audio.removeAttribute('src');
+  }
+  if (_currentBlobUrl) {
+    URL.revokeObjectURL(_currentBlobUrl);
+    _currentBlobUrl = null;
+  }
 }
 
 document.addEventListener('keydown', function (e) {

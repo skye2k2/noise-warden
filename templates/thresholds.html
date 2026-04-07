@@ -8,8 +8,8 @@
   <table>
     <tr><th>Category</th><th>Day ({{ ordinance.measurement.day_start }}:00–{{ ordinance.measurement.night_start }}:00)</th><th>Night ({{ ordinance.measurement.night_start }}:00–{{ ordinance.measurement.day_start }}:00)</th></tr>
     {% for key, vals in zone_thresholds.items() %}
-    <tr>
-      <td>{{ key }}</td>
+    <tr{% if key == active_rule %} class="active-rule"{% endif %}>
+      <td>{{ key }}{% if key == active_rule %} <span class="small">(active)</span>{% endif %}</td>
       <td>{{ vals.day }} dBA</td>
       <td>{{ vals.night }} dBA</td>
     </tr>

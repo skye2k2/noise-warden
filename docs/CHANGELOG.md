@@ -1,5 +1,95 @@
 # noise-warden CHANGELOG
 
+## v10 - 2026-04-06 — "Smooth Operator Edition"
+
+Polish pass addressing observations from initial local testing. Dashboard decluttered, incidents page brought to parity with dashboard formatting, thresholds page filtered to relevant categories, offline experience hardened, and auto-purge guarded against silent data loss.
+
+<details>
+
+<summary>Key details</summary>
+
+### Dashboard polish
+
+- **"Running" pill removed** — if you can see the dashboard, the app is running. The pill was always `True` and carried no useful information. The `running` key remains in `/api/state` for Home Assistant consumers
+- **Mode column removed from recent incidents table** — the column always showed "respond" or "record_only" which is an internal engine label, not a user-facing concept. Mode is still stored in the database and available in the incident detail popup and CSV export
+- **Warning banners for nonstandard states** — amber banner when detection is paused, amber banner when recording is disabled, blue info banner when a force-test incident is active. Banners update live via the 5-second `/api/state` poll (except recording, which reloads the page on toggle)
+
+### Incidents page parity with dashboard
+
+- **ID column removed** — internal database ID exposed no useful information to the operator
+- **Client-side timestamp formatting** — same locale-aware date+time rendering as the dashboard, with UTC offset shown once in the "Start" column header instead of per-row raw ISO strings
+- **Human-friendly duration** — durations now displayed as `Xs`, `X.Ym`, or `X.Yh` matching the dashboard format, instead of raw `REAL` seconds with decimals
+
+### Thresholds page
+
+- **Irrelevant categories filtered** — `commerce_industry_A1` (which the engine never evaluates) is no longer shown in the ordinance limits table. Only `continuous_A2_A3`, `intermittent_A2_A3`, and `impulse_A1_A3` are displayed
+- **Active rule highlighted** — the currently-active threshold row (based on detection mode) gets a blue highlight and "(active)" label, making it immediately clear which ordinance rule is being enforced
+
+### Data retention safety
+
+- **Auto-purge now opt-in** — new `audio.auto_purge_enabled` config key (default `false`). Snippet cleanup at startup and the daily periodic purge are skipped unless this is explicitly set to `true`. Previously, `retention_days: 30` silently deleted old snippets with no opt-in. The `retention_days` value is still respected when purge is enabled
+- **Startup log message** — when auto-purge is disabled, the engine logs a clear message noting that cleanup was skipped and why
+
+### Offline experience
+
+- **Service Worker expanded** — CSS and favicon are now pre-cached on SW install. Dashboard, incidents, build, and thresholds pages use network-first with cache fallback (previously only the timeline was cached). Cache version bumped to v10
+- **Config and Calibration nav links disabled offline** — links are dimmed and unclickable when `navigator.onLine` is false, preventing navigation to pages where save operations would silently fail
+- **Mutation controls hidden offline** — all `form[method="post"]` elements and `.destructive` buttons are hidden when offline. Restored immediately when connectivity returns
+- **Offline indicator bar** — red banner at the top of every page when offline: "Offline — viewing cached data. Controls disabled."
+
+### Resolved TODOs
+
+- Thresholds page `commerce_industry_A1` clutter — filtered (v10)
+- Dashboard Mode column — removed (v10)
+- Dashboard Running pill — removed (v10)
+- Dashboard warning states — added (v10)
+- Incidents page formatting parity — applied (v10)
+- Retention auto-delete guard — `auto_purge_enabled: false` default (v10)
+- Offline caching improvements — SW expanded, mutations disabled offline (v10)
+- Choppy audio — addressed in v9 (persistent WAV handle + block size revert); awaiting Pi hardware verification
+
+### Dashboard interaction
+
+- **Flash messages removed from control actions** — Pause, resume, recording toggle, and force-incident routes no longer pass `?msg=` query params on redirect. The warning banners (paused/disabled/force-test) provide real-time status feedback, making the flash text redundant
+- **`recording_enabled` added to StateStore** — toggling recording now updates in-memory state in addition to config, so the poll-driven warning banners reflect the current recording state without requiring a page reload
+- **Force-test incident toggle** — the dashboard button now reads "Start Test Incident" / "End Test Incident" as a single toggle (was two separate buttons with different labels)
+
+### Audio scrubbing fix (third time's the charm)
+
+- **Server-side Range request support for audio snippets** — the `/snippets/{id}` route now handles HTTP `Range: bytes=X-Y` requests and returns proper `206 Partial Content` responses with `Content-Range` headers. `Accept-Ranges: bytes` is advertised on all snippet responses. Previously, Starlette's `FileResponse` (which does NOT support Range requests as of 0.38.x) returned `200 OK` with the full file for every request, causing browsers to treat the audio as non-seekable on first load. The Service Worker's `maybeSliceForRange()` only fixed this for *cached* snippets — uncached first-load requests still broke. Both layers (server + SW) are now documented as essential and cross-referenced
+
+  > **Architecture note — why Range handling exists in two places:**
+  > This is the third time audio scrubbing has broken. For future reference:
+  >   1. **Server** (`web.py` `get_snippet`): handles Range for first-load requests before the SW has cached the file
+  >   2. **Service Worker** (`sw.js` `maybeSliceForRange`): handles Range for cached/offline snippets
+  >   3. **`<audio preload="metadata">`**: tells the browser to fetch WAV headers on load so `audio.duration` is available for the seek bar. Do NOT change to `preload="none"`
+  >
+  > All three are required. Removing any one breaks scrubbing for a specific scenario.
+
+### Single-fetch audio architecture
+
+- **Eliminated dual-fetch race condition** — previously, `<audio preload="metadata">` and the waveform `fetch()` both independently requested the same snippet, racing each other. On first load this caused a simultaneous 200 and 206, and playback often stopped after <1 second. Now a single `fetch()` is used: the response is converted to a Blob URL shared by both the `<audio>` element and `decodeAudioData()` for the waveform canvas
+- **Blob URL memory management** — `hidePopup()` revokes the Blob URL and clears the audio `src`, preventing memory leaks from accumulated object URLs across popup open/close cycles
+
+### Smooth playback cursor
+
+- **requestAnimationFrame-driven scrubber** — the waveform cursor line and timestamp now update at display refresh rate (~60fps) instead of the `timeupdate` event's ~4Hz. The rAF loop starts on `play`, stops on `pause`/`ended`/popup-close, and snaps to final position on stop. Manual seeks while paused also update the cursor via the `seeked` event
+
+### Timeline enhancements
+
+- **Persistent view state via localStorage** — the selected view (day/week/month), date, and checkbox states ("Show borderline", "Zoom to active hours") are saved to `localStorage` under `nw-timeline-state` and restored on page load. Refreshing or switching tabs returns to where you left off instead of resetting to today
+- **Click-to-drill column headers** — clicking a day's column header in week or month view switches to that day's day view. Headers show a pointer cursor and underline on hover as affordance
+- **Month view uses full vertical scale** — month view now uses the same `HOUR_PX` as day and week views (was previously a compressed `MONTH_HOUR_PX = 16`). Hour labels are now shown in the month view gutter as well
+- **"Zoom to active hours" toggle** — a checkbox that crops the grid vertically to only the hours that contain incidents, ±1 hour padding on each side. When zoomed, the grid fills available viewport height (300px minimum floor for mobile). Falls back to full 0–24 range when no incidents exist in the current view period
+
+### Offline reliability
+
+- **Snippet pre-caching on all pages** — dashboard and incidents pages now pre-cache their visible snippets on load (same pattern the timeline already used), so going offline after visiting any page preserves snippet playback
+- **Pre-cache gated behind `navigator.serviceWorker.ready`** — on a fresh first visit (cleared app data), the SW may still be installing when `DOMContentLoaded` fires. All three pages now wait for `navigator.serviceWorker.ready` before issuing precache fetches, ensuring they route through the SW and actually populate the cache. This also fixed offline page-switching, since the pages themselves now reliably land in the cache on first load
+- **Global Service Worker registration** — SW registration moved from timeline-only to `base.html`, so all pages benefit from caching without requiring a timeline visit first
+
+</details>
+
 ## v9 - 2026-04-05 — "Fit and Finish Edition"
 
 UI/UX overhaul for evidence clarity, cross-platform timezone handling, data rounding, borderline threshold filtering, and calibration wizard improvements. After finally seeing the code running, there were definite improvements to be made.

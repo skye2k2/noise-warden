@@ -139,7 +139,8 @@ class Engine:
         self.running = True
         # Restore armed state from config so pauses survive server restarts
         armed = bool(self.cfg["detection"].get("armed", True))
-        self.state.set(armed=armed)
+        recording = bool(self.cfg["audio"].get("recording_enabled", True))
+        self.state.set(armed=armed, recording_enabled=recording)
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
@@ -517,15 +518,19 @@ class Engine:
         except Exception as e:
             print(f"[engine] Stale incident repair error: {e}")
 
-        # Run snippet cleanup at engine startup
+        # Run snippet cleanup at engine startup (only if auto-purge is explicitly enabled)
         retention_days = int(self.cfg["audio"].get("retention_days", 30))
         snippets_dir = os.path.join(self.cfg["app"]["shared_dir"], "snippets")
-        try:
-            removed = self.storage.cleanup_old_snippets(retention_days, snippets_dir)
-            if removed:
-                print(f"[engine] Startup cleanup removed {removed} expired snippet(s)")
-        except Exception as e:
-            print(f"[engine] Startup cleanup error: {e}")
+        auto_purge = bool(self.cfg["audio"].get("auto_purge_enabled", False))
+        if auto_purge:
+            try:
+                removed = self.storage.cleanup_old_snippets(retention_days, snippets_dir)
+                if removed:
+                    print(f"[engine] Startup cleanup removed {removed} expired snippet(s)")
+            except Exception as e:
+                print(f"[engine] Startup cleanup error: {e}")
+        else:
+            print(f"[engine] Auto-purge disabled — skipping snippet cleanup (retention_days={retention_days})")
 
         self._check_disk_quota()
 
@@ -666,14 +671,15 @@ class Engine:
                     self.ha.publish_state(self.state.snapshot())
                     self._last_mqtt_publish = now_ts
 
-                # Periodic snippet cleanup (once per day)
+                # Periodic snippet cleanup (once per day, only if auto-purge enabled)
                 if time.time() - last_cleanup >= CLEANUP_INTERVAL:
-                    try:
-                        removed = self.storage.cleanup_old_snippets(retention_days, snippets_dir)
-                        if removed:
-                            print(f"[engine] Periodic cleanup removed {removed} expired snippet(s)")
-                    except Exception as e:
-                        print(f"[engine] Periodic cleanup error: {e}")
+                    if auto_purge:
+                        try:
+                            removed = self.storage.cleanup_old_snippets(retention_days, snippets_dir)
+                            if removed:
+                                print(f"[engine] Periodic cleanup removed {removed} expired snippet(s)")
+                        except Exception as e:
+                            print(f"[engine] Periodic cleanup error: {e}")
                     self._check_disk_quota()
                     # Periodic device validation — catch slow drift or silent mic swap
                     ok, msg = self.capture.validate_device()

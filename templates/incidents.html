@@ -4,18 +4,17 @@
   <h2>Incidents</h2>
   <table>
     <tr>
-      <th>ID</th><th>Start</th><th>End</th><th>Start dB</th><th>Peak</th><th>Avg</th><th>Duration</th>
+      <th>Start <span class="small" id="tz-offset-label"></span></th><th>End</th><th>Start dB</th><th>Peak</th><th>Avg</th><th>Duration</th>
       <th>Music</th><th>Beat</th><th>Class</th><th>Snippet</th><th>Notes</th><th>Delete</th>
     </tr>
     {% for r in rows %}
     <tr>
-      <td>{{ r.id }}</td>
-      <td>{{ r.start_ts }}</td>
-      <td>{{ r.end_ts or "" }}</td>
+      <td class="incident-ts" data-ts="{{ r.start_ts }}">{{ r.start_ts }}</td>
+      <td class="incident-ts" data-ts="{{ r.end_ts or '' }}">{{ r.end_ts or "" }}</td>
       <td>{{ r.start_db }}</td>
       <td>{{ r.peak_db }}</td>
       <td>{{ r.avg_db }}</td>
-      <td>{{ r.duration_sec or "" }}</td>
+      <td>{% if r.duration_sec is not none %}{% if r.duration_sec >= 3600 %}{{ "%.1f"|format(r.duration_sec / 3600) }}h{% elif r.duration_sec >= 60 %}{{ "%.1f"|format(r.duration_sec / 60) }}m{% else %}{{ r.duration_sec|int }}s{% endif %}{% endif %}</td>
       <td>{{ r.music_like_score }}</td>
       <td>{{ r.beat_confidence }}</td>
       <td>{{ r.classification }}</td>
@@ -52,11 +51,63 @@
 {% include '_popup.html' %}
 
 <script>
+/* Format incident timestamps: strip the offset suffix (shown once in the heading)
+   and display just the date + time. Detect offset from first row for the heading label. */
+(function () {
+  var cells = document.querySelectorAll('.incident-ts');
+  var offsetLabel = document.getElementById('tz-offset-label');
+  var offsetShown = false;
+
+  cells.forEach(function (td) {
+    var raw = td.getAttribute('data-ts');
+    if (!raw) { return; }
+
+    /* Extract and display timezone offset once in the heading */
+    if (!offsetShown) {
+      var offsetMatch = raw.match(/([+-]\d{2}:\d{2})$/);
+      if (offsetMatch && offsetLabel) {
+        offsetLabel.textContent = '(UTC ' + offsetMatch[1] + ')';
+      }
+      offsetShown = true;
+    }
+
+    /* Render as locale-appropriate short date+time */
+    try {
+      var d = new Date(raw);
+      td.textContent = d.toLocaleDateString([], { month:'short', day:'numeric' })
+        + ' ' + d.toLocaleTimeString([], { hour:'numeric', minute:'2-digit', second:'2-digit' });
+    } catch (e) {
+      /* Fallback: just strip the offset */
+      td.textContent = raw.replace(/[+-]\d{2}:\d{2}$/, '');
+    }
+  });
+})();
+</script>
+
+<script>
 /* Wire play buttons to the shared popup */
 document.querySelectorAll('.snippet-play-btn').forEach(function (btn) {
   btn.addEventListener('click', function () {
     showPopup(JSON.parse(btn.getAttribute('data-incident')));
   });
 });
+
+/* Pre-cache visible snippets so they survive going offline.
+   Waits for the SW to be active so fetches actually go through it —
+   on first visit the SW may still be installing when this code runs. */
+(function precacheVisibleSnippets() {
+  if (!('serviceWorker' in navigator)) { return; }
+  navigator.serviceWorker.ready.then(function () {
+    var btns = document.querySelectorAll('.snippet-play-btn');
+    btns.forEach(function (btn) {
+      try {
+        var inc = JSON.parse(btn.getAttribute('data-incident'));
+        if (inc.has_snippet && inc.id) {
+          fetch('/snippets/' + inc.id).catch(function () { /* offline — skip */ });
+        }
+      } catch (e) { /* malformed JSON — skip */ }
+    });
+  });
+})();
 </script>
 {% endblock %}

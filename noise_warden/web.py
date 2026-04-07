@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -87,7 +87,6 @@ def dashboard(request: Request):
         "ordinance_json": json.dumps(ORDINANCE),
         "borderline_margin_db": float(cfg["detection"].get("borderline_margin_db", 5.0)),
         "cfg": cfg,
-        "message": request.query_params.get("msg")
     })
 
 @app.get("/incidents", response_class=HTMLResponse)
@@ -122,11 +121,73 @@ def clear_all_incidents(request: Request):
 
 @app.get("/snippets/{incident_id}")
 def get_snippet(request: Request, incident_id: int):
+    """Serve an incident's WAV audio snippet with HTTP Range request support.
+
+    WHY THIS IS NOT A SIMPLE FileResponse:
+    ───────────────────────────────────────
+    Browser <audio> elements require Range request support for scrubbing/seeking.
+    When a user clicks the seek bar, the browser sends "Range: bytes=X-Y" and
+    expects a 206 Partial Content response with Content-Range headers. Starlette's
+    FileResponse (as of 0.38.x) returns 200 with the full file regardless,
+    which causes the browser to:
+      - Treat the audio as a non-seekable stream
+      - Reset the playhead to the start on any seek attempt
+      - Fail to display the correct duration until the entire file downloads
+
+    The Service Worker's maybeSliceForRange() handles this for CACHED snippets,
+    but on the first load (before the SW caches the response), the browser talks
+    directly to this route. Both layers are needed:
+      - This route:  handles Range for first-load / uncached requests
+      - The SW:      handles Range for cached / offline requests
+
+    DO NOT replace this with FileResponse without verifying Range support.
+    This has broken audio scrubbing in at least two previous releases.
+    """
     row = storage.get_incident(incident_id)
     if not row or not row.get("snippet_path") or not os.path.exists(row["snippet_path"]):
         raise HTTPException(status_code=404)
-    # FileResponse manages the file handle lifecycle properly
-    return FileResponse(row["snippet_path"], media_type="audio/wav")
+
+    file_path = row["snippet_path"]
+    file_size = os.path.getsize(file_path)
+
+    # Common headers for all responses — Accept-Ranges tells the browser
+    # that this endpoint supports partial content requests.
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "audio/wav",
+    }
+
+    range_header = request.headers.get("range")
+    if range_header:
+        # Parse "bytes=START-END" (END is optional; omitted = rest of file)
+        import re
+        match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2)) if match.group(2) else file_size - 1
+
+            # Clamp to file bounds
+            start = min(start, file_size - 1)
+            end = min(end, file_size - 1)
+
+            content_length = end - start + 1
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                data = f.read(content_length)
+
+            return Response(
+                content=data,
+                status_code=206,
+                headers={
+                    **base_headers,
+                    "Content-Length": str(content_length),
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
+                },
+            )
+
+    # No Range header — return the full file with Accept-Ranges so the browser
+    # knows it can make Range requests for subsequent seeks.
+    return FileResponse(file_path, media_type="audio/wav", headers={"Accept-Ranges": "bytes"})
 
 @app.get("/sw.js")
 def service_worker():
@@ -338,7 +399,7 @@ def pause(request: Request):
     must_auth(request)
     engine.set_armed(False)
     _persist_armed(False)
-    return RedirectResponse(url="/?msg=paused", status_code=303)
+    return RedirectResponse(url="/", status_code=303)
 
 @app.get("/thresholds", response_class=HTMLResponse)
 def thresholds(request: Request):
@@ -347,12 +408,19 @@ def thresholds(request: Request):
     now = datetime.now()
     rule_name, threshold = applicable_threshold(cfg, now)
     night = is_night(now, cfg["detection"]["night_start_hour"], cfg["detection"]["night_end_hour"])
+
+    # Only categories the engine actually evaluates (continuous + intermittent).
+    # Other categories (e.g., commerce_industry_A1) are in the ordinance data for
+    # reference but never used in threshold comparisons.
+    ACTIVE_CATEGORIES = {"continuous_A2_A3", "intermittent_A2_A3", "impulse_A1_A3"}
+    active_thresholds = {k: v for k, v in zone_data.items() if k in ACTIVE_CATEGORIES}
+
     return templates.TemplateResponse("thresholds.html", {
         "request": request,
         "ordinance": ORDINANCE,
         "cfg": cfg,
         "zone_label": zone.replace("_", " ").title(),
-        "zone_thresholds": zone_data,
+        "zone_thresholds": active_thresholds,
         "active_rule": rule_name,
         "active_threshold": threshold,
         "period": "night" if night else "day",
@@ -363,7 +431,7 @@ def resume(request: Request):
     must_auth(request)
     engine.set_armed(True)
     _persist_armed(True)
-    return RedirectResponse(url="/?msg=resumed", status_code=303)
+    return RedirectResponse(url="/", status_code=303)
 
 @app.post("/control/recording")
 def toggle_recording(request: Request, enabled: str = Form(...)):
@@ -371,8 +439,8 @@ def toggle_recording(request: Request, enabled: str = Form(...)):
     must_auth(request)
     new_val = enabled.lower() == "true"
     cfg["audio"]["recording_enabled"] = new_val
-    msg = "recording-enabled" if new_val else "recording-disabled"
-    return RedirectResponse(url=f"/?msg={msg}", status_code=303)
+    state.set(recording_enabled=new_val)
+    return RedirectResponse(url="/", status_code=303)
 
 VALID_DETECTION_MODES = {"continuous", "intermittent", "continuous_music_focus"}
 
@@ -407,14 +475,14 @@ def force_incident(request: Request):
     """Force-start a test incident for verifying recording and playback."""
     must_auth(request)
     engine.force_incident()
-    return RedirectResponse(url="/?msg=forced-incident-started", status_code=303)
+    return RedirectResponse(url="/", status_code=303)
 
 @app.post("/control/end-forced-incident")
 def end_forced_incident(request: Request):
     """End a force-started test incident."""
     must_auth(request)
     engine.end_forced_incident()
-    return RedirectResponse(url="/?msg=forced-incident-ended", status_code=303)
+    return RedirectResponse(url="/", status_code=303)
 
 @app.get("/export.csv")
 def export_csv(request: Request):

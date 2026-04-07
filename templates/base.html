@@ -19,10 +19,10 @@
   <a href="/">Dashboard</a>
   <a href="/timeline">Timeline</a>
   <a href="/incidents">Incidents</a>
-  <a href="/build">Build</a>
-  <a href="/config">Config</a>
   <a href="/thresholds">Thresholds</a>
-  <a href="/calibration">Calibration</a>
+  <a href="/build">Build</a>
+  <a href="/config" class="online-only-link">Config</a>
+  <a href="/calibration" class="online-only-link">Calibration</a>
   <button id="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark mode">🌓</button>
 </nav>
 <div class="wrap">
@@ -46,6 +46,70 @@ function toggleTheme() {
       a.classList.add('active');
     }
   });
+})();
+
+/* Offline detection: disable mutation-heavy pages and hide save/delete buttons.
+   Config and Calibration pages require network to save changes — navigating to
+   them offline would show stale forms with non-functional save buttons. */
+(function () {
+  function applyOfflineState(offline) {
+    // Dim and disable Config/Calibration nav links
+    document.querySelectorAll('.online-only-link').forEach(function (link) {
+      if (offline) {
+        link.classList.add('disabled-offline');
+        link.setAttribute('data-href', link.getAttribute('href'));
+        link.removeAttribute('href');
+        link.title = 'Unavailable offline';
+      } else {
+        link.classList.remove('disabled-offline');
+        var savedHref = link.getAttribute('data-href');
+        if (savedHref) {
+          link.setAttribute('href', savedHref);
+        }
+        link.title = '';
+      }
+    });
+
+    // Hide all destructive/mutation buttons and forms when offline
+    document.querySelectorAll('.destructive, form[method="post"]').forEach(function (el) {
+      if (offline) {
+        el.classList.add('hidden-offline');
+      } else {
+        el.classList.remove('hidden-offline');
+      }
+    });
+
+    // Show a small offline indicator
+    var indicator = document.getElementById('offline-indicator');
+    if (indicator) {
+      indicator.style.display = offline ? 'block' : 'none';
+    }
+  }
+
+  // Create a subtle offline indicator bar
+  var bar = document.createElement('div');
+  bar.id = 'offline-indicator';
+  bar.textContent = '⚡ Offline — viewing cached data. Controls disabled.';
+  bar.style.display = 'none';
+  document.querySelector('.wrap').prepend(bar);
+
+  // Initial check + event listeners for online/offline transitions
+  if (!navigator.onLine) { applyOfflineState(true); }
+  window.addEventListener('offline', function () { applyOfflineState(true); });
+  window.addEventListener('online', function () { applyOfflineState(false); });
+})();
+
+/* Register the Service Worker globally so all pages benefit from caching.
+   The SW intercepts /snippets/ fetches (caching them for offline use) and
+   handles cached page responses. Previously only registered from the
+   timeline page, meaning snippet plays from dashboard or incidents wouldn't
+   populate the cache until the user had visited the timeline at least once. */
+(function () {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(function () {
+      // Registration failed — pages still function, just no offline support
+    });
+  }
 })();
 </script>
 </body>

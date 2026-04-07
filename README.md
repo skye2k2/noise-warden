@@ -460,17 +460,15 @@ Add to crontab (`crontab -e`):
 
 <details>
 
-- TODO: Thresholds page `zone_thresholds` table includes `commerce_industry_A1` which the engine never uses — filter to only relevant categories, or clearly label which rows are active
+### Speculative / future use cases
+
 - TODO: What if someone wants to use this for identifying overall dog nuisance? Dog barks have a particular noise pattern, and could even be categorized with some spectrographic analysis into "dog1", "dog2", for individual incidents and later tagged with names/locations, etc. Would this just completely break _my_ use case?
-- TODO: Dashboard: I don't understand the meaning behind the Mode table column, or the entries of "respond"
-- TODO: Add warning states for nonstandard modes of the status buttons, for when detection is disabled, recording is disabled, or a force-test is active.
-- TODO: Config: We have an entire thresholds page and configuration yaml file with a detection section, but only a single entry that seems related to the noise ordinances we want to utilize in our configuration. We should probably have an ordinances section, which is deliberate and avoids magic numbers that are specific to my location in our threshold logic
-- TODO: Dashboard: Running: true doesn't make sense to include in the ui--I have also never seen it as any other value, and if we are connecting to the webapp, it is obviously running, right? I anticipate that this is because the web app is just surfacing the state that is surfaced to home assistant
-- TODO: Did maybe the data not update in the webapp quickly enough?
+- TODO: Consider alternate usage scenario as a cheap sleep snoring monitor--enabled for _nighttime_ only, coupled with a deep sleep monitor, some correlations could be determined. And easier than having a recorder run _all_ night, and then needing to scrub eight hours of recording for potential data.
+- TODO: Ensure that birdsong does not trigger incidents (minimal bass, despite a loud, piercing melody, especially if directly on my roof). Would require a high-frequency-only exclusion filter, similar to how the mower/rain/thunder filters work but targeting the 2–8 kHz band with high spectral flatness and no low-band energy.
 
-### Observations from initial test pilot
+### Architecture
 
-- Uncalibrated microphone test run recorded very regularly choppy audio with a wideband sample rate. don't know if the was due to some built-in aec, or our recording algorithm, or if that is what happens when we don't calibrate, but whatever it is, we will need it resolved
+- TODO: **Externalize ordinance thresholds from `ordinance.py` into `noise_warden.yaml`** — Currently, the Pleasant Grove UT thresholds are hardcoded in `ordinance.py` as a Python dict. The thresholds page, config page, and engine all reference this hardcoded data. A proper `ordinance:` section in the YAML would: (a) make thresholds user-editable without touching source code, (b) eliminate magic numbers specific to one city from the codebase, (c) allow the thresholds page to stitch together config + ordinance data for a complete picture, and (d) make evidence logs more credible by having explicit, traceable ordinance references. The YAML section should include: city name, ordinance section reference, day/night hour boundaries, zone-specific dB thresholds per category (continuous, intermittent, impulse), measurement guidance (weighting, mic placement), and legal notes. `ordinance.py` becomes a loader that reads from config instead of a hardcoded dict. All existing test assertions against `ORDINANCE` values need to be updated to use fixture-injected config.
 
 ### Functionality
 

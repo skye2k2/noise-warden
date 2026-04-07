@@ -291,7 +291,7 @@ class TestSnippetEndpoint:
         assert resp.status_code == 404
 
     def test_snippet_with_valid_file(self, client, storage, tmp_path):
-        """If a snippet file exists, it should be served."""
+        """If a snippet file exists, it should be served with Accept-Ranges header."""
         snippet_file = tmp_path / "test_snippet.wav"
         snippet_file.write_bytes(b"RIFF fake wav content")
 
@@ -308,6 +308,55 @@ class TestSnippetEndpoint:
         resp = client.get(f"/snippets/{iid}")
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "audio/wav"
+        # Accept-Ranges must be present so browsers know scrubbing is supported
+        assert resp.headers.get("accept-ranges") == "bytes"
+
+    def test_snippet_range_request_returns_206(self, client, storage, tmp_path):
+        """Range requests must return 206 Partial Content — this is what makes
+        <audio> scrubbing work. Without it, browsers treat the audio as a
+        non-seekable stream. This has broken in multiple previous releases."""
+        snippet_file = tmp_path / "test_range.wav"
+        content = b"RIFF" + (b"\x00" * 100) + b"fake wav content for range test"
+        snippet_file.write_bytes(content)
+
+        sample = {
+            "start_ts": "2026-04-01T12:00:00+00:00",
+            "start_db": 72.5, "peak_db": 72.5, "avg_db": 72.5,
+            "threshold_db": 65.0, "music_like_score": 0.78,
+            "beat_confidence": 0.45, "classification": "music_like",
+            "mode": "respond", "responded": 0, "merge_count": 0,
+            "snippet_path": str(snippet_file), "notes": "",
+        }
+        iid = storage.create_incident(sample)
+
+        # Request a specific byte range (like a browser seeking within <audio>)
+        resp = client.get(f"/snippets/{iid}", headers={"Range": "bytes=10-49"})
+        assert resp.status_code == 206
+        assert resp.headers["content-type"] == "audio/wav"
+        assert "bytes 10-49/" in resp.headers["content-range"]
+        assert int(resp.headers["content-length"]) == 40
+        assert resp.content == content[10:50]
+
+    def test_snippet_range_open_ended(self, client, storage, tmp_path):
+        """Open-ended Range (bytes=X-) should return from X to end of file."""
+        snippet_file = tmp_path / "test_range_open.wav"
+        content = b"A" * 200
+        snippet_file.write_bytes(content)
+
+        sample = {
+            "start_ts": "2026-04-01T12:00:00+00:00",
+            "start_db": 72.5, "peak_db": 72.5, "avg_db": 72.5,
+            "threshold_db": 65.0, "music_like_score": 0.78,
+            "beat_confidence": 0.45, "classification": "music_like",
+            "mode": "respond", "responded": 0, "merge_count": 0,
+            "snippet_path": str(snippet_file), "notes": "",
+        }
+        iid = storage.create_incident(sample)
+
+        resp = client.get(f"/snippets/{iid}", headers={"Range": "bytes=150-"})
+        assert resp.status_code == 206
+        assert int(resp.headers["content-length"]) == 50
+        assert f"bytes 150-199/200" in resp.headers["content-range"]
 
 
 # ---------------------------------------------------------------------------
@@ -507,4 +556,4 @@ class TestServiceWorker:
 
     def test_sw_contains_cache_strategy(self, client):
         resp = client.get("/sw.js")
-        assert "noise-warden-timeline" in resp.text
+        assert "noise-warden-cache-v10" in resp.text
