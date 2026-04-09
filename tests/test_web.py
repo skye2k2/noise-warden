@@ -185,6 +185,23 @@ class TestPostMutations:
         assert resp.status_code == 303
         assert storage.count_incidents() == 0
 
+    def test_seed_from_classification_data(self, client, storage, tmp_path):
+        """POST /incidents/seed seeds the DB when empty, blocks when not."""
+        # Should succeed when empty
+        assert storage.count_incidents() == 0
+        resp = client.post("/incidents/seed", follow_redirects=False)
+        assert resp.status_code == 303
+        assert "seeded" in resp.headers.get("location", "")
+        seeded_count = storage.count_incidents()
+        assert seeded_count > 0
+
+        # Should block when DB already has incidents
+        resp = client.post("/incidents/seed", follow_redirects=False)
+        assert resp.status_code == 303
+        assert "seed-blocked" in resp.headers.get("location", "")
+        # Count unchanged — no duplicates
+        assert storage.count_incidents() == seeded_count
+
     def test_save_notes(self, client, storage):
         sample = {
             "start_ts": "2026-04-01T12:00:00+00:00",
@@ -557,3 +574,130 @@ class TestServiceWorker:
     def test_sw_contains_cache_strategy(self, client):
         resp = client.get("/sw.js")
         assert "noise-warden-cache-v10" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Reclassify API endpoint
+# ---------------------------------------------------------------------------
+
+# Canned analyze_clip result used by all reclassify tests
+_MOCK_ANALYZE_RESULT = {
+    "blocks": [],
+    "journal": [(0, "mower"), (4, "unknown")],
+    "dominant": "mower",
+    "db_history": [72.0, 73.5],
+    "peak_db": 73.5,
+    "avg_db": 72.1,
+    "filter_counts": {"mower": 4, "none": 2},
+    "n_blocks": 6,
+}
+
+
+class TestReclassifyEndpoint:
+
+    def _create_incident_with_snippet(self, storage, tmp_path, classification="music_like"):
+        """Helper: create an incident whose snippet_path points to a real file."""
+        wav = tmp_path / "snippet.wav"
+        wav.write_bytes(b"RIFF" + b"\x00" * 44)
+        inc = {
+            "start_ts": "2026-04-01T12:00:00+00:00",
+            "start_db": 72.5,
+            "peak_db": 72.5,
+            "avg_db": 72.5,
+            "threshold_db": 65.0,
+            "music_like_score": 0.78,
+            "beat_confidence": 0.45,
+            "classification": classification,
+            "mode": "respond",
+            "responded": 0,
+            "merge_count": 0,
+            "snippet_path": str(wav),
+            "notes": "",
+        }
+        return storage.create_incident(inc)
+
+    @patch("noise_warden.web.analyze_clip", return_value=_MOCK_ANALYZE_RESULT)
+    def test_reclassify_returns_comparison(self, mock_ac, client, storage, tmp_path):
+        iid = self._create_incident_with_snippet(storage, tmp_path)
+        resp = client.post(f"/incidents/{iid}/reclassify")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["incident_id"] == iid
+        assert data["old_classification"] == "music_like"
+        assert data["new_classification"] == "mower"
+        assert data["changed"] is True
+        assert data["applied"] is False
+        assert "journal" in data
+        assert "filter_counts" in data
+
+    @patch("noise_warden.web.analyze_clip", return_value=_MOCK_ANALYZE_RESULT)
+    def test_reclassify_with_apply_updates_db(self, mock_ac, client, storage, tmp_path):
+        iid = self._create_incident_with_snippet(storage, tmp_path)
+        resp = client.post(f"/incidents/{iid}/reclassify?apply=true")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["applied"] is True
+        assert data["changed"] is True
+
+        # Verify the DB was actually updated
+        updated = storage.get_incident(iid)
+        assert updated["classification"] == "mower"
+
+    @patch("noise_warden.web.analyze_clip", return_value={
+        **_MOCK_ANALYZE_RESULT, "dominant": "music_like", "journal": [],
+    })
+    def test_reclassify_unchanged_not_applied(self, mock_ac, client, storage, tmp_path):
+        """When classification AND journal are both the same, apply=true should
+        still report applied=False. (Journal-only changes are now applied.)"""
+        iid = self._create_incident_with_snippet(storage, tmp_path, classification="music_like")
+        resp = client.post(f"/incidents/{iid}/reclassify?apply=true")
+        data = resp.json()
+        assert data["changed"] is False
+        assert data["applied"] is False
+
+    @patch("noise_warden.web.analyze_clip", return_value={
+        **_MOCK_ANALYZE_RESULT, "dominant": "music_like",
+    })
+    def test_reclassify_journal_only_change_applied(self, mock_ac, client, storage, tmp_path):
+        """When classification matches but journal differs, changed=True and
+        apply commits the updated journal to the database."""
+        iid = self._create_incident_with_snippet(storage, tmp_path, classification="music_like")
+        resp = client.post(f"/incidents/{iid}/reclassify?apply=true")
+        data = resp.json()
+        assert data["class_changed"] is False
+        assert data["journal_changed"] is True
+        assert data["changed"] is True
+        assert data["applied"] is True
+
+        # Verify the DB was updated with the new journal
+        import json
+        updated = storage.get_incident(iid)
+        assert updated["classification"] == "music_like"  # unchanged
+        assert json.loads(updated["class_journal"]) == [[0, "mower"], [4, "unknown"]]
+
+    def test_reclassify_missing_incident_404(self, client):
+        resp = client.post("/incidents/99999/reclassify")
+        assert resp.status_code == 404
+
+    def test_reclassify_missing_snippet_404(self, client, storage, sample_incident):
+        """Incident exists but has no snippet_path — should 404."""
+        sample_incident["snippet_path"] = None
+        iid = storage.create_incident(sample_incident)
+        resp = client.post(f"/incidents/{iid}/reclassify")
+        assert resp.status_code == 404
+
+    @patch("noise_warden.web.analyze_clip", return_value=_MOCK_ANALYZE_RESULT)
+    def test_reclassify_auth_rejected(self, mock_ac, web_app, client, storage, tmp_path):
+        """With auth enabled, a bad token should be rejected."""
+        import noise_warden.web as web_mod
+        web_mod.cfg["app"]["auth_token"] = "secret-test-token"
+
+        iid = self._create_incident_with_snippet(storage, tmp_path)
+        resp = client.post(
+            f"/incidents/{iid}/reclassify",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert resp.status_code == 401
+
+        # Restore
+        web_mod.cfg["app"]["auth_token"] = ""

@@ -5,9 +5,9 @@
   <p>
     <span class="pill" id="pill-armed">Armed: {{ state.armed }}</span>
     <span class="pill" id="pill-mic">Mic OK: {{ state.mic_ok }}</span>
-    <span class="pill" id="pill-mode">Mode: {{ state.mode }}</span>
-    <span class="pill" id="pill-db">Current dB: {{ state.current_db }}</span>
     <span class="pill" id="pill-threshold">Threshold: {{ state.current_threshold_db }}</span>
+    <span class="pill" id="pill-db">Current dB: {{ state.current_db }}</span>
+    <span class="pill" id="pill-mode" {% if state.mode == 'incident_active' %}style="background:#27ae60;color:#fff"{% endif %}>Mode: {{ state.mode }}</span>
     <span class="pill" id="pill-disk" style="{% if state.disk_warning %}background:#e74c3c;color:#fff{% endif %}">Disk: {{ state.disk_warning or ('%.0f MB free' | format(state.disk_free_mb|default(0, true))) }}</span>
   </p>
   <p class="small">Status updates every 5 seconds from in-memory state (no database reads).</p>
@@ -20,7 +20,7 @@
     {% if not cfg.audio.recording_enabled %}
     <p class="warning-banner" id="warn-no-record">⚠ Recording is <strong>disabled</strong> — incidents log dB data only, no audio snippets.</p>
     {% endif %}
-    {% if state.active_incident_id %}
+    {% if state.forced_test %}
     <p class="warning-banner warning-info" id="warn-force-test">ℹ A test incident is <strong>active</strong> — force-end it when finished testing.</p>
     {% endif %}
   </div>
@@ -71,20 +71,47 @@
 <div class="card">
   <h3>Recent Incidents ({{ incidents|length }})</h3>
   <table>
-    <tr><th>Start <span class="small" id="tz-offset-label"></span></th><th>Duration</th><th>Excess</th><th>Music Score</th><th></th></tr>
+    <tr><th>Start <span class="small" id="tz-offset-label"></span></th><th>Duration</th><th>Excess</th><th title="music · music_like · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · conversation · drive_by · forced_test">Class</th><th></th></tr>
     {% for r in incidents %}
     <tr>
       <td class="incident-ts" data-ts="{{ r.start_ts }}">{{ r.start_ts }}</td>
       <td>{% if r.duration_sec is not none %}{% if r.duration_sec >= 3600 %}{{ "%.1f"|format(r.duration_sec / 3600) }}h{% elif r.duration_sec >= 60 %}{{ "%.1f"|format(r.duration_sec / 60) }}m{% else %}{{ r.duration_sec|int }}s{% endif %}{% endif %}</td>
-      <td>{% if r.start_db and r.threshold_db %}(+{{ "%.1f"|format(r.start_db - r.threshold_db) }}dB){% endif %}</td>
-      <td>{{ r.music_like_score }}</td>
+      <td>{% if r.peak_db and r.threshold_db %}<span class="excess-cell" data-excess="{{ "%.1f"|format(r.peak_db - r.threshold_db) }}">(+{{ "%.1f"|format(r.peak_db - r.threshold_db) }}dB)</span>{% endif %}</td>
+      <td>{{ r.classification or "unknown" }}</td>
       <td>{% if r.snippet_path %}<button class="snippet-play-btn"
-        data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
+        data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "class_journal": r.class_journal or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
         title="Play audio snippet">&#9654;</button>{% endif %}</td>
     </tr>
     {% endfor %}
   </table>
 </div>
+
+<script>
+/* Severity color mapping — shared by dB pill and excess column.
+   Thresholds match the popup's excess badge tiers for visual consistency.
+   Returns {background, color} or null if below threshold / no data. */
+function dbSeverityStyle(excessDb) {
+  if (excessDb == null || isNaN(excessDb) || excessDb <= 0) { return null; }
+  if (excessDb >= 40) { return { background: '#c0392b', color: '#fff' }; }
+  if (excessDb >= 30) { return { background: '#e74c3c', color: '#fff' }; }
+  if (excessDb >= 25) { return { background: '#e67e22', color: '#fff' }; }
+  if (excessDb >= 15) { return { background: '#f39c12', color: '#fff' }; }
+  return { background: '#f39c12', color: '#fff' };
+}
+
+/* Apply severity colors to excess column cells on initial render */
+(function () {
+  document.querySelectorAll('.excess-cell').forEach(function (el) {
+    var s = dbSeverityStyle(parseFloat(el.getAttribute('data-excess')));
+    if (s) {
+      el.style.background = s.background;
+      el.style.color = s.color;
+      el.style.borderRadius = '4px';
+      el.style.padding = '2px 6px';
+    }
+  });
+})();
+</script>
 
 <script>
 /* Format incident timestamps: strip the offset suffix (shown once in the heading)
@@ -144,6 +171,32 @@
         }
       }
 
+      // Green mode pill when actively recording an incident
+      var modePill = pills.mode.el;
+      if (modePill) {
+        if (data.mode === 'incident_active') {
+          modePill.style.background = '#27ae60';
+          modePill.style.color = '#fff';
+        } else {
+          modePill.style.background = '';
+          modePill.style.color = '';
+        }
+      }
+
+      // Severity color on the current dB pill — reflects how far above threshold
+      var dbPill = pills.current_db.el;
+      if (dbPill && data.current_db != null && data.current_threshold_db != null) {
+        var excess = data.current_db - data.current_threshold_db;
+        var sev = dbSeverityStyle(excess);
+        if (sev) {
+          dbPill.style.background = sev.background;
+          dbPill.style.color = sev.color;
+        } else {
+          dbPill.style.background = '';
+          dbPill.style.color = '';
+        }
+      }
+
       // Disk warning gets special treatment: red background when warning is active
       if (diskPill) {
         if (data.disk_warning) {
@@ -167,7 +220,7 @@
         if (data.recording_enabled === false) {
           html += '<p class="warning-banner">⚠ Recording is <strong>disabled</strong> — incidents log dB data only, no audio snippets.</p>';
         }
-        if (data.active_incident_id) {
+        if (data.forced_test) {
           html += '<p class="warning-banner warning-info">ℹ A test incident is <strong>active</strong> — end it when finished testing.</p>';
         }
         banners.innerHTML = html;

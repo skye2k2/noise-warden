@@ -8,14 +8,13 @@ import numpy as np
 #   - Primary mic: pointed at the noise source (neighbor's property)
 #   - Reference mic: pointed at our own speaker/amp (captures self-noise)
 #
-# Both require _CALLBACK_STREAMS_ENABLED = True in audio.py so that two
-# AudioCapture instances can run concurrently on separate USB devices.
+# Both require two AudioCapture instances running concurrently on separate
+# USB devices (callback streaming handles this natively).
 #
 # Neither plugin is wired into the engine loop yet. When ready:
-#   1. Enable callback streams in audio.py
-#   2. Create a second AudioCapture for the reference device
-#   3. Call plugin.process(primary_block, reference_block) before dB calculation
-#   4. Use the cleaned output for threshold comparison and WAV recording
+#   1. Create a second AudioCapture for the reference device
+#   2. Call plugin.process(primary_block, reference_block) before dB calculation
+#   3. Use the cleaned output for threshold comparison and WAV recording
 # ---------------------------------------------------------------------------
 
 

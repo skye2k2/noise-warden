@@ -79,6 +79,36 @@ class TestSoftDelete:
         tmp_storage.soft_delete_all_incidents()
         assert tmp_storage.count_incidents() == 0
 
+    def test_hard_clear_resets_id_counter(self, tmp_storage, sample_incident):
+        """hard_clear_all_incidents should delete all rows and reset autoincrement
+        so the next incident starts at ID 1."""
+        for _ in range(5):
+            tmp_storage.create_incident(sample_incident)
+        assert tmp_storage.count_incidents() == 5
+
+        tmp_storage.hard_clear_all_incidents()
+        assert tmp_storage.count_incidents() == 0
+
+        # Next incident should get ID 1, not 6
+        new_id = tmp_storage.create_incident(sample_incident)
+        assert new_id == 1
+
+    def test_hard_clear_removes_soft_deleted_too(self, tmp_storage, sample_incident):
+        """hard_clear should remove even previously soft-deleted incidents."""
+        iid = tmp_storage.create_incident(sample_incident)
+        tmp_storage.soft_delete_incident(iid)
+        # Soft-deleted row still exists in DB, just hidden from queries
+        tmp_storage.hard_clear_all_incidents()
+
+        # Confirm truly gone — create new incident, ID should be 1
+        new_id = tmp_storage.create_incident(sample_incident)
+        assert new_id == 1
+
+    def test_hard_clear_on_empty_is_safe(self, tmp_storage):
+        """Calling hard_clear on an empty table doesn't error."""
+        tmp_storage.hard_clear_all_incidents()
+        assert tmp_storage.count_incidents() == 0
+
 
 # ---------------------------------------------------------------------------
 # Listing & counting
@@ -348,3 +378,64 @@ class TestAutodismissedCleanup:
         assert removed == 1
         assert not os.path.exists(old_file)
         assert os.path.exists(new_file)
+
+
+# ---------------------------------------------------------------------------
+# Excluded incidents
+# ---------------------------------------------------------------------------
+
+class TestExcludedIncidents:
+
+    def test_excluded_column_defaults_to_zero(self, tmp_storage, sample_incident):
+        """Normal incidents should have excluded=0 by default."""
+        iid = tmp_storage.create_incident(sample_incident)
+        row = tmp_storage.get_incident(iid)
+        assert row["excluded"] == 0
+
+    def test_excluded_can_be_set_on_create(self, tmp_storage, sample_incident):
+        """Excluded incidents (filter hits) should be stored with excluded=1."""
+        row = dict(sample_incident)
+        row["classification"] = "thunder"
+        row["excluded"] = 1
+        iid = tmp_storage.create_incident(row)
+        inc = tmp_storage.get_incident(iid)
+        assert inc["excluded"] == 1
+        assert inc["classification"] == "thunder"
+
+    def test_list_excludes_excluded_by_default(self, tmp_storage, sample_incident):
+        """Default list_incidents should not include excluded incidents."""
+        tmp_storage.create_incident(sample_incident)
+        excluded = dict(sample_incident)
+        excluded["classification"] = "mower"
+        excluded["excluded"] = 1
+        tmp_storage.create_incident(excluded)
+        rows = tmp_storage.list_incidents()
+        assert len(rows) == 1
+        assert rows[0]["classification"] == "music_like"
+
+    def test_list_includes_excluded_when_requested(self, tmp_storage, sample_incident):
+        """include_excluded=True should return all incidents."""
+        tmp_storage.create_incident(sample_incident)
+        excluded = dict(sample_incident)
+        excluded["classification"] = "mower"
+        excluded["excluded"] = 1
+        tmp_storage.create_incident(excluded)
+        rows = tmp_storage.list_incidents(include_excluded=True)
+        assert len(rows) == 2
+
+    def test_schema_migration_adds_excluded_column(self, tmp_path):
+        """A fresh database should have the excluded column via migration 2+."""
+        s = Storage(str(tmp_path / "test.db"))
+        with s.conn() as c:
+            version = c.execute("PRAGMA user_version").fetchone()[0]
+            assert version == 3
+            # Verify the column exists by inserting with excluded=1
+            row = {
+                "start_ts": "2026-04-01T12:00:00+00:00", "start_db": 70, "peak_db": 70,
+                "avg_db": 70, "threshold_db": 65, "music_like_score": 0.5,
+                "beat_confidence": 0.3, "classification": "rain", "mode": "respond",
+                "excluded": 1,
+            }
+            iid = s.create_incident(row)
+            inc = s.get_incident(iid)
+            assert inc["excluded"] == 1

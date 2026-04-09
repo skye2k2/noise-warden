@@ -7,24 +7,27 @@ app:
   auth_token: ""  # optional bearer token; blank disables auth (LAN only)
 
 audio:
-  sample_rate: 22050       # 22050 (wideband), 44100 (CD quality), or 48000 (studio). Lower = smaller files
-  block_seconds: 1.0        # Seconds per audio capture block. 1.0 is standard; smaller = more I/O overhead
-  input_device: null
+  sample_rate: 22050                 # 22050 (wideband), 44100 (CD quality), or 48000 (studio). Lower = smaller files
+  block_seconds: 1.0                 # Seconds per audio capture block. 1.0 is standard; smaller = more I/O overhead
+  input_device: null                 # null = default audio device
   input_channels: 1
-  # reference_device: null   # Secondary mic device for dual-mic reference subtraction (see plugins)
+  # reference_device: null           # Secondary mic device for dual-mic reference subtraction (see plugins)
   recording_enabled: true
-  snippet_pre_seconds: 12
+  snippet_pre_seconds: 2
   snippet_post_seconds: 8
   chunk_flush_seconds: 30
-  max_incident_record_hours: 6
-  retention_days: 30
-  auto_purge_enabled: false     # Set to true to automatically delete snippets and incidents older than retention_days
+  max_incident_record_hours: 6       # Maximum hours to recording as a single incident, even if it keeps exceeding the threshold. Prevents runaway disk usage from a sustained noise source.
+  retention_days: 30                 # IF auto_purge_enabled, how many days to keep snippets and incidents before auto-deletion
+  auto_purge_enabled: false          # Set to true to automatically delete snippets and incidents older than retention_days
 
 detection:
   zone: residential_agricultural
-  mode: continuous_music_focus   # continuous | intermittent | continuous_music_focus
-  armed: true                    # Set to false by Pause button; persisted across watch-mode reloads
-  noise_floor_db: 50.0           # Ambient gate — signals below this dBA skip DSP analysis entirely
+  mode: continuous_music_focus       # continuous | intermittent | continuous_music_focus
+  armed: true                        # Set to false by Pause button; persisted across watch-mode reloads
+  # Borderline margin: incidents within this many dB above the threshold are tagged
+  # as borderline and hidden by default on the timeline (still recorded for the full log).
+  borderline_margin_db: 5.0          # -X dB overhead to allow for calibration imperfections and natural volume fluctuations.
+  noise_floor_db: 50.0                # Ambient gate — signals below this dBA skip DSP analysis entirely
   calibration_offset_db: 88.0
   # Day/night thresholds use the Pi's system clock. Ensure `timedatectl set-timezone`
   # matches the ordinance jurisdiction (e.g. America/Denver for Pleasant Grove, UT).
@@ -35,26 +38,66 @@ detection:
   min_music_like_score: 0.62
   min_beat_confidence: 0.38
   impulse_peak_delta_db: 14.0
+  # Filter holdover: once a filter runs for holdover_min_run consecutive blocks,
+  # it persists through up to holdover_max_gap unmatched blocks. Prevents mower
+  # stop/restart gaps from fragmenting into unknown/impulse journal entries.
+  holdover_min_run: 5                # Minimum consecutive blocks to establish a filter
+  holdover_max_gap: 12               # Maximum unmatched blocks before holdover expires
   thunder_peak_delta_db: 18.0
+  thunder_lowband_min: 0.55          # Minimum lowband_ratio — thunder is bass-dominant
+  thunder_flatness_min: 0.45          # Minimum spectral flatness — thunder is broadband rumble
   rain_flatness_threshold: 0.72
   rain_low_variance_db: 2.5
-  mower_flatness_threshold: 0.60
+  # Birdsong targeting: high-frequency dominant, minimal bass, stable amplitude.
+  # Targets the 2–8 kHz band typical of songbirds. Lowband raised from 0.10 to
+  # 0.15 after continuous capture showed background fan/HVAC adds ~0.11 lowband.
+  # Flatness lowered from 0.50 to 0.30 after robin chirps showed only 0.09–0.43.
+  birdsong_highband_min: 0.70        # mower has 0.58–0.83; birds should be higher
+  birdsong_lowband_max: 0.15         # Allow incidental white noise bass from surroundings (fan/HVAC hum, etc.)
+  birdsong_flatness_min: 0.30         # Robin chirps have sharp harmonics (0.09–0.43)
+  birdsong_amplitude_std_max: 3.0    # Real birdsong should be quite stable
+  birdsong_min_history: 8            # Minimum db_history length before birdsong filter activates
+  mower_flatness_threshold: 0.25      # Real mower measured 0.26-0.49
   mower_centroid_min_hz: 300
-  mower_centroid_max_hz: 3000
-  allow_response_night: false
+  mower_centroid_max_hz: 4000        # Real mower reached 3450 Hz; widened from 3000
+  mower_env_std_max: 4.5             # Maximum dB std dev — allows for some variation
+  mower_min_db: 70.0                 # Minimum dBA floor — rejects quiet fan/HVAC hum
+  # Weedwhacker targeting: high-pitched mechanical whine (2–6 kHz).
+  # Checked before mower since their centroid ranges can overlap at the boundary.
+  weedwhacker_centroid_min_hz: 2000
+  weedwhacker_centroid_max_hz: 6000
+  weedwhacker_flatness_min: 0.50      # Raised from 0.45 — real mower flatness spikes to 0.46, avoid overlap
+  weedwhacker_lowband_max: 0.15      # No significant bass
+  weedwhacker_env_std_max: 5.0       # Operator movement adds some variance
+  # Truck rumble targeting: sustained low-frequency drone.
+  # Checked after mower since diesel has a lower centroid and more bass.
+  diesel_centroid_max_hz: 400        # Rumble is concentrated below 400 Hz
+  diesel_lowband_min: 0.45           # Bass-dominant
+  diesel_flatness_min: 0.40           # Broadband rumble
+  diesel_flatness_max: 0.65           # Below rain territory
+  diesel_env_std_max: 3.0            # Very steady idle
+  diesel_min_history: 8              # Need 8+ seconds for sustained pattern
+  # Conversation targeting: mid-frequency speech with syllable-level amplitude modulation.
+  # Broadest catch — checked last in filter priority order.
+  conversation_centroid_min_hz: 500
+  conversation_centroid_max_hz: 2500
+  conversation_lowband_max: 0.35     # Not bass-dominant
+  conversation_flatness_max: 0.55     # Speech has harmonics (lower than rain/mower)
+  conversation_env_std_min: 4.0      # Requires syllable modulation (rejects steady drones)
+  conversation_env_std_max: 8.0      # Not wildly erratic (rejects traffic spikes)
+  conversation_db_range_max: 15.0    # Max dB range in window — rejects level transitions (mower start/stop)
+  conversation_min_history: 10       # 10 seconds for reliable syllable pattern
   # Drive-by auto-dismiss: short events with a fade-out pattern are struck from the record
   driveby_max_duration_sec: 30
-  driveby_fade_tail_fraction: 0.5  # Fraction of samples to check for monotonic-ish fade
-  # Borderline margin: incidents within this many dB above the threshold are tagged
-  # as borderline and hidden by default on the timeline (still recorded for the full log).
-  borderline_margin_db: 5.0
+  driveby_fade_tail_fraction: 0.5    # Fraction of samples to check for monotonic-ish fade
+  allow_response_night: false
 
 response:
   enable_daytime_response: false
   relay_gpio_pin: 18
-  relay_active_high: true          # Most opto-isolated relay modules are active-high
-  amp_power_on_delay_sec: 1.0      # Seconds to wait after relay on before starting playback
-  response_cooldown_sec: 5.0       # Seconds after response stops before resuming detection
+  relay_active_high: true            # Most opto-isolated relay modules are active-high
+  amp_power_on_delay_sec: 1.0        # Seconds to wait after relay on before starting playback
+  response_cooldown_sec: 5.0         # Seconds after response stops before resuming detection
   player_command: /usr/bin/cvlc --play-and-exit --no-video
   playlist_dir: /opt/noise-warden/shared/playlist
 

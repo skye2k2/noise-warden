@@ -350,15 +350,21 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 | `filters` | Per-filter enable toggles and tuning parameters for impulse, drive-by, mower-like, thunder-like, and rain-like exclusions |
 | `web` | Host, port, dashboard refresh interval |
 
+### TROUBLESHOOTING configuration tweaking
+
+> [!TIP]
+> If you, like me, do not have access to high-end recording equipment, you might try calibrating and testing your noise-warden configuration using a handy YouTube or sound site recording. _Extensive_ analysis of exactly this kind of source data has revealed that YouTube submissions and subsequent compression completely washes out the volume of diesel engines, to the point of not being able to ever trigger the detection criteria. You can try if you want, but be warned.
+
 ## Features
 
 - **Intelligent gating, recording, and logging of incidents** — hysteresis-based state machine prevents chatter at threshold boundaries; song-gap merging (default 10 sec) bundles closely-spaced noise events into single incidents
 - **WAV snippet evidence capture** — ring buffer preserves pre-trigger audio (15 sec default) plus post-trigger recording, saved per incident
 - **5 false-positive exclusion filters** — impulse, thunder-like, rain-like, mower-like, and drive-by patterns each with configurable tuning parameters
+- **Reclassify tool** — replay the DSP pipeline against saved snippets to test config changes before deploying them. Available as both a CLI module (see [Reclassify CLI](#reclassify-cli) below) and an in-popup UI button on every incident with a stored snippet
 - **Web UI** for calibration, customization, and incident review:
   - Dashboard — live dB readout, arm/disarm/pause controls, detection mode switcher, force test incident, recording toggle, incident list with ▶ play buttons
   - Timeline — day/week/month incident viewer with severity-colored blocks, borderline filtering, and click-to-inspect detail popups
-  - Incident detail popup — shared across all pages; shows ordinance violation badge, classification, timestamps, notes, and audio player with intensity waveform and click-to-seek
+  - Incident detail popup — shared across all pages; shows ordinance violation badge, classification, timestamps, notes, audio player with intensity waveform and click-to-seek, and a "Re-analyze with current config" button that replays the DSP pipeline against the stored snippet and shows an inline comparison (old → new classification, journal timeline, filter distribution). When the classification or timeline has changed, an Apply button commits the update without leaving the popup
   - Calibration — 3-step wizard with live dB/raw dBFS readouts, click-to-fill, offset slider, profile management, sample rate and detection mode controls
   - Thresholds — display current thresholds vs. ordinance limits
   - Config editor — edit YAML configuration without SSH
@@ -372,11 +378,37 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 - **Ambient noise floor gate** — configurable minimum dBA threshold (default 50 dB) below which the DSP pipeline is skipped entirely. Reduces CPU load on the Pi and prevents constant analysis of background white noise. Adjustable via calibration page UI or YAML config
 - **GPIO relay + audio playback response** (optional, disabled by default) — powers amplifier and plays audio during daytime threshold violations. Real GPIO control via `gpiozero` when `_RELAY_HW_ENABLED = True` in `response.py`; boolean-only fallback on non-Pi systems
 - **Self-noise suppression** — automatically skips incident detection while the system is playing a response (and for a configurable cooldown window afterward), preventing the system from logging its own retaliation as a noise violation
-- **Non-blocking callback audio streams** (optional, disabled by default) — `sd.InputStream` callback mode via `_CALLBACK_STREAMS_ENABLED = True` in `audio.py`. Enables concurrent multi-device capture for future dual-mic reference subtraction
+- **Continuous callback audio streaming** — `sd.InputStream` with a callback pushes audio blocks into a thread-safe queue, capturing continuously with zero sample loss between blocks. An earlier blocking mode (`sd.rec()` + `sd.wait()`) was removed after sine wave analysis proved it caused audible clicks at every block boundary
 - **Dual-mic reference subtraction plugins** — `ReferenceSubtractor` (NLMS adaptive filter) and `DualMicDifferential` (spectral subtraction) in `plugins.py` with documented algorithms. Not yet wired into the engine loop — requires callback streams and a second `AudioCapture` instance
 - **Intensity waveform visualization** — Canvas-based RMS envelope displayed above the audio player in incident popups. Color-coded (teal → lime → yellow → orange → red) by amplitude so loud sections are immediately visible. Click anywhere on the waveform to seek; playback cursor tracks position in real-time
 - **Armed state persistence** — Pausing detection writes to YAML config so pauses survive server restarts and watch-mode reloads
 - **Offline-capable timeline** — Service worker caches the timeline page and audio snippets for offline review, with proper HTTP Range request handling for cached audio scrubbing
+
+### Reclassify CLI
+
+After tuning filter thresholds in your config YAML, you can re-run the DSP pipeline against any previously-captured snippet to see if the new settings would produce a different classification — without waiting for the next real incident.
+
+```bash
+# Analyze a single incident by ID (reads snippet path from DB)
+python -m noise_warden.reclassify 63
+
+# Full block-by-block feature table (like the old .TMP_analyze_clip.py)
+python -m noise_warden.reclassify 63 --verbose
+
+# Analyze a standalone WAV file (no database needed)
+python -m noise_warden.reclassify path/to/clip.wav
+
+# Dry-run all incidents with snippets — shows what WOULD change
+python -m noise_warden.reclassify --all
+
+# Batch reclassify and write new classifications back to the database
+python -m noise_warden.reclassify --all --update
+
+# Use a specific config file (defaults to local config if present)
+python -m noise_warden.reclassify 63 -c config/noise_warden.yaml
+```
+
+The tool compares the newly-computed dominant classification against the stored value and reports changes. Use `--update` to commit the new classification and journal to the database. Without it, the tool is read-only (dry run).
 
 ## Testing
 
@@ -425,6 +457,7 @@ pytest tests/ -v -s
 | `test_response.py` | PlaylistPlayer file selection, shlex command parsing, RelayController (boolean fallback + mocked gpiozero GPIO path) |
 | `test_state.py` | StateStore get/set, snapshot isolation, thread safety |
 | `test_storage.py` | Incident CRUD, soft delete, pagination, CSV export, snippet cleanup, autodismissed cleanup, stale repair, vacuum, WAL mode, schema versioning, index existence |
+| `test_reclassify.py` | analyze_clip pipeline, _compute_dominant journal logic, DB-backed reclassify with update, missing snippet/incident handling |
 | `test_web.py` | All GET pages, API endpoints, POST mutations, auth enforcement, recording toggle, calibration apply, timeline JSON embedding, SW route, path leak prevention |
 
 </details>
@@ -463,8 +496,11 @@ Add to crontab (`crontab -e`):
 ### Speculative / future use cases
 
 - TODO: What if someone wants to use this for identifying overall dog nuisance? Dog barks have a particular noise pattern, and could even be categorized with some spectrographic analysis into "dog1", "dog2", for individual incidents and later tagged with names/locations, etc. Would this just completely break _my_ use case?
+- TODO: We could also potentially provide clean recordings of birds (robin, seagull, dove, quail, crow, sparrow-finch-things, roosters) to either identify and record or definitively _exclude_, based on spectral matching. Then potentially other things, like car alarms, lawn mowers, and weedwhackers.
 - TODO: Consider alternate usage scenario as a cheap sleep snoring monitor--enabled for _nighttime_ only, coupled with a deep sleep monitor, some correlations could be determined. And easier than having a recorder run _all_ night, and then needing to scrub eight hours of recording for potential data.
-- TODO: Ensure that birdsong does not trigger incidents (minimal bass, despite a loud, piercing melody, especially if directly on my roof). Would require a high-frequency-only exclusion filter, similar to how the mower/rain/thunder filters work but targeting the 2–8 kHz band with high spectral flatness and no low-band energy.
+- TODO: Consider minority impulse and unknown entries to not be technically part of the (multiple) stipulation.
+- TODO: The yaml configuration has some odd sorting, like which things are put under `audio` versus `detection`. I might change audio to recording, and move things like noise_floor_db and calibration_offset_db into it.
+- TODO: How did a _lawn mower_ get a music-like score of .55 and actual birdsong only get a score of .19? TODOTODO: After re-recording, see what our new values are
 
 ### Architecture
 
@@ -476,7 +512,7 @@ Add to crontab (`crontab -e`):
 
 ### Performance
 
-- **Dual-mic plugins not wired into engine** — `ReferenceSubtractor` (NLMS) and `DualMicDifferential` (spectral subtraction) are implemented in `plugins.py` with documented algorithms but not yet called from the engine loop. Requires enabling callback streams (`_CALLBACK_STREAMS_ENABLED = True` in `audio.py`) and creating a second `AudioCapture` instance for the reference device.
+- **Dual-mic plugins not wired into engine** — `ReferenceSubtractor` (NLMS) and `DualMicDifferential` (spectral subtraction) are implemented in `plugins.py` with documented algorithms but not yet called from the engine loop. Requires creating a second `AudioCapture` instance for the reference device.
 
 ### Usability
 

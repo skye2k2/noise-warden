@@ -5,7 +5,7 @@
   <table>
     <tr>
       <th>Start <span class="small" id="tz-offset-label"></span></th><th>End</th><th>Start dB</th><th>Peak</th><th>Avg</th><th>Duration</th>
-      <th>Music</th><th>Beat</th><th>Class</th><th>Snippet</th><th>Notes</th><th>Delete</th>
+      <th>Music</th><th>Beat</th><th title="music · music_like · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · conversation · drive_by · forced_test">Class</th><th>Snippet</th><th>Notes</th><th>Delete</th>
     </tr>
     {% for r in rows %}
     <tr>
@@ -19,7 +19,7 @@
       <td>{{ r.beat_confidence }}</td>
       <td>{{ r.classification }}</td>
       <td>{% if r.snippet_path %}<button class="snippet-play-btn"
-        data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
+        data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "class_journal": r.class_journal or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
         title="Play audio snippet">&#9654;</button>{% endif %}</td>
       <td>
         <form method="post" action="/incidents/{{ r.id }}/notes">
@@ -42,13 +42,49 @@
   </p>
   <p><a href="/export.csv">Export CSV</a></p>
   <p>
-    <form method="post" action="/incidents/clear" onsubmit="return confirm('Delete ALL incidents? This cannot be undone.')">
+    <form method="post" action="/incidents/clear" id="clear-form" onsubmit="return clearAllWithCaches(this)">
       <button  class="destructive">Clear All Incidents</button>
     </form>
   </p>
+  {% if not rows %}
+  <p>
+    <form method="post" action="/incidents/seed" onsubmit="return confirm('Seed the database from classification_data WAV files?')">
+      <button>Re-seed from Classification Data</button>
+    </form>
+  </p>
+  {% endif %}
 </div>
 
 {% include '_popup.html' %}
+
+<script>
+/**
+ * Handle "Clear All Incidents" — confirm, purge browser caches of snippets,
+ * then submit the form to clear the server-side DB and files.
+ */
+function clearAllWithCaches(form) {
+  if (!confirm('Delete ALL incidents and cached snippets? This cannot be undone.')) {
+    return false;
+  }
+
+  // Clear Service Worker and timeline caches that hold snippet audio data.
+  // The form submit proceeds immediately — cache deletion is best-effort.
+  if ('caches' in window) {
+    caches.keys().then(function (names) {
+      names.forEach(function (name) {
+        caches.delete(name);
+      });
+    }).catch(function () { /* Cache API unavailable — proceed anyway */ });
+  }
+
+  // Clear the timeline view/date state from localStorage
+  try {
+    localStorage.removeItem('nw-timeline-state');
+  } catch (e) { /* Private browsing — skip */ }
+
+  return true;
+}
+</script>
 
 <script>
 /* Format incident timestamps: strip the offset suffix (shown once in the heading)

@@ -156,7 +156,7 @@ class TestEngineProcessing:
 
         incidents = tmp_storage.list_incidents()
         assert len(incidents) >= 1, "Expected at least one incident from loud signal"
-        assert incidents[0]["classification"] in ("music_like", "other")
+        assert incidents[0]["classification"] in ("music", "music_like", "unknown")
 
     def test_silence_creates_no_incident(self, base_cfg, tmp_storage, tmp_state):
         """Silence should never create an incident."""
@@ -345,25 +345,30 @@ class TestWeightedAvgDb:
         """
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
         base_cfg["audio"]["recording_enabled"] = False
+        # Disable drive-by filter so the ramp pattern isn't auto-dismissed
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
 
         # Simulate a long incident: 20 blocks starting quiet (60 dB) then ramping to 80 dB
         dbs = [60 + i for i in range(20)]  # 60, 61, ..., 79
 
-        # Manually set up the active incident and finalize
+        # Manually set up the active incident and finalize.
+        # last_above = now so tail trimming doesn't discard any blocks — this
+        # test is about the exponential weighting, not the tail-trim logic.
+        now = datetime.now(tz=timezone.utc)
         engine.active = {
             "id": tmp_storage.create_incident({
                 "start_ts": "2026-01-01T00:00:00+00:00",
                 "start_db": dbs[0], "peak_db": max(dbs), "avg_db": dbs[0],
                 "threshold_db": 65.0, "music_like_score": 0.5,
-                "beat_confidence": 0.3, "classification": "other",
+                "beat_confidence": 0.3, "classification": "unknown",
                 "mode": "respond",
             }),
-            "start": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "start": now - timedelta(seconds=20),
             "dbs": dbs,
-            "classification": "other",
+            "classification": "unknown",
             "period": "day",
             "responded": False,
-            "last_above": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "last_above": now,
             "tmp_wav": None,
             "recording": False,
         }
@@ -375,6 +380,230 @@ class TestWeightedAvgDb:
         simple_mean = sum(dbs) / len(dbs)  # 69.5
         # The weighted avg should be noticeably higher than the simple mean
         assert incident["avg_db"] > simple_mean
+
+
+# ---------------------------------------------------------------------------
+# Tail trimming at finalization
+# ---------------------------------------------------------------------------
+
+class TestTailTrim:
+    """Verify that the song_gap_merge_sec silent tail is trimmed from dbs,
+    duration, and WAV snippets at incident finalization."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_tail_trim_excludes_silent_blocks_from_avg(self, base_cfg, tmp_storage, tmp_state):
+        """avg_db should be computed from the active portion only, not the
+        silent blocks accumulated during the song_gap_merge_sec window."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+
+        # 10 active blocks at 70 dB, then 12 silent blocks at 40 dB (the tail)
+        active_dbs = [70.0] * 10
+        tail_dbs = [40.0] * 12
+        all_dbs = active_dbs + tail_dbs
+
+        now = datetime.now(tz=timezone.utc)
+        engine.active = {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+                "threshold_db": 65.0, "music_like_score": 0.5,
+                "beat_confidence": 0.3, "classification": "unknown",
+                "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=len(all_dbs)),
+            "dbs": all_dbs,
+            "classification": "unknown",
+            "class_journal": [(0, "unknown")],
+            "period": "day",
+            "responded": False,
+            # last_above was 12 seconds ago (the tail started)
+            "last_above": now - timedelta(seconds=12),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        incident = tmp_storage.list_incidents()[0]
+
+        # avg_db should be close to 70 (the active portion), not dragged down
+        # toward 40 by the silent tail. With 11 blocks (10 active + 1 kept
+        # for context), the single 40 dB block has minimal impact — but the
+        # exponential weighting favors later blocks, so the lone context block
+        # at 40 dB pulls the average down slightly more than a flat mean would.
+        # Without trimming, 12 tail blocks at 40 dB would drag avg below 55.
+        assert incident["avg_db"] >= 65.0, (
+            f"avg_db {incident['avg_db']} too low — silent tail not trimmed"
+        )
+
+    def test_tail_trim_adjusts_duration(self, base_cfg, tmp_storage, tmp_state):
+        """Stored duration should reflect the trimmed incident length, not the
+        full gap-timeout span."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+
+        active_dbs = [70.0] * 10
+        tail_dbs = [40.0] * 12
+        all_dbs = active_dbs + tail_dbs
+
+        now = datetime.now(tz=timezone.utc)
+        engine.active = {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+                "threshold_db": 65.0, "music_like_score": 0.5,
+                "beat_confidence": 0.3, "classification": "unknown",
+                "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=len(all_dbs)),
+            "dbs": all_dbs,
+            "classification": "unknown",
+            "class_journal": [(0, "unknown")],
+            "period": "day",
+            "responded": False,
+            "last_above": now - timedelta(seconds=12),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        incident = tmp_storage.list_incidents()[0]
+        # 22 total blocks, 11 blocks trimmed → dur ≈ 11s (not 22s)
+        assert incident["duration_sec"] <= 12, (
+            f"duration_sec {incident['duration_sec']} too high — tail not trimmed"
+        )
+
+    def test_tail_trim_preserves_peak_db(self, base_cfg, tmp_storage, tmp_state):
+        """peak_db should reflect the true max across ALL blocks, including the
+        tail — it's valid evidence of the loudest moment."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+
+        # Peak is in the active portion, but verify it's not lost
+        active_dbs = [65.0, 72.0, 68.0, 70.0, 66.0]
+        tail_dbs = [40.0] * 12
+        all_dbs = active_dbs + tail_dbs
+
+        now = datetime.now(tz=timezone.utc)
+        engine.active = {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 65.0, "peak_db": 65.0, "avg_db": 65.0,
+                "threshold_db": 65.0, "music_like_score": 0.5,
+                "beat_confidence": 0.3, "classification": "unknown",
+                "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=len(all_dbs)),
+            "dbs": all_dbs,
+            "classification": "unknown",
+            "class_journal": [(0, "unknown")],
+            "period": "day",
+            "responded": False,
+            "last_above": now - timedelta(seconds=12),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        incident = tmp_storage.list_incidents()[0]
+        assert incident["peak_db"] == 72.0
+
+    def test_tail_trim_truncates_wav(self, base_cfg, tmp_storage, tmp_state, tmp_path):
+        """WAV snippet should be truncated to remove silent tail blocks."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+
+        sr = 22050
+        block_sec = float(base_cfg["audio"].get("block_seconds", 1.0))
+        block_samples = int(sr * block_sec)
+        n_active = 10
+        n_tail = 12
+        n_total = n_active + n_tail
+
+        # Create a WAV file with known content
+        wav_path = os.path.join(str(tmp_path), "test_snippet.wav")
+        import soundfile as _sf
+        audio = np.random.randn(n_total * block_samples).astype(np.float32) * 0.01
+        _sf.write(wav_path, audio, sr, subtype="PCM_16")
+        original_samples = len(audio)
+
+        now = datetime.now(tz=timezone.utc)
+        engine.active = {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+                "threshold_db": 65.0, "music_like_score": 0.5,
+                "beat_confidence": 0.3, "classification": "unknown",
+                "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=n_total),
+            "dbs": [70.0] * n_active + [40.0] * n_tail,
+            "classification": "unknown",
+            "class_journal": [(0, "unknown")],
+            "period": "day",
+            "responded": False,
+            "last_above": now - timedelta(seconds=n_tail),
+            "tmp_wav": wav_path,
+            "wav_handle": None,
+            "recording": True,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        trimmed_audio, _ = _sf.read(wav_path)
+        # 11 blocks trimmed (12 tail - 1 kept) → should be shorter
+        expected_trim = (n_tail - 1) * block_samples
+        assert len(trimmed_audio) == original_samples - expected_trim, (
+            f"Expected {original_samples - expected_trim} samples, got {len(trimmed_audio)}"
+        )
+
+    def test_no_trim_when_no_tail(self, base_cfg, tmp_storage, tmp_state):
+        """When last_above is recent (no gap), nothing should be trimmed."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+
+        dbs = [70.0] * 10
+        now = datetime.now(tz=timezone.utc)
+        engine.active = {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+                "threshold_db": 65.0, "music_like_score": 0.5,
+                "beat_confidence": 0.3, "classification": "unknown",
+                "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=10),
+            "dbs": dbs,
+            "classification": "unknown",
+            "class_journal": [(0, "unknown")],
+            "period": "day",
+            "responded": False,
+            "last_above": now,
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        incident = tmp_storage.list_incidents()[0]
+        # All 10 blocks at 70 dB — avg should be ~70
+        assert incident["avg_db"] >= 69.5
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +646,7 @@ class TestDriveByQuarantine:
             "start_ts": "2026-04-01T12:00:00+00:00",
             "start_db": 70, "peak_db": 70, "avg_db": 70,
             "threshold_db": 55, "music_like_score": 0.5,
-            "beat_confidence": 0.3, "classification": "other",
+            "beat_confidence": 0.3, "classification": "unknown",
             "mode": "record_only",
         }
         iid = tmp_storage.create_incident(row)
@@ -430,7 +659,7 @@ class TestDriveByQuarantine:
             "id": iid,
             "start": recent_start,
             "dbs": dbs,
-            "classification": "other",
+            "classification": "unknown",
             "period": "night",
             "responded": False,
             "last_above": datetime.now(timezone.utc),
@@ -448,8 +677,11 @@ class TestDriveByQuarantine:
         quarantine_path = os.path.join(snippets_dir, "autodismissed", "incident_1_test.wav")
         assert os.path.exists(quarantine_path)
 
-        # And the incident should be soft-deleted
-        assert tmp_storage.get_incident(iid) is None
+        # And the incident should be reclassified as drive_by and marked excluded
+        inc = tmp_storage.get_incident(iid)
+        assert inc is not None
+        assert inc["classification"] == "drive_by"
+        assert inc["excluded"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +706,7 @@ class TestDiskFullRecordingStop:
             "id": 1,
             "start": datetime(2026, 4, 1, 12, 0, 0, tzinfo=timezone.utc),
             "dbs": [70],
-            "classification": "other",
+            "classification": "unknown",
             "period": "day",
             "responded": False,
             "last_above": datetime(2026, 4, 1, 12, 0, 0, tzinfo=timezone.utc),
@@ -518,7 +750,7 @@ class TestPeriodBoundarySplit:
             "start_ts": (datetime.now().astimezone() - timedelta(seconds=10)).replace(microsecond=0).isoformat(),
             "start_db": 70, "peak_db": 72, "avg_db": 70,
             "threshold_db": 65.0, "music_like_score": 0.5,
-            "beat_confidence": 0.3, "classification": "other",
+            "beat_confidence": 0.3, "classification": "unknown",
             "mode": "respond",
         }
         day_id = tmp_storage.create_incident(day_row)
@@ -529,7 +761,7 @@ class TestPeriodBoundarySplit:
             "id": day_id,
             "start": recent_start,
             "dbs": [70, 71, 72],
-            "classification": "other",
+            "classification": "unknown",
             "period": "day",
             "responded": False,
             "last_above": datetime.now().astimezone(),
@@ -577,7 +809,7 @@ class TestPeriodBoundarySplit:
             "start_ts": datetime.now(timezone.utc).isoformat(),
             "start_db": 58, "peak_db": 60, "avg_db": 58,
             "threshold_db": 55.0, "music_like_score": 0.5,
-            "beat_confidence": 0.3, "classification": "other",
+            "beat_confidence": 0.3, "classification": "unknown",
             "mode": "record_only",
         }
         night_id = tmp_storage.create_incident(night_row)
@@ -587,7 +819,7 @@ class TestPeriodBoundarySplit:
             "id": night_id,
             "start": recent_start,
             "dbs": [58, 59, 60],
-            "classification": "other",
+            "classification": "unknown",
             "period": "night",
             "responded": False,
             "last_above": datetime.now(timezone.utc),
@@ -621,7 +853,7 @@ class TestPeriodBoundarySplit:
             "start_ts": "2026-04-04T14:00:00+00:00",
             "start_db": 70, "peak_db": 70, "avg_db": 70,
             "threshold_db": 65.0, "music_like_score": 0.5,
-            "beat_confidence": 0.3, "classification": "other",
+            "beat_confidence": 0.3, "classification": "unknown",
             "mode": "respond",
         }
         iid = tmp_storage.create_incident(row)
@@ -630,7 +862,7 @@ class TestPeriodBoundarySplit:
             "id": iid,
             "start": datetime(2026, 4, 4, 14, 0, 0, tzinfo=timezone.utc),
             "dbs": [70],
-            "classification": "other",
+            "classification": "unknown",
             "period": "day",
             "responded": False,
             "last_above": datetime.now(timezone.utc),
@@ -678,7 +910,7 @@ class TestDurationSplit:
             "start_ts": (datetime.now().astimezone() - timedelta(seconds=10)).replace(microsecond=0).isoformat(),
             "start_db": 70, "peak_db": 72, "avg_db": 70,
             "threshold_db": 65.0, "music_like_score": 0.5,
-            "beat_confidence": 0.3, "classification": "other",
+            "beat_confidence": 0.3, "classification": "unknown",
             "mode": "respond",
         }
         iid = tmp_storage.create_incident(row)
@@ -688,7 +920,7 @@ class TestDurationSplit:
             "id": iid,
             "start": datetime.now().astimezone() - timedelta(hours=3),
             "dbs": [70, 71, 72],
-            "classification": "other",
+            "classification": "unknown",
             "period": "day",
             "responded": False,
             "last_above": datetime.now().astimezone(),
@@ -729,7 +961,7 @@ class TestDurationSplit:
             "start_ts": datetime.now(timezone.utc).isoformat(),
             "start_db": 70, "peak_db": 70, "avg_db": 70,
             "threshold_db": 65.0, "music_like_score": 0.5,
-            "beat_confidence": 0.3, "classification": "other",
+            "beat_confidence": 0.3, "classification": "unknown",
             "mode": "respond",
         }
         iid = tmp_storage.create_incident(row)
@@ -739,7 +971,7 @@ class TestDurationSplit:
             "id": iid,
             "start": datetime.now(timezone.utc) - timedelta(hours=1),
             "dbs": [70],
-            "classification": "other",
+            "classification": "unknown",
             "period": "day",
             "responded": False,
             "last_above": datetime.now(timezone.utc),
@@ -767,7 +999,7 @@ class TestDurationSplit:
             "start_ts": datetime.now(timezone.utc).isoformat(),
             "start_db": 58, "peak_db": 60, "avg_db": 58,
             "threshold_db": 55.0, "music_like_score": 0.5,
-            "beat_confidence": 0.3, "classification": "other",
+            "beat_confidence": 0.3, "classification": "unknown",
             "mode": "record_only",
         }
         iid = tmp_storage.create_incident(row)
@@ -776,7 +1008,7 @@ class TestDurationSplit:
             "id": iid,
             "start": datetime.now(timezone.utc) - timedelta(hours=2),
             "dbs": [58, 59, 60],
-            "classification": "other",
+            "classification": "unknown",
             "period": "night",
             "responded": False,
             "last_above": datetime.now(timezone.utc),
@@ -973,7 +1205,7 @@ class TestNoiseFloorGate:
             "start_ts": datetime.now(timezone.utc).isoformat(),
             "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
             "threshold_db": 65.0, "music_like_score": 0.5,
-            "beat_confidence": 0.3, "classification": "other",
+            "beat_confidence": 0.3, "classification": "unknown",
             "mode": "record_only", "responded": 0, "merge_count": 0,
             "snippet_path": None, "notes": ""
         }
@@ -982,7 +1214,7 @@ class TestNoiseFloorGate:
             "id": iid,
             "start": datetime.now(timezone.utc),
             "dbs": [70.0],
-            "classification": "other",
+            "classification": "unknown",
             "period": "day",
             "responded": False,
             "last_above": datetime.now(timezone.utc) - timedelta(seconds=2),
@@ -1006,3 +1238,335 @@ class TestNoiseFloorGate:
         assert engine.active is None
         incidents = tmp_storage.list_incidents(limit=100)
         assert len(incidents) == 1
+
+
+# ---------------------------------------------------------------------------
+# Classification expansion
+# ---------------------------------------------------------------------------
+
+class TestClassifySound:
+    """Tests for _classify_sound: music/music_like/unknown categorization."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_high_music_and_beat_returns_music(self, base_cfg, tmp_storage, tmp_state):
+        """High music score + high beat confidence = rhythmic music."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert engine._classify_sound(0.80, 0.50) == "music"
+
+    def test_high_music_low_beat_returns_music_like(self, base_cfg, tmp_storage, tmp_state):
+        """High music score + low beat confidence = bass-heavy but non-rhythmic."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert engine._classify_sound(0.80, 0.20) == "music_like"
+
+    def test_low_music_returns_unknown(self, base_cfg, tmp_storage, tmp_state):
+        """Low music score = no recognizable pattern."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert engine._classify_sound(0.30, 0.50) == "unknown"
+
+    def test_boundary_music_like_score(self, base_cfg, tmp_storage, tmp_state):
+        """Score exactly at threshold should classify as music_like (not unknown)."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        threshold = float(base_cfg["detection"]["min_music_like_score"])
+        assert engine._classify_sound(threshold, 0.10) == "music_like"
+
+
+# ---------------------------------------------------------------------------
+# Filter identification
+# ---------------------------------------------------------------------------
+
+class TestIdentifyFilter:
+    """Tests for _identify_filter: returns the name of the matching filter or None."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_no_filter_returns_none(self, base_cfg, tmp_storage, tmp_state):
+        """Normal sound that passes all filters should return None."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.db_history = [65.0] * 20
+        # flatness 0.20 is below mower threshold (0.30), centroid 200 is below mower range (300+)
+        feats = {"flatness": 0.20, "centroid_hz": 200, "lowband_ratio": 0.4,
+                 "midband_ratio": 0.4, "highband_ratio": 0.2}
+        assert engine._identify_filter(feats, 68.0, 67.0) is None
+
+    def test_impulse_detected(self, base_cfg, tmp_storage, tmp_state):
+        """Large dB jump should be identified as impulse."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.db_history = [50.0] * 20
+        feats = {"flatness": 0.30, "centroid_hz": 500, "lowband_ratio": 0.3,
+                 "midband_ratio": 0.4, "highband_ratio": 0.3}
+        # 20 dB jump exceeds impulse threshold (14 dB default)
+        assert engine._identify_filter(feats, 70.0, 50.0) == "impulse"
+
+    def test_thunder_takes_priority_over_impulse(self, base_cfg, tmp_storage, tmp_state):
+        """Thunder (impulse + low-band + flat) should be labeled thunder, not impulse."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.db_history = [50.0] * 20
+        feats = {"flatness": 0.50, "centroid_hz": 200, "lowband_ratio": 0.60,
+                 "midband_ratio": 0.25, "highband_ratio": 0.15}
+        assert engine._identify_filter(feats, 70.0, 50.0) == "thunder"
+
+    def test_birdsong_detected(self, base_cfg, tmp_storage, tmp_state):
+        """High-frequency dominant, no bass, stable amplitude = birdsong."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.db_history = [62.0, 63.0, 61.5, 62.5, 63.0, 62.0, 61.0, 62.5, 63.0, 62.0, 61.5, 62.5]
+        feats = {"flatness": 0.55, "centroid_hz": 4000, "lowband_ratio": 0.05,
+                 "midband_ratio": 0.25, "highband_ratio": 0.70}
+        assert engine._identify_filter(feats, 65.0, 64.0) == "birdsong"
+
+
+# ---------------------------------------------------------------------------
+# Excluded incident lifecycle
+# ---------------------------------------------------------------------------
+
+class TestExcludedIncidents:
+    """Tests for excluded incident creation and finalization in continuous mode."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_begin_excluded_incident_creates_row(self, base_cfg, tmp_storage, tmp_state):
+        """Starting an excluded incident should create a DB row with excluded=1."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_excluded_incident("thunder", 70.0, 65.0, 0.3, 0.2, "respond")
+        assert engine._excluded_id is not None
+        inc = tmp_storage.get_incident(engine._excluded_id)
+        assert inc["classification"] == "thunder"
+        assert inc["excluded"] == 1
+
+    def test_end_excluded_incident_sets_duration(self, base_cfg, tmp_storage, tmp_state):
+        """Ending an excluded incident should finalize it with end_ts and duration."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_excluded_incident("rain", 68.0, 65.0, 0.1, 0.1, "respond")
+        iid = engine._excluded_id
+        engine._end_excluded_incident()
+        assert engine._excluded_id is None
+        inc = tmp_storage.get_incident(iid)
+        assert inc["end_ts"] is not None
+        assert inc["duration_sec"] is not None
+
+    def test_should_log_excluded_false_in_music_focus(self, base_cfg, tmp_storage, tmp_state):
+        """Music-focus mode should not log excluded incidents."""
+        base_cfg["detection"]["mode"] = "continuous_music_focus"
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert engine._should_log_excluded() is False
+
+    def test_should_log_excluded_true_in_continuous(self, base_cfg, tmp_storage, tmp_state):
+        """Continuous mode should log excluded incidents."""
+        base_cfg["detection"]["mode"] = "continuous"
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert engine._should_log_excluded() is True
+
+    def test_should_log_excluded_true_in_intermittent(self, base_cfg, tmp_storage, tmp_state):
+        """Intermittent mode should log excluded incidents."""
+        base_cfg["detection"]["mode"] = "intermittent"
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert engine._should_log_excluded() is True
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 filter identification
+# ---------------------------------------------------------------------------
+
+class TestIdentifyFilterTier3:
+    """Tests for _identify_filter with Tier 3 categories: weedwhacker, diesel, conversation."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_weedwhacker_detected(self, base_cfg, tmp_storage, tmp_state):
+        """High-centroid, flat, no-bass, moderately steady → weedwhacker.
+        Uses highband_ratio below 0.55 to avoid triggering birdsong filter."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.db_history = [72.0, 73.0, 71.5, 72.5, 73.0, 72.0, 71.0, 72.5, 73.0, 72.0, 71.5, 72.5]
+        feats = {"centroid_hz": 3500, "flatness": 0.55, "lowband_ratio": 0.05,
+                 "midband_ratio": 0.45, "highband_ratio": 0.50}
+        assert engine._identify_filter(feats, 73.0, 72.0) == "weedwhacker"
+
+    def test_diesel_detected(self, base_cfg, tmp_storage, tmp_state):
+        """Low centroid, bass-heavy, moderate flatness, very steady → diesel."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.db_history = [68.0, 68.5, 67.8, 68.2, 68.1, 67.9, 68.3, 68.0,
+                             67.8, 68.1, 68.2, 67.9]
+        feats = {"centroid_hz": 200, "flatness": 0.50, "lowband_ratio": 0.55,
+                 "midband_ratio": 0.30, "highband_ratio": 0.15}
+        assert engine._identify_filter(feats, 68.5, 68.0) == "diesel"
+
+    def test_conversation_detected(self, base_cfg, tmp_storage, tmp_state):
+        """Mid-centroid, moderate flatness, syllable-level modulation → conversation.
+        Amplitude swings must exceed mower_env_std_max (4.5) to avoid mower match."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.db_history = [58.0, 72.0, 60.0, 73.0, 59.0, 71.0,
+                             61.0, 72.0, 58.0, 70.0, 60.0, 72.0]
+        feats = {"centroid_hz": 1200, "flatness": 0.40, "lowband_ratio": 0.20,
+                 "midband_ratio": 0.50, "highband_ratio": 0.30}
+        assert engine._identify_filter(feats, 68.0, 64.0) == "conversation"
+
+    def test_weedwhacker_priority_over_mower(self, base_cfg, tmp_storage, tmp_state):
+        """A sound matching both weedwhacker and mower centroid range should be
+        classified as weedwhacker (checked first in filter priority).
+        Uses highband_ratio below 0.55 so birdsong doesn't intercept."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.db_history = [70.0] * 12
+        # centroid 2500 is in both weedwhacker (2000–6000) and mower (300–3000) range
+        feats = {"centroid_hz": 2500, "flatness": 0.55, "lowband_ratio": 0.05,
+                 "midband_ratio": 0.45, "highband_ratio": 0.50}
+        assert engine._identify_filter(feats, 71.0, 70.0) == "weedwhacker"
+
+    def test_diesel_not_confused_with_mower(self, base_cfg, tmp_storage, tmp_state):
+        """Diesel (centroid 200) should not match mower (centroid 300–3000).
+        The centroid is below mower's minimum, so only diesel should fire."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.db_history = [68.0] * 12
+        feats = {"centroid_hz": 200, "flatness": 0.50, "lowband_ratio": 0.55,
+                 "midband_ratio": 0.30, "highband_ratio": 0.15}
+        assert engine._identify_filter(feats, 68.5, 68.0) == "diesel"
+
+
+# ---------------------------------------------------------------------------
+# Classification journal & last_above fix
+# ---------------------------------------------------------------------------
+
+class TestClassificationJournal:
+    """Tests for the classification journal feature: tracking source transitions
+    within a single incident, the last_above refresh fix for filter-hit blocks,
+    and the '(multiple)' classification suffix on finalization."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_journal_initialized_on_begin(self, base_cfg, tmp_storage, tmp_state):
+        """_begin_incident should create a class_journal with the initial classification."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        assert engine.active is not None
+        journal = engine.active["class_journal"]
+        assert journal == [(0, "music")]
+
+    def test_journal_no_duplicate_on_same_class(self, base_cfg, tmp_storage, tmp_state):
+        """Calling _update_class_journal with the same classification should not
+        add a duplicate entry — the journal only logs transitions."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._update_class_journal("music")
+        engine._update_class_journal("music")
+        assert len(engine.active["class_journal"]) == 1
+
+    def test_journal_records_transition(self, base_cfg, tmp_storage, tmp_state):
+        """When classification changes, journal should record the new entry."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._update_class_journal("birdsong")
+        journal = engine.active["class_journal"]
+        assert len(journal) == 2
+        assert journal[0] == (0, "music")
+        assert journal[1][1] == "birdsong"
+        assert journal[1][0] >= 0
+
+    def test_journal_multiple_transitions(self, base_cfg, tmp_storage, tmp_state):
+        """Multiple transitions should all be recorded in order."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._update_class_journal("birdsong")
+        engine._update_class_journal("mower")
+        engine._update_class_journal("music")
+        journal = engine.active["class_journal"]
+        assert len(journal) == 4
+        classifications = [entry[1] for entry in journal]
+        assert classifications == ["music", "birdsong", "mower", "music"]
+
+    def test_finalize_single_class_no_multiple_suffix(self, base_cfg, tmp_storage, tmp_state):
+        """An incident with only one classification should NOT get '(multiple)' suffix."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._update_class_journal("music")
+        iid = engine.active["id"]
+        engine._finalize_incident()
+        inc = tmp_storage.get_incident(iid)
+        assert inc["classification"] == "music"
+        assert inc["class_journal"] is not None
+        import json
+        journal = json.loads(inc["class_journal"])
+        assert len(journal) == 1
+
+    def test_finalize_multi_class_appends_multiple(self, base_cfg, tmp_storage, tmp_state):
+        """An incident with multiple classifications should get '(multiple)' suffix
+        and the journal should be stored as JSON."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._update_class_journal("birdsong")
+        engine._update_class_journal("music")
+        iid = engine.active["id"]
+        engine._finalize_incident()
+        inc = tmp_storage.get_incident(iid)
+        assert inc["classification"] == "music (multiple)"
+        import json
+        journal = json.loads(inc["class_journal"])
+        assert len(journal) == 3
+        assert journal[0][1] == "music"
+        assert journal[1][1] == "birdsong"
+        assert journal[2][1] == "music"
+
+    def test_driveby_overrides_multiple_classification(self, base_cfg, tmp_storage, tmp_state):
+        """Drive-by reclassification should override '(multiple)' if the incident
+        matches drive-by criteria, since the drive-by check runs after journal storage."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "unknown", "respond")
+        engine._update_class_journal("mower")
+        iid = engine.active["id"]
+        # Simulate a short incident with a fade-out tail (drive-by pattern)
+        engine.active["dbs"] = [72.0, 71.0, 70.0, 69.0, 68.0]
+        engine._finalize_incident()
+        inc = tmp_storage.get_incident(iid)
+        # Drive-by should reclassify — the (multiple) from journal is overwritten
+        assert inc["classification"] == "drive_by"
+        # But the journal is preserved (initial "unknown" gets replaced by
+        # the backdated mower entry, leaving a single-entry journal)
+        import json
+        journal = json.loads(inc["class_journal"])
+        assert len(journal) == 1
+        assert journal[0][1] == "mower"
+
+    def test_last_above_refreshed_during_filter_hit(self, base_cfg, tmp_storage, tmp_state):
+        """When a filter matches during an active incident and noise is above threshold,
+        last_above should be refreshed so the incident doesn't zombie-timeout."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        original_last_above = engine.active["last_above"]
+
+        import time
+        time.sleep(0.01)
+
+        # Simulate the run loop refreshing last_above on filter-hit above threshold
+        engine.active["dbs"].append(73.0)
+        engine.active["last_above"] = datetime.now().astimezone()
+
+        assert engine.active["last_above"] > original_last_above
+
+    def test_no_excluded_incident_during_active(self, base_cfg, tmp_storage, tmp_state):
+        """When a normal incident is active and a filter matches, no separate excluded
+        incident should be created — the journal captures the filter classification."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        assert engine._excluded_id is None
+        engine._update_class_journal("birdsong")
+        assert len(engine.active["class_journal"]) == 2
+        assert engine._excluded_id is None
+
+    def test_update_journal_noop_without_active(self, base_cfg, tmp_storage, tmp_state):
+        """_update_class_journal should be a no-op when there's no active incident."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert engine.active is None
+        engine._update_class_journal("music")

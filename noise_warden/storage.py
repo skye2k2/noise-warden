@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS incidents (
   merge_count INTEGER DEFAULT 0,
   snippet_path TEXT,
   notes TEXT,
-  deleted INTEGER DEFAULT 0
+  deleted INTEGER DEFAULT 0,
+  excluded INTEGER DEFAULT 0,
+  class_journal TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_incidents_start_ts ON incidents(start_ts DESC);
@@ -43,7 +45,7 @@ CREATE TABLE IF NOT EXISTS calibration_profiles (
 '''
 
 # Increment this when adding migrations. Each migration runs exactly once.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 class Storage:
     def __init__(self, db_path: str):
@@ -82,6 +84,22 @@ class Storage:
             # Indexes are created by SCHEMA above; this just stamps the version
             pass
 
+        # Migration 2: add excluded flag for filter-classified incidents
+        if current < 2:
+            print(f"[storage] Running migration to schema version 2")
+            try:
+                c.execute("ALTER TABLE incidents ADD COLUMN excluded INTEGER DEFAULT 0")
+            except Exception:
+                pass  # Column already exists (fresh DB created with updated SCHEMA)
+
+        # Migration 3: add classification journal for multi-source incident tracking
+        if current < 3:
+            print(f"[storage] Running migration to schema version 3")
+            try:
+                c.execute("ALTER TABLE incidents ADD COLUMN class_journal TEXT")
+            except Exception:
+                pass  # Column already exists (fresh DB created with updated SCHEMA)
+
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         print(f"[storage] Schema version now {SCHEMA_VERSION}")
 
@@ -90,22 +108,25 @@ class Storage:
             cur = c.execute('''
                 INSERT INTO incidents (
                     start_ts,start_db,peak_db,avg_db,threshold_db,music_like_score,
-                    beat_confidence,classification,mode,responded,merge_count,snippet_path,notes
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    beat_confidence,classification,mode,responded,merge_count,snippet_path,notes,excluded
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ''', (
                 row["start_ts"], row["start_db"], row["peak_db"], row["avg_db"], row["threshold_db"],
                 row["music_like_score"], row["beat_confidence"], row["classification"], row["mode"],
-                int(row.get("responded", 0)), int(row.get("merge_count", 0)), row.get("snippet_path"), row.get("notes", "")
+                int(row.get("responded", 0)), int(row.get("merge_count", 0)), row.get("snippet_path"), row.get("notes", ""),
+                int(row.get("excluded", 0))
             ))
             return int(cur.lastrowid)
 
-    def finalize_incident(self, incident_id: int, end_ts: str, duration_sec: float, peak_db: float, avg_db: float, snippet_path: str | None):
+    def finalize_incident(self, incident_id: int, end_ts: str, duration_sec: float, peak_db: float, avg_db: float, snippet_path: str | None, class_journal: str | None = None, classification: str | None = None):
         with self.conn() as c:
             c.execute('''
                 UPDATE incidents
-                SET end_ts=?, duration_sec=?, peak_db=?, avg_db=?, snippet_path=?
+                SET end_ts=?, duration_sec=?, peak_db=?, avg_db=?, snippet_path=?,
+                    class_journal=COALESCE(?, class_journal),
+                    classification=COALESCE(?, classification)
                 WHERE id=?
-            ''', (end_ts, duration_sec, peak_db, avg_db, snippet_path, incident_id))
+            ''', (end_ts, duration_sec, peak_db, avg_db, snippet_path, class_journal, classification, incident_id))
 
     def update_incident_notes(self, incident_id: int, notes: str):
         with self.conn() as c:
@@ -120,15 +141,58 @@ class Storage:
         with self.conn() as c:
             c.execute("UPDATE incidents SET deleted=1 WHERE deleted=0")
 
+    def hard_clear_all_incidents(self, snippets_dir=None):
+        """Delete ALL incident rows (including soft-deleted), reset the ID counter
+        to 1, remove all snippet WAV files, and VACUUM. This is a true reset —
+        the next incident created will be ID 1.
+
+        The autoincrement counter lives in SQLite's sqlite_sequence table. Simply
+        deleting rows does not reset it; we must explicitly zero it out."""
+        # Collect snippet paths before deletion so we can clean up files
+        with self.conn() as c:
+            paths = [r["snippet_path"] for r in
+                     c.execute("SELECT snippet_path FROM incidents WHERE snippet_path IS NOT NULL").fetchall()]
+            c.execute("DELETE FROM incidents")
+            # Reset autoincrement so next ID starts at 1
+            c.execute("DELETE FROM sqlite_sequence WHERE name='incidents'")
+
+        # Remove snippet WAV files referenced by deleted rows
+        removed = 0
+        for p in paths:
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                    removed += 1
+                except OSError:
+                    pass
+
+        # Also clear the autodismissed quarantine folder entirely
+        if snippets_dir:
+            quarantine = os.path.join(snippets_dir, "autodismissed")
+            for filepath in glob.glob(os.path.join(quarantine, "*.wav")):
+                try:
+                    os.remove(filepath)
+                    removed += 1
+                except OSError:
+                    pass
+
+        # VACUUM reclaims disk space from the deleted rows (important on SD cards)
+        with self.conn() as c:
+            c.execute("VACUUM")
+
+        return removed
+
     def get_incident(self, incident_id: int):
         """Fetch a single incident by ID (returns None if not found or soft-deleted)."""
         with self.conn() as c:
             row = c.execute("SELECT * FROM incidents WHERE id=? AND deleted=0", (incident_id,)).fetchone()
             return dict(row) if row else None
 
-    def list_incidents(self, limit=200, offset=0, since=None):
+    def list_incidents(self, limit=200, offset=0, since=None, include_excluded=False):
         q = "SELECT * FROM incidents WHERE deleted=0"
         params = []
+        if not include_excluded:
+            q += " AND (excluded IS NULL OR excluded=0)"
         if since:
             q += " AND start_ts >= ?"
             params.append(since)

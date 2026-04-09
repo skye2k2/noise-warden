@@ -20,6 +20,21 @@
   .excess-high { background:#e74c3c; }
   .excess-severe { background:#c0392b; }
 
+  /* Reclassify result display */
+  .reclass-result { margin-top:8px; padding:10px; border-radius:6px; font-size:13px; }
+  .reclass-changed { background:var(--excess-borderline, #3a3a3a); border:1px solid #e67e22; }
+  .reclass-same { background:var(--excess-borderline, #3a3a3a); border:1px solid #27ae60; }
+  .reclass-arrow { font-weight:bold; margin:0 6px; }
+  .reclass-old { text-decoration:line-through; opacity:0.7; }
+  .reclass-new { font-weight:bold; }
+  .reclass-journal { margin-top:6px; font-size:12px; color:var(--text-muted); }
+  .reclass-journal-entry { margin-left:8px; }
+  .reclass-btn { font-size:12px; padding:4px 10px; cursor:pointer; border:1px solid var(--border-light, #555); border-radius:4px; background:var(--bg-input, #2d2d2d); color:var(--text, #eee); margin-right:6px; }
+  .reclass-btn:hover { background:var(--border-light, #555); }
+  .reclass-btn:disabled { opacity:0.5; cursor:not-allowed; }
+  .reclass-apply-btn { background:#27ae60; color:#fff; border-color:#27ae60; }
+  .reclass-apply-btn:hover { background:#219a52; }
+
 
   /* Waveform intensity display */
   .waveform-wrap { position:relative; width:100%; height:64px; margin:6px 0 4px; cursor:pointer; border-radius:4px; overflow:hidden; background:var(--bg-input, #2d2d2d); }
@@ -27,6 +42,12 @@
   .waveform-cursor { position:absolute; top:0; bottom:0; width:2px; background:var(--now-line, #66d9ef); pointer-events:none; transition:left 0.1s linear; }
   .waveform-time { position:absolute; bottom:2px; right:4px; font-size:11px; color:var(--text-muted); pointer-events:none; }
   .waveform-loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:12px; color:var(--text-muted); }
+
+  /* Source timeline — journal entry highlighting and interaction */
+  .journal-entry { margin-left:8px; padding:2px 4px; border-radius:3px; cursor:pointer; transition:background 0.15s; }
+  .journal-entry:hover { background:rgba(255,255,255,0.08); }
+  .journal-active { background:rgba(102,217,239,0.25); }
+  .journal-unknown .popup-val { font-weight:normal; opacity:0.5; }
 </style>
 
 <div id="popup-overlay" style="display:none" onclick="hidePopup()">
@@ -153,11 +174,43 @@ function showPopup(inc) {
     html += '</div>';
   }
 
+  // Classification journal: show source transitions for multi-source incidents.
+  // Each entry is [seconds_since_start, classification_name].
+  if (inc.class_journal) {
+    try {
+      var journal = typeof inc.class_journal === 'string' ? JSON.parse(inc.class_journal) : inc.class_journal;
+      if (Array.isArray(journal) && journal.length > 1) {
+        _popupJournal = journal;
+        html += '<div class="popup-section">';
+        html += '<div class="popup-lbl">Source timeline:</div>';
+        for (var ji = 0; ji < journal.length; ji++) {
+          var entry = journal[ji];
+          var atSec = entry[0];
+          var cls = entry[1];
+          var isUnknown = cls === 'unknown';
+          html += '<div class="journal-entry' + (isUnknown ? ' journal-unknown' : '') + '" data-seek-time="' + atSec + '">';
+          html += '<span class="popup-lbl">+' + popupFormatDuration(atSec) + ':</span> ';
+          html += '<span class="popup-val">' + popupEscapeHtml(cls) + '</span>';
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+    } catch (e) { /* malformed journal — skip */ }
+  }
+
   // Notes
   if (inc.notes) {
     html += '<div class="popup-section">';
     html += '<div class="popup-lbl">Notes:</div>';
     html += '<div>' + popupEscapeHtml(inc.notes) + '</div>';
+    html += '</div>';
+  }
+
+  // Reclassify — re-run DSP pipeline with current config against stored snippet
+  if (inc.has_snippet && inc.id) {
+    html += '<div class="popup-section">';
+    html += '<button class="reclass-btn" id="reclass-btn" onclick="reclassifyIncident(' + inc.id + ')">Re-analyze with current config</button>';
+    html += '<div id="reclass-result"></div>';
     html += '</div>';
   }
 
@@ -184,6 +237,9 @@ function showPopup(inc) {
   document.getElementById('popup-content').innerHTML = html;
   document.getElementById('popup-overlay').style.display = 'flex';
 
+  // Wire click-to-seek on source timeline journal entries
+  _wireJournalSeek();
+
   // Initialize waveform visualization after DOM is populated
   if (inc.has_snippet) {
     _initWaveform(inc.id);
@@ -208,6 +264,7 @@ function showPopup(inc) {
    in the HTML — the Blob URL assignment here is the single source
    of truth for audio data.
    ====================================================================== */
+var _popupJournal = null;
 var _waveformAudioCtx = null;
 var _currentBlobUrl = null;
 
@@ -374,6 +431,7 @@ function _wireWaveformInteraction(wrap, cursor, timeEl, audio) {
 
   function animateCursor() {
     updateCursor();
+    _updateJournalHighlight(audio.currentTime);
     rafId = requestAnimationFrame(animateCursor);
   }
 
@@ -383,6 +441,7 @@ function _wireWaveformInteraction(wrap, cursor, timeEl, audio) {
       rafId = null;
     }
     updateCursor(); // Final position snap
+    _updateJournalHighlight(audio.currentTime);
   }
 
   audio.addEventListener('play', function () {
@@ -392,8 +451,57 @@ function _wireWaveformInteraction(wrap, cursor, timeEl, audio) {
   audio.addEventListener('ended', stopAnimation);
   // Also update on manual seeks while paused
   audio.addEventListener('seeked', function () {
-    if (audio.paused) { updateCursor(); }
+    if (audio.paused) {
+      updateCursor();
+      _updateJournalHighlight(audio.currentTime);
+    }
   });
+}
+
+/**
+ * Wire click-to-seek handlers on source timeline journal entries.
+ * Clicking an entry seeks to half a block (0.5s) before its start time.
+ */
+function _wireJournalSeek() {
+  var entries = document.querySelectorAll('.journal-entry');
+  if (!entries.length) { return; }
+
+  for (var i = 0; i < entries.length; i++) {
+    entries[i].addEventListener('click', function () {
+      var audio = document.getElementById('popup-audio');
+      if (!audio || !audio.duration || !isFinite(audio.duration)) { return; }
+      var seekTime = parseFloat(this.getAttribute('data-seek-time'));
+      // Seek to half a block before the entry, clamped to valid range
+      audio.currentTime = Math.max(0, Math.min(seekTime - 0.5, audio.duration));
+      if (audio.paused) { audio.play(); }
+    });
+  }
+}
+
+/**
+ * Highlight the source timeline journal entry that covers the current
+ * playback position. Uses the globally stored _popupJournal array.
+ */
+function _updateJournalHighlight(currentTime) {
+  var entries = document.querySelectorAll('.journal-entry');
+  if (!entries.length || !_popupJournal) { return; }
+
+  // Find the last entry whose time <= currentTime
+  var activeIdx = 0;
+  for (var i = _popupJournal.length - 1; i >= 0; i--) {
+    if (currentTime >= _popupJournal[i][0]) {
+      activeIdx = i;
+      break;
+    }
+  }
+
+  for (var i = 0; i < entries.length; i++) {
+    if (i === activeIdx) {
+      entries[i].classList.add('journal-active');
+    } else {
+      entries[i].classList.remove('journal-active');
+    }
+  }
 }
 
 /** Format seconds as m:ss for the waveform time display. */
@@ -405,6 +513,7 @@ function _formatSeconds(sec) {
 
 function hidePopup() {
   document.getElementById('popup-overlay').style.display = 'none';
+  _popupJournal = null;
   // Stop any playing audio and revoke the Blob URL to free memory
   var audio = document.querySelector('#popup-box audio');
   if (audio) {
@@ -415,6 +524,136 @@ function hidePopup() {
     URL.revokeObjectURL(_currentBlobUrl);
     _currentBlobUrl = null;
   }
+}
+
+/* ======================================================================
+   RECLASSIFY — re-run DSP pipeline on a stored snippet via the API.
+   Shows a comparison of old vs new classification inline in the popup,
+   with an optional "Apply" button to commit the change to the DB.
+   ====================================================================== */
+
+/**
+ * Trigger reclassification for an incident. Called by the "Re-analyze" button.
+ * Fires a POST to the API, then renders the result inline.
+ */
+function reclassifyIncident(incidentId) {
+  var btn = document.getElementById('reclass-btn');
+  var resultDiv = document.getElementById('reclass-result');
+  if (!btn || !resultDiv) { return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Analyzing\u2026';
+  resultDiv.innerHTML = '';
+
+  fetch('/incidents/' + incidentId + '/reclassify', { method: 'POST' })
+    .then(function (resp) {
+      if (!resp.ok) { throw new Error('Reclassify failed (' + resp.status + ')'); }
+      return resp.json();
+    })
+    .then(function (data) {
+      btn.textContent = 'Re-analyze with current config';
+      btn.disabled = false;
+      _renderReclassResult(resultDiv, data, incidentId);
+    })
+    .catch(function (err) {
+      btn.textContent = 'Re-analyze with current config';
+      btn.disabled = false;
+      resultDiv.innerHTML = '<div style="color:#e74c3c;margin-top:6px">' + popupEscapeHtml(err.message) + '</div>';
+    });
+}
+
+/**
+ * Render the reclassification comparison result inline in the popup.
+ */
+function _renderReclassResult(container, data, incidentId) {
+  var html = '';
+
+  if (data.changed) {
+    if (data.class_changed) {
+      html += '<div class="reclass-result reclass-changed">';
+      html += '<div>';
+      html += '<span class="reclass-old">' + popupEscapeHtml(data.old_classification) + '</span>';
+      html += '<span class="reclass-arrow">\u2192</span>';
+      html += '<span class="reclass-new">' + popupEscapeHtml(data.new_classification) + '</span>';
+      html += '</div>';
+    } else {
+      // Journal changed but classification didn't
+      html += '<div class="reclass-result reclass-changed">';
+      html += '<div>\u2713 Classification unchanged: <strong>' + popupEscapeHtml(data.new_classification) + '</strong>';
+      html += ' &mdash; timeline updated</div>';
+    }
+
+    // Apply button — shown for both classification and journal-only changes
+    html += '<div style="margin-top:8px">';
+    html += '<button class="reclass-btn reclass-apply-btn" id="reclass-apply-btn" ';
+    html += 'onclick="applyReclassification(' + incidentId + ')">Apply new classification</button>';
+    html += '</div>';
+  } else {
+    html += '<div class="reclass-result reclass-same">';
+    html += '<div>\u2713 Classification unchanged: <strong>' + popupEscapeHtml(data.new_classification) + '</strong></div>';
+  }
+
+  // Journal summary
+  if (data.journal && data.journal.length > 0) {
+    html += '<div class="reclass-journal">';
+    html += '<div>Journal (' + data.journal.length + ' entries, ' + data.n_blocks + ' blocks):</div>';
+    for (var i = 0; i < data.journal.length; i++) {
+      var sec = data.journal[i][0];
+      var cls = data.journal[i][1];
+      html += '<div class="reclass-journal-entry">+' + sec + 's \u2192 ' + popupEscapeHtml(cls) + '</div>';
+    }
+    html += '</div>';
+  }
+
+  // Filter distribution
+  if (data.filter_counts) {
+    var parts = [];
+    var keys = Object.keys(data.filter_counts).sort();
+    for (var k = 0; k < keys.length; k++) {
+      parts.push(keys[k] + ': ' + data.filter_counts[keys[k]]);
+    }
+    html += '<div class="reclass-journal" style="margin-top:4px">Filters: ' + parts.join(', ') + '</div>';
+  }
+
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+/**
+ * Apply a reclassification result to the database. Called by the "Apply" button
+ * that appears only when the classification has changed.
+ */
+function applyReclassification(incidentId) {
+  var applyBtn = document.getElementById('reclass-apply-btn');
+  if (applyBtn) {
+    applyBtn.disabled = true;
+    applyBtn.textContent = 'Applying\u2026';
+  }
+
+  fetch('/incidents/' + incidentId + '/reclassify?apply=true', { method: 'POST' })
+    .then(function (resp) {
+      if (!resp.ok) { throw new Error('Apply failed (' + resp.status + ')'); }
+      return resp.json();
+    })
+    .then(function (data) {
+      if (applyBtn) {
+        applyBtn.textContent = '\u2713 Applied';
+        applyBtn.disabled = true;
+        applyBtn.classList.remove('reclass-apply-btn');
+      }
+
+      // Update the popup header classification text to reflect the change
+      var headerLbl = document.querySelector('#popup-content .popup-section .popup-lbl');
+      if (headerLbl && data.new_classification) {
+        headerLbl.textContent = data.new_classification + ' \u00B7 updated';
+      }
+    })
+    .catch(function (err) {
+      if (applyBtn) {
+        applyBtn.textContent = 'Apply failed — retry';
+        applyBtn.disabled = false;
+      }
+    });
 }
 
 document.addEventListener('keydown', function (e) {

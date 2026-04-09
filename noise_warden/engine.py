@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, shutil, threading, time, tempfile
+import json, os, shutil, threading, time, tempfile
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import sounddevice as sd
@@ -7,8 +7,9 @@ import soundfile as sf
 
 from .audio import AudioCapture
 from .dsp import (
-    rms_dbfs, dba_estimate, spectrum_features, beat_confidence_from_history, music_like_score,
-    is_impulse, looks_like_thunder, looks_like_rain, looks_like_mower
+    apply_filter_holdover, rms_dbfs, dba_estimate, spectrum_features,
+    beat_confidence_from_history, get_filter_detection_latency,
+    identify_filter, music_like_score,
 )
 from .ordinance import applicable_threshold, is_night
 from .response import RelayController, PlaylistPlayer
@@ -81,6 +82,9 @@ class Engine:
         self.ha = HAClient(cfg)
         self.running = False
         self.thread = None
+        # Plain list, not deque — DSP functions slice db_history (e.g. [-12:])
+        # and deque doesn't support slicing. Converting to list at each DSP call
+        # would cost more than the list re-slice here, so keep it simple.
         self.db_history = []
         self.active = None
         self._lock = threading.Lock()
@@ -97,6 +101,23 @@ class Engine:
         # Force-incident flags: set from web UI thread, consumed by engine loop
         self._force_start_requested = False
         self._force_end_requested = False
+
+        # Excluded incident tracking: when a filter (thunder, mower, birdsong, etc.)
+        # catches a sound that's above threshold, we optionally log it as an excluded
+        # incident so the operator can review what was filtered out. Only active in
+        # continuous/intermittent mode (not continuous_music_focus).
+        self._excluded_id = None
+        self._excluded_filter = None
+        self._excluded_peak_db = 0.0
+        self._excluded_start = None
+
+        # Filter holdover state: tracks the most recent filter result and how
+        # many consecutive blocks it has been active. Used by apply_filter_holdover()
+        # to persist a well-established filter through brief gaps (startups,
+        # throttle changes, stop/restart pauses).
+        self._prev_filter = None
+        self._prev_filter_run = 0
+        self._holdover_gap = 0
 
     def _check_disk_quota(self):
         """Check available disk space in snippets directory and warn if below threshold.
@@ -228,6 +249,7 @@ class Engine:
             "start": now,
             "dbs": [db_now],
             "classification": classification,
+            "class_journal": [(0, classification)],
             "period": "night" if is_night(datetime.now(), self.cfg["detection"]["night_start_hour"], self.cfg["detection"]["night_end_hour"]) else "day",
             "responded": False,
             "last_above": now,
@@ -254,7 +276,8 @@ class Engine:
                     wf.write(block)
                 wf.flush()
 
-        self.state.set(active_incident_id=iid, mode="incident_active")
+        self.state.set(active_incident_id=iid, mode="incident_active",
+                      forced_test=(classification == "forced_test"))
 
     def _append_audio(self, block):
         if not self.active or not self.active.get("recording") or not self.active.get("tmp_wav"):
@@ -286,6 +309,158 @@ class Engine:
             except (OSError, RuntimeError) as e:
                 print(f"[engine] WAV handle close failed: {e}")
         self.active["wav_handle"] = None
+
+    def _trim_snippet_tail(self, wav_path, blocks_to_trim, block_seconds):
+        """Remove trailing silent blocks from a WAV snippet file.
+
+        During the song_gap_merge_sec window, sub-threshold audio accumulates
+        at the end of every recording.  This dead air inflates file size and
+        carries no evidentiary value.  Trimming it keeps snippets concise.
+        NOTE: could be made more precise by trimming to the last
+        positively-classified block instead of last above-threshold block.
+        """
+        try:
+            data, sr = sf.read(wav_path, dtype="float32")
+            samples_per_block = int(sr * block_seconds)
+            samples_to_trim = blocks_to_trim * samples_per_block
+
+            if samples_to_trim <= 0 or samples_to_trim >= len(data):
+                return
+
+            trimmed = data[:len(data) - samples_to_trim]
+            sf.write(wav_path, trimmed, sr, subtype="PCM_16")
+        except (OSError, RuntimeError) as exc:
+            # Non-fatal — the un-trimmed snippet is still usable evidence.
+            print(f"[engine] Snippet tail trim failed for {wav_path}: {exc}")
+
+    def _identify_filter(self, features, db_now, prev_db):
+        """Delegate to dsp.identify_filter + apply holdover. The engine doesn't
+        need to know about individual filter parameters or priority order.
+        Tracks holdover state so sustained filters persist through brief gaps."""
+        raw = identify_filter(
+            features, self.db_history, db_now, prev_db, self.cfg["detection"],
+        )
+        effective, self._prev_filter, self._prev_filter_run, self._holdover_gap = (
+            apply_filter_holdover(
+                raw, self._prev_filter, self._prev_filter_run,
+                self._holdover_gap, self.cfg["detection"],
+            )
+        )
+        return effective
+
+    def _classify_sound(self, mscore, bconf):
+        """Classify a non-excluded sound based on DSP features.
+
+        Categories:
+          music       — high music-like score AND high beat confidence (rhythmic music)
+          music_like  — high music-like score but low beat confidence (bass-heavy, non-rhythmic)
+          unknown     — does not match any known pattern
+
+        The min_music_like_score and min_beat_confidence thresholds are configurable
+        in detection config. Default: music_like >= 0.62, beat >= 0.38."""
+        det = self.cfg["detection"]
+        min_music = float(det["min_music_like_score"])
+        min_beat = float(det.get("min_beat_confidence", 0.38))
+
+        if mscore >= min_music and bconf >= min_beat:
+            return "music"
+        if mscore >= min_music:
+            return "music_like"
+        return "unknown"
+
+    def _update_class_journal(self, classify):
+        """Append a classification transition to the active incident's journal.
+        Only logs when the classification actually changes from the most recent
+        entry, keeping the journal compact (transitions only, not per-block).
+        When a filter first identifies a sound, the entry is backdated by the
+        filter's detection latency — the pattern was present before we had
+        enough history to confirm it."""
+        if not self.active:
+            return
+        journal = self.active.get("class_journal")
+        if not journal:
+            return
+        if journal[-1][1] == classify:
+            return  # Same source — no transition
+        elapsed = round((datetime.now().astimezone() - self.active["start"]).total_seconds())
+
+        # Backdate filter transitions by their detection latency
+        det_cfg = self.cfg["detection"]
+        latency = get_filter_detection_latency(classify, det_cfg)
+        if latency > 0:
+            block_sec = float(self.cfg["audio"]["block_seconds"])
+            backdated = round(elapsed - latency * block_sec)
+
+            # If backdating would overlap with or precede a trailing
+            # "unknown" entry, replace it — that unknown was really the
+            # lead-in to this filter's detection window.
+            if (len(journal) >= 1 and journal[-1][1] == "unknown" and
+                    backdated <= journal[-1][0]):
+                journal.pop()
+
+            earliest = journal[-1][0] + 1 if journal else 0
+            elapsed = max(earliest, backdated)
+
+            # After replacing, check if we'd duplicate the previous entry
+            if journal and journal[-1][1] == classify:
+                return
+
+        journal.append((elapsed, classify))
+
+    def _should_log_excluded(self):
+        """Whether to log filter-excluded sounds as informational incidents.
+        Only active in continuous or intermittent mode — in music-focus mode we're
+        specifically filtering for music, so logging mower/birdsong adds noise."""
+        return self.cfg["detection"]["mode"] != "continuous_music_focus"
+
+    def _begin_excluded_incident(self, filter_type, db_now, threshold, mscore, bconf, mode):
+        """Start a lightweight excluded incident — metadata only, no audio recording."""
+        now = datetime.now().astimezone()
+        ts = now.replace(microsecond=0).isoformat()
+        row = {
+            "start_ts": ts,
+            "start_db": round(db_now, 1),
+            "peak_db": round(db_now, 1),
+            "avg_db": round(db_now, 1),
+            "threshold_db": threshold,
+            "music_like_score": round(mscore, 3),
+            "beat_confidence": round(bconf, 3),
+            "classification": filter_type,
+            "mode": mode,
+            "responded": 0,
+            "merge_count": 0,
+            "snippet_path": None,
+            "notes": "",
+            "excluded": 1,
+        }
+        self._excluded_id = self.storage.create_incident(row)
+        self._excluded_filter = filter_type
+        self._excluded_peak_db = db_now
+        self._excluded_start = now
+
+    def _extend_excluded_incident(self, db_now):
+        """Update peak dB for the active excluded incident."""
+        if db_now > self._excluded_peak_db:
+            self._excluded_peak_db = db_now
+
+    def _end_excluded_incident(self):
+        """Finalize the active excluded incident with end timestamp and duration."""
+        if self._excluded_id is None:
+            return
+        end = datetime.now().astimezone()
+        dur = round((end - self._excluded_start).total_seconds())
+        self.storage.finalize_incident(
+            self._excluded_id,
+            end.replace(microsecond=0).isoformat(),
+            dur,
+            round(self._excluded_peak_db, 1),
+            round(self._excluded_peak_db, 1),  # avg ≈ peak for brief excluded events
+            None,  # no snippet
+        )
+        self._excluded_id = None
+        self._excluded_filter = None
+        self._excluded_peak_db = 0.0
+        self._excluded_start = None
 
     def _looks_like_driveby(self, dbs, duration_sec):
         """Determine if an incident matches a drive-by pattern: short duration with a
@@ -329,40 +504,99 @@ class Engine:
         self._close_wav_handle()
 
         end = datetime.now().astimezone()
-        dur = round((end - self.active["start"]).total_seconds())
+        raw_dur = round((end - self.active["start"]).total_seconds())
         if self.active["recording"] and self.active.get("tmp_wav"):
-            # pad post-roll with silence window placeholder by simply leaving last blocks already captured
             snippet_path = self.active["tmp_wav"]
         else:
             snippet_path = None
 
-        # Compute average dB with exponential weighting so later (sustained) readings
-        # carry more weight than the initial onset ramp. For short incidents (<10 blocks),
-        # the weighting barely differs from a flat mean.
-        dbs = self.active["dbs"]
-        if dbs:
-            n = len(dbs)
-            # Decay factor: earlier readings get exponentially less weight
+        # ── Tail trimming ──────────────────────────────────────────────
+        # During the song_gap_merge_sec window the mic hears sub-threshold
+        # audio that keeps the incident open but contributes nothing useful.
+        # Trim those blocks from dbs, duration, and the WAV — keep one
+        # sub-threshold block for context, drop the rest.
+        block_sec = float(self.cfg["audio"].get("block_seconds", 1.0))
+        gap_seconds = (end - self.active["last_above"]).total_seconds()
+        tail_blocks = max(0, round(gap_seconds / block_sec))
+        # Keep one block past the last above-threshold reading for context
+        blocks_to_trim = max(0, tail_blocks - 1)
+
+        all_dbs = self.active["dbs"]
+        # Safety: never trim to fewer than 1 block
+        effective_count = max(1, len(all_dbs) - blocks_to_trim)
+        trimmed_dbs = all_dbs[:effective_count]
+        dur = max(1, raw_dur - int(blocks_to_trim * block_sec))
+
+        if blocks_to_trim > 0:
+            print(f"[engine] Tail trim: {blocks_to_trim} silent blocks removed "
+                  f"({len(all_dbs)} → {len(trimmed_dbs)} blocks, "
+                  f"{raw_dur}s → {dur}s)")
+
+        # Trim the WAV snippet to match
+        if snippet_path and blocks_to_trim > 0 and os.path.exists(snippet_path):
+            self._trim_snippet_tail(snippet_path, blocks_to_trim, block_sec)
+
+        # ── avg_db (on trimmed dbs — excludes silent tail) ─────────────
+        # Exponential weighting so later (sustained) readings carry more
+        # weight than the initial onset ramp.  For short incidents (<10
+        # blocks), the weighting barely differs from a flat mean.
+        if trimmed_dbs:
+            n = len(trimmed_dbs)
             decay = 0.95
             weights = np.array([decay ** (n - 1 - i) for i in range(n)])
             weights /= weights.sum()
-            avg_db = float(np.dot(weights, dbs))
+            avg_db = float(np.dot(weights, trimmed_dbs))
         else:
             avg_db = 0.0
 
+        # Classification journal: determine the dominant source based on duration
+        # each classification held. If multiple distinct sources were detected,
+        # the primary classification becomes the longest-running one with "(multiple)"
+        # appended. This prevents the common case where a 30-second mower incident
+        # shows as "unknown (multiple)" just because the first 5 seconds were unknown
+        # while the filter's min_history was building up.
+        journal = self.active.get("class_journal", [])
+        unique_classes = set(entry[1] for entry in journal)
+        journal_json = json.dumps(journal) if journal else None
+        updated_class = None
+
+        if len(unique_classes) > 1 and len(journal) > 1:
+            # Calculate duration each classification held based on journal transitions
+            durations = {}
+            for idx in range(len(journal)):
+                cls = journal[idx][1]
+                start_sec = journal[idx][0]
+                # End is the next entry's start, or incident duration for the last entry
+                if idx + 1 < len(journal):
+                    end_sec = journal[idx + 1][0]
+                else:
+                    end_sec = dur
+                durations[cls] = durations.get(cls, 0) + (end_sec - start_sec)
+
+            dominant = max(durations, key=durations.get)
+            updated_class = f"{dominant} (multiple)"
+        elif len(unique_classes) == 1 and journal:
+            # Single source — update classification to the journal's value in case
+            # the initial classification was set before the filter had enough history
+            updated_class = journal[0][1]
+
         self.storage.finalize_incident(
             self.active["id"], end.replace(microsecond=0).isoformat(), dur,
-            round(max(self.active["dbs"]), 1) if self.active["dbs"] else 0.0,
+            # peak_db uses un-trimmed dbs — the peak is valid evidence
+            round(max(all_dbs), 1) if all_dbs else 0.0,
             round(avg_db, 1),
-            snippet_path
+            snippet_path,
+            class_journal=journal_json,
+            classification=updated_class,
         )
         self.ha.publish_event({"type": "incident_end", "id": self.active["id"], "duration_sec": dur})
 
         # Drive-by auto-dismiss: short incidents with a fade-out tail are likely passing
-        # vehicles, not sustained nuisance noise. Soft-delete and quarantine the snippet
-        # (moved to autodismissed/ for manual review — never permanently deleted by automation).
+        # vehicles, not sustained nuisance noise. Reclassify as "drive_by", mark excluded,
+        # and quarantine the snippet (moved to autodismissed/ for manual review).
+        # Uses un-trimmed dbs + raw_dur — drive-by detection needs the full fade-out shape.
         incident_id = self.active["id"]
-        if not force and self._looks_like_driveby(dbs, dur):
+        if not force and self._looks_like_driveby(all_dbs, raw_dur):
             if snippet_path and os.path.exists(snippet_path):
                 try:
                     quarantine_dir = os.path.join(os.path.dirname(snippet_path), "autodismissed")
@@ -371,12 +605,15 @@ class Engine:
                     shutil.move(snippet_path, quarantine_path)
                 except OSError as exc:
                     print(f"[engine] Failed to quarantine drive-by snippet {snippet_path}: {exc}")
-            self.storage.soft_delete_incident(incident_id)
-            print(f"[engine] Auto-dismissed incident {incident_id} as drive-by ({dur:.1f}s, {len(dbs)} samples)")
+            # Reclassify and mark as excluded rather than soft-deleting, so drive-bys
+            # appear in the classification audit trail when viewing excluded incidents.
+            with self.storage.conn() as c:
+                c.execute("UPDATE incidents SET classification='drive_by', excluded=1 WHERE id=?", (incident_id,))
+            print(f"[engine] Auto-classified incident {incident_id} as drive_by ({raw_dur:.1f}s, {len(all_dbs)} samples)")
 
         self.active = None
         self._stop_response()
-        self.state.set(active_incident_id=None, mode="idle")
+        self.state.set(active_incident_id=None, mode="idle", forced_test=False)
 
     def _check_period_split(self, db_now, threshold, mscore, bconf, classification, block):
         """Split an active incident when it crosses a day/night boundary.
@@ -604,19 +841,14 @@ class Engine:
                 mscore = music_like_score(features)
 
                 prev = self.db_history[-2] if len(self.db_history) > 1 else db_now
-                impulse = is_impulse(db_now, prev, float(self.cfg["detection"]["impulse_peak_delta_db"]))
-                thunder = looks_like_thunder(features, db_now, prev, float(self.cfg["detection"]["thunder_peak_delta_db"]))
-                rain = looks_like_rain(features, self.db_history, float(self.cfg["detection"]["rain_flatness_threshold"]), float(self.cfg["detection"]["rain_low_variance_db"]))
-                mower = looks_like_mower(
-                    features, self.db_history,
-                    float(self.cfg["detection"]["mower_flatness_threshold"]),
-                    float(self.cfg["detection"]["mower_centroid_min_hz"]),
-                    float(self.cfg["detection"]["mower_centroid_max_hz"])
-                )
+                filter_hit = self._identify_filter(features, db_now, prev)
+                classify = filter_hit if filter_hit else self._classify_sound(mscore, bconf)
 
-                classify = "other"
-                if mscore >= float(self.cfg["detection"]["min_music_like_score"]):
-                    classify = "music_like"
+                # Track classification transitions in the active incident's journal.
+                # Must run before split/finalize logic so the current block's source
+                # is captured before any incident boundary decisions are made.
+                if self.active:
+                    self._update_class_journal(classify)
 
                 # If an active incident crosses a day/night boundary, split it so each
                 # segment displays the correct period-specific threshold in the timeline.
@@ -640,30 +872,62 @@ class Engine:
                 if self._in_response_cooldown() and not self.active:
                     continue
 
-                if db_now >= threshold and not impulse and not thunder and not rain and not mower:
-                    if classify == "music_like" or self.cfg["detection"]["mode"] != "continuous_music_focus":
-                        if not self.active:
-                            mode = "record_only" if is_night(datetime.now(), self.cfg["detection"]["night_start_hour"], self.cfg["detection"]["night_end_hour"]) else "respond"
-                            self._begin_incident(db_now, threshold, mscore, bconf, classify, mode)
+                if db_now >= threshold:
+                    if filter_hit is None:
+                        # Sound passed all filters — normal incident path.
+                        # End any active excluded incident (filter condition ended).
+                        if self._excluded_id:
+                            self._end_excluded_incident()
 
-                            if mode == "respond" and self.cfg["response"].get("enable_daytime_response", False):
-                                self._start_response()
-                                self.active["responded"] = True
+                        if classify in ("music", "music_like") or self.cfg["detection"]["mode"] != "continuous_music_focus":
+                            if not self.active:
+                                mode = "record_only" if is_night(datetime.now(), self.cfg["detection"]["night_start_hour"], self.cfg["detection"]["night_end_hour"]) else "respond"
+                                self._begin_incident(db_now, threshold, mscore, bconf, classify, mode)
+
+                                if mode == "respond" and self.cfg["response"].get("enable_daytime_response", False):
+                                    self._start_response()
+                                    self.active["responded"] = True
+                            else:
+                                self.active["dbs"].append(db_now)
+                                self.active["last_above"] = datetime.now().astimezone()
+                                self._append_audio(block)
                         else:
-                            self.active["dbs"].append(db_now)
-                            self.active["last_above"] = datetime.now().astimezone()
-                            self._append_audio(block)
+                            # Music-focus mode and not music — don't create incident
+                            if self.active:
+                                self.active["dbs"].append(db_now)
+                                self._append_audio(block)
                     else:
+                        # Filter caught this sound — but noise IS still present above threshold.
                         if self.active:
                             self.active["dbs"].append(db_now)
+                            # Refresh last_above: the mic is hearing continuous above-threshold
+                            # noise even though the source changed. Without this, the incident
+                            # zombie-timeouts despite ongoing noise just because a filter matched.
+                            self.active["last_above"] = datetime.now().astimezone()
                             self._append_audio(block)
+                            # Journal already captures the classification transition (logged above).
+                            # Don't log a separate excluded incident — would double-count.
+                        else:
+                            # No active incident — log as excluded if appropriate.
+                            if self._should_log_excluded():
+                                if self._excluded_id and self._excluded_filter == filter_hit:
+                                    self._extend_excluded_incident(db_now)
+                                else:
+                                    if self._excluded_id:
+                                        self._end_excluded_incident()
+                                    mode = "record_only" if is_night(datetime.now(), self.cfg["detection"]["night_start_hour"], self.cfg["detection"]["night_end_hour"]) else "respond"
+                                    self._begin_excluded_incident(filter_hit, db_now, threshold, mscore, bconf, mode)
                 else:
+                    # Below threshold — check gap-timeout for active incidents
                     if self.active:
                         self.active["dbs"].append(db_now)
                         self._append_audio(block)
                         gap = (datetime.now().astimezone() - self.active["last_above"]).total_seconds()
                         if gap >= float(self.cfg["detection"]["song_gap_merge_sec"]):
                             self._finalize_incident()
+                    # End any active excluded incident (noise dropped below threshold)
+                    if self._excluded_id:
+                        self._end_excluded_incident()
 
                 # Throttle MQTT to avoid flooding the broker (~120 msgs/min → ~12 msgs/min)
                 now_ts = time.time()
@@ -688,9 +952,10 @@ class Engine:
                         self.state.set(mic_ok=False, last_error=f"Device drift: {msg}")
                     last_cleanup = time.time()
 
-            except (sd.PortAudioError, OSError) as e:
-                # Audio I/O errors (USB disconnect, ALSA xrun, disk I/O) are often transient.
-                # Reinitialize the capture device and retry rather than spinning on a dead handle.
+            except (sd.PortAudioError, RuntimeError, OSError) as e:
+                # Audio I/O errors (USB disconnect, ALSA xrun, disk I/O, callback
+                # timeout) are often transient. Reinitialize the capture device and
+                # retry rather than spinning on a dead handle.
                 error_msg = str(e)
                 print(f"[engine] Audio I/O error (attempting reconnection): {error_msg}")
                 self.state.set(mic_ok=False, last_error=error_msg, mode="error")

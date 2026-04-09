@@ -13,6 +13,8 @@ from .storage import Storage
 from .state import StateStore
 from .engine import Engine
 from .ordinance import ORDINANCE, applicable_threshold, is_night
+from .reclassify import analyze_clip
+from .seed import seed_all, DEFAULT_CLASSIFICATION_DIR
 
 cfg = load_yaml()
 storage = Storage(os.path.join(cfg["app"]["shared_dir"], "noise_warden.db"))
@@ -116,8 +118,89 @@ def delete_incident(request: Request, incident_id: int):
 @app.post("/incidents/clear")
 def clear_all_incidents(request: Request):
     must_auth(request)
-    storage.soft_delete_all_incidents()
+    snippets_dir = os.path.join(cfg["app"]["shared_dir"], "snippets")
+    removed = storage.hard_clear_all_incidents(snippets_dir)
+    print(f"[web] Hard-cleared all incidents, removed {removed} snippet file(s)")
     return RedirectResponse(url="/incidents?msg=all-cleared", status_code=303)
+
+@app.post("/incidents/seed")
+def seed_from_classification_data(request: Request):
+    """Re-seed the database from classification_data WAV files.
+
+    Only allowed when the incidents table is empty — prevents accidental
+    duplication of seeded rows alongside real incident data.
+    """
+    must_auth(request)
+    if storage.count_incidents() > 0:
+        return RedirectResponse(url="/incidents?msg=seed-blocked", status_code=303)
+
+    snippets_dir = os.path.join(cfg["app"]["shared_dir"], "snippets")
+    results = seed_all(
+        storage, DEFAULT_CLASSIFICATION_DIR,
+        cfg["detection"], cfg["audio"], cfg, snippets_dir,
+    )
+    count = len(results)
+    print(f"[web] Seeded {count} incident(s) from classification data")
+    return RedirectResponse(url=f"/incidents?msg=seeded-{count}", status_code=303)
+
+
+@app.post("/incidents/{incident_id}/reclassify")
+def reclassify_incident_api(request: Request, incident_id: int, apply: bool = False):
+    """Re-run the DSP pipeline on an incident's snippet with current config thresholds.
+
+    Returns a JSON comparison of old vs new classification. With ?apply=true,
+    writes the new classification and journal back to the database.
+    """
+    must_auth(request)
+
+    inc = storage.get_incident(incident_id)
+    if not inc:
+        raise HTTPException(404, "Incident not found")
+
+    wav_path = inc.get("snippet_path")
+    if not wav_path or not os.path.exists(wav_path):
+        raise HTTPException(404, "No audio snippet available for this incident")
+
+    result = analyze_clip(wav_path, cfg["detection"], cfg["audio"])
+
+    old_class = inc.get("classification") or "unknown"
+    new_class = result["dominant"]
+    class_changed = old_class != new_class
+
+    # Compare journals to detect timeline-only changes (e.g. backdate shifts).
+    # analyze_clip() returns journal entries as tuples, but JSON round-trips
+    # them as lists. Normalize new_journal to lists so the comparison works.
+    import json as _json
+    old_journal_raw = inc.get("class_journal")
+    old_journal = _json.loads(old_journal_raw) if old_journal_raw else []
+    new_journal = [list(entry) for entry in result["journal"]]
+    journal_changed = old_journal != new_journal
+
+    changed = class_changed or journal_changed
+
+    if apply and changed:
+        journal_json = _json.dumps(new_journal)
+        new_class_to_store = new_class if class_changed else old_class
+        with storage.conn() as c:
+            c.execute(
+                "UPDATE incidents SET classification=?, class_journal=? WHERE id=?",
+                (new_class_to_store, journal_json, incident_id)
+            )
+
+    return JSONResponse({
+        "incident_id": incident_id,
+        "old_classification": old_class,
+        "new_classification": new_class,
+        "changed": changed,
+        "class_changed": class_changed,
+        "journal_changed": journal_changed,
+        "applied": apply and changed,
+        "journal": result["journal"],
+        "filter_counts": result["filter_counts"],
+        "n_blocks": result["n_blocks"],
+        "peak_db": result["peak_db"],
+        "avg_db": result["avg_db"],
+    })
 
 @app.get("/snippets/{incident_id}")
 def get_snippet(request: Request, incident_id: int):

@@ -1,5 +1,150 @@
 # noise-warden CHANGELOG
 
+## TESTING RESOURCES:
+
+To help ensure that we don't corrupt our analysis engine, these are the source sound recordings used for initial calibration (TODO: record high-quality audio only, instead of YouTube videos, and add to repository to utilize for known state calibration and quicker self-diagnosis and parameter modification):
+
+- lawn mower: https://www.youtube.com/watch?v=jzwom7I02ks
+- birdsong (robin): https://www.youtube.com/watch?v=CCh-Ga7bu6M
+- diesel truck (TERRIBLE IDEA): https://www.youtube.com/watch?v=3B_2mc2l10s&t=228
+
+Additionally, real-world recordings are saved in `tests/classification_data/` as
+version-controlled WAV files — empirical sources of truth decoupled from the
+incident database. These are replayed through the DSP pipeline during regression
+tests to prevent threshold changes from silently breaking known-good calibrations,
+and can seed a clean database for full reclassification after engine or filter
+changes without needing to manually re-record each sound type.
+
+## v11 - 2026-04-09 — "Tweaker Edition"
+
+<details>
+
+Enhancements to assist in the inevitable tweaking required to actually deploy this solution. Many configuration defaults tweaked after analyzing sample input.
+
+<summary>Key details</summary>
+
+### Sound classification expansion (Tier 1)
+
+- **Ten-category classification** — replaced binary `music_like`/`other` with ten categories: `music`, `music_like`, `unknown`, `impulse`, `thunder`, `rain`, `mower`, `birdsong`, `drive_by`, `forced_test`. Filter-identified sounds are now labeled with their filter name instead of being silently discarded
+- **Birdsong exclusion filter** — new `looks_like_birdsong()` DSP function targeting the 2–8 kHz band (highband_ratio >= 0.55, lowband_ratio <= 0.15, flatness >= 0.30, stable amplitude std <= 4.0). Checked after thunder/impulse and before rain/mower in filter priority order
+- **Excluded incident tracking** — in continuous and intermittent modes, filter-hit sounds are logged as metadata-only incidents with `excluded=1` (no WAV capture, no song-gap merging). Provides an audit trail of what the system heard and why it was dismissed. In `continuous_music_focus` mode, excluded sounds are silently dropped as before
+- **Drive-by reclassification** — drive-by detection now sets `classification='drive_by', excluded=1` instead of soft-deleting the row, preserving the complete detection history
+- **Schema v2** — `ALTER TABLE incidents ADD COLUMN excluded INTEGER DEFAULT 0`. Migration applied automatically on startup via the existing schema-version upgrade path
+- **Dashboard "Class" column** — replaced the "Music Score" column with a "Class" column showing the incident's classification. Tooltip on the column header lists all possible categories for discoverability
+- **Engine refactor** — new internal methods: `_identify_filter()` (priority-ordered filter check), `_classify_sound()` (music/music_like/unknown based on score+confidence thresholds), `_should_log_excluded()`, `_begin_excluded_incident()`, `_extend_excluded_incident()`, `_end_excluded_incident()`
+
+### DSP documentation & sensitivity (Tier 2)
+
+- **Module-level docstring** — `dsp.py` now opens with a pipeline overview and categorization of all "magic numbers" (epsilon values, band-split boundaries, autocorrelation constants) with rationale
+- **Function docstrings with rationale** — every function in `dsp.py` now has a comprehensive docstring explaining what it does, why each constant was chosen, and what real-world sounds motivated the thresholds
+- **Hardcoded thresholds extracted as parameters** — `looks_like_thunder` now accepts `lowband_min` (default 0.55) and `flatness_min` (default 0.45) as keyword arguments. `looks_like_mower` now accepts `env_std_max` (default 3.5), `min_history` (default 6), and `window` (default 12). `looks_like_rain` now accepts `min_history` (default 6) and `window` (default 12). All wired through `noise_warden.yaml` → `engine.py` → `dsp.py`
+- **Config keys added** — `thunder_lowband_min`, `thunder_flatness_min`, and `mower_env_std_max` in `noise_warden.yaml` for field-tuning without code changes
+- **31 sensitivity tests** — `TestMusicLikeScoreSensitivity` (9 tests: lowband boost mapping, saturation, tonal window peak/symmetry/rain-rejection, weight-only cases), `TestBeatConfidenceSensitivity` (5 tests: lag patterns, noise rejection, monotone, boundary), `TestThunderSensitivity` (5 tests: lowband/flatness boundary pairs, configurable override), `TestMowerSensitivity` (5 tests: env_std boundary, configurable override, centroid boundaries), `TestRainSensitivity` (4 tests: min_history boundary, custom min_history, custom window), `TestBirdsongSensitivity` (4 tests: min_history boundary, custom min_history, highband boundary) — **Total: 278 tests passing**
+
+### New sound categories (Tier 3)
+
+- **Weedwhacker detection** — `looks_like_weedwhacker()` targets the 2–6 kHz centroid range with moderate-to-high flatness (0.45+), minimal bass (lowband ≤ 0.15), and moderately steady amplitude (env_std ≤ 5.0). Distinguished from mower by higher centroid and from birdsong by higher flatness and more midband energy. Checked after birdsong and before mower in filter priority
+- **Diesel idle detection** — `looks_like_diesel()` targets low-centroid sounds (≤ 400 Hz) with dominant bass (lowband ≥ 0.45), moderate flatness (0.40–0.65, below rain territory), and very steady amplitude (env_std ≤ 3.0). Requires 8+ seconds of history for sustained-pattern confirmation. Checked after mower in priority to distinguish from higher-frequency mechanical sounds
+- **Conversation detection** — `looks_like_conversation()` targets mid-centroid speech (500–2500 Hz) with moderate flatness (≤ 0.55, speech has harmonics), not bass-dominant (lowband ≤ 0.35), and the key distinguisher: syllable-level amplitude modulation (env_std 3.0–8.0 dB). Requires 10+ seconds of history. Broadest catch — checked last in filter priority. Single speakers are more reliable than groups (groups approach broadband noise)
+- **Filter priority order** — thunder → impulse → birdsong → rain → weedwhacker → mower → diesel → conversation. Most specific patterns first, broadest last
+- **20 config keys added** — all three new filters are fully configurable via `noise_warden.yaml` with documented defaults: `weedwhacker_*` (5 keys), `diesel_*` (6 keys), `conversation_*` (7 keys)
+- **Dashboard/incidents tooltips updated** — Class column tooltip now lists all 13 categories — **Total: 312 tests passing**
+
+### Classification journal & multi-source incidents
+
+- **Classification journal** — active incidents now track a `[(elapsed_sec, classification)]` transition log. Only source changes are recorded (not every block), keeping the journal compact. On finalization, the journal is stored as JSON in a new `class_journal TEXT` column
+- **"(multiple)" suffix** — when an incident's journal contains more than one distinct classification, the original classification is suffixed with " (multiple)" (e.g., `music (multiple)`). Visible at a glance in dashboard and incidents table without requiring popup drill-in
+- **Source timeline in popup** — the incident detail popup renders a "Source timeline" section showing each transition with elapsed time when the journal has multiple entries
+- **`last_above` fix for filter-hit blocks** — when a filter matches during an active incident but noise is still above threshold, `last_above` is now refreshed. Previously, filter-hit blocks didn't update `last_above`, causing the incident to zombie-timeout via `song_gap_merge_sec` despite continuous above-threshold noise
+- **No double-counting** — when a normal incident is active, filter-hit blocks are captured in the journal instead of spawning separate excluded incidents. Excluded incidents are only created when no normal incident is active
+- **Schema v3** — `ALTER TABLE incidents ADD COLUMN class_journal TEXT`. Migration applied automatically. `finalize_incident()` accepts optional `class_journal` and `classification` parameters — **Total: 327 tests passing**
+
+### Reclassify tool & UI
+
+- **Reclassify CLI** (`noise_warden/reclassify.py`) — replay the full DSP pipeline block-by-block on any captured snippet using the current config thresholds. Three modes: single incident by ID, standalone WAV file, or batch all incidents. `--verbose` prints per-block detail; `--update` writes the new classification and journal back to the database. Importable `analyze_clip()` function for programmatic use
+- **Reclassify API endpoint** — `POST /incidents/{id}/reclassify` runs the DSP pipeline on the incident's stored snippet and returns a JSON comparison: old vs new classification, journal timeline, filter distribution, block count, peak/avg dB. Optional `?apply=true` query param writes the new classification and journal to the DB. Auth-protected
+- **In-popup reclassify UI** — "Re-analyze with current config" button in the incident detail popup. Calls the API and renders an inline comparison showing old → new classification (color-coded changed/unchanged), the full journal timeline, and filter distribution. When the classification or timeline has changed, an "Apply" button appears to commit the update without leaving the popup
+- **Calibration workflow** — enables rapid config iteration: tweak thresholds in YAML → click "Re-analyze" on a known incident → see whether the classification improves → apply or discard. No SSH, no CLI, no page reload — **Total: 348 tests passing**
+
+### Filter holdover & detection latency backdate
+
+- **Filter holdover** (`apply_filter_holdover()`) — when a sustained-pattern filter (mower, birdsong, etc.) has been active for `holdover_min_run` consecutive blocks (default 5), it persists through up to `holdover_max_gap` unmatched blocks (default 12). During active holdover, transient filters (impulse) are suppressed by the established filter. Prevents sustained sounds from fragmenting during brief stop/start pauses or momentary signal variations. Real-world example: a 20-minute mower recording that previously showed 11 journal entries (mower → unknown → impulse → mower → ...) now cleanly shows 4
+- **Mower env_std threshold bump** — `mower_env_std_max` raised from 3.5 to 4.5, catching slightly noisier blocks near mower start/stop transitions that were previously falling through to "unknown"
+- **Journal backdate by detection latency** — sustained-pattern filters require `min_history` blocks of data before they can make a confident match. When a filter first triggers, the journal entry is now backdated to the front of the detection window, reflecting when the source _actually started_, not when the system had enough data to confirm it. Example: mower (min_history=6) first confirmed at block 17 → journal entry backdated to block 11. Clamped to never overlap the previous journal entry
+- **`get_filter_detection_latency()`** — DSP helper mapping filter names to their min_history values (mower=6, birdsong=8, conversation=10, diesel=8, rain=6, weedwhacker=6). Instant detectors (impulse, thunder) return 0. Overridable via existing config keys (`birdsong_min_history`, `conversation_min_history`, `diesel_min_history`)
+- **Reclassify Apply for journal-only changes** — the "Apply" button in the re-analyze UI now appears when only the journal/timeline has changed, even if the classification itself is unchanged. Previously, a same-classification result with a different timeline showed "✓ Classification unchanged" with no way to commit the improved journal
+- **Config keys added** — `holdover_min_run: 5`, `holdover_max_gap: 12` in both config YAMLs
+- **Snippet pre-trigger reduced** — `snippet_pre_seconds` reduced from 12 to 2 seconds, saving ~80% of pre-trigger buffer storage while still providing sufficient context — **Total: 370 tests passing**
+
+### Peak-weighted birdsong & classification regression harness
+
+- **Peak-weighted birdsong (Path B)** — `looks_like_birdsong()` now has dual-path detection. Path A (original) targets sustained high-frequency, stable-amplitude calls (warblers, wrens). New Path B targets bursty chirps: a block qualifies if it's a loud peak (dB ≥ mean+10) with extreme highband (≥ 0.89), high centroid (≥ 2800 Hz), and the surrounding window has high amplitude variance (env_std ≥ 8.0). This catches robins, doves, and seagulls whose staccato chirps never triggered Path A's stability requirements. Four new config keys: `birdsong_peak_highband_min`, `birdsong_peak_centroid_min`, `birdsong_peak_db_threshold`, `birdsong_peak_variance_min`
+- **Impulse birdsong exemption** — `_check_impulse()` now returns False for transients with extreme highband (≥ 0.89) and minimal bass (lowband ≤ 0.10). Without this, robin chirps (30+ dB jumps, sharp attacks) always triggered impulse before birdsong could evaluate them. Config keys: `impulse_birdsong_highband_min`, `impulse_birdsong_lowband_max`
+- **Classification regression harness** (`tests/test_classification_regression.py`) — parametrized pytest tests replaying real WAV snippets through `analyze_clip()` and locking expected classifications. Three verified incidents: 63 (mower), 65 (mower), 67 (birdsong). Skips gracefully when `local_data/` is unavailable. Includes a summary test that prints a visual table. Prevents future threshold changes from silently breaking known-good calibrations
+
+### Journal backdate & source timeline UI
+
+- **Journal backdate unknown-overlap fix** — when a filter's backdated entry would overlap with a trailing "unknown" journal entry, the unknown is now replaced instead of clamping after it. Root cause: the initial "unknown" placeholder represented time before the filter had enough history to confirm its detection — not a genuine unknown sound source. This eliminated spurious 1-second unknown gaps before every filter transition. Incident 67 journal: 9 entries → 5 entries, with birdsong spanning continuously from 6s to 34s. Applied to both `reclassify.py` and `engine.py`
+- **Active entry highlighting** — the source timeline in the popup now highlights whichever journal entry covers the current audio playback position. Uses a teal background tint (`.journal-active`), updated at 60fps via the existing `requestAnimationFrame` cursor loop. Also updates on pause, end, and manual seek
+- **Unknown entries dimmed** — journal entries classified as "unknown" no longer have bold text; they render at 50% opacity to keep visual focus on the meaningful classifications
+- **Click-to-seek on journal entries** — each source timeline entry is now clickable. Clicking seeks audio to 0.5 seconds before the entry's start time (half a block lead-in) and begins playback. Provides a quick way to audition the specific segment that triggered a classification — **Total: 375 tests passing**
+
+### Audio capture: blocking → continuous streaming
+
+- **Switched from `sd.rec()` blocking mode to `sd.InputStream` callback mode** — the previous blocking capture model called `sd.rec(22050)` + `sd.wait()` per block, then ran DSP analysis and WAV I/O before starting the next recording. During that processing gap (10–50ms per block), the microphone produced audio that nobody captured. This caused **audible clicks at every 1-second block boundary** — phase discontinuities confirmed by sine-wave analysis (17/23 boundaries showed discontinuity ratios up to 22x the typical sample-to-sample change). Callback mode uses `sd.InputStream`, which captures audio continuously via the OS audio driver; blocks are pushed into a thread-safe queue and consumed by the engine at its own pace. Zero sample loss regardless of processing time
+- **Queue overflow protection** — the callback's `queue.put(block=False)` now handles `queue.Full` by dropping the oldest block. This prevents silent data loss if the engine somehow falls 128+ seconds behind (shouldn't happen in practice, but defensive coding beats silent failure)
+- **Timeout error type corrected** — callback timeout now raises `RuntimeError` instead of `sd.PortAudioError` (which is not a proper exception class in all environments). Engine main loop updated to catch `RuntimeError` alongside `PortAudioError` and `OSError`
+- **Late detection of low-frequency sounds is expected** — manual recording of 200 Hz sine didn't trigger until ~346 Hz because A-weighting penalizes low frequencies heavily (~-10.9 dB at 200 Hz vs ~-4.8 dB at 400 Hz). With the Pi's `calibration_offset_db=88.0`, a -20 dBFS signal at 200 Hz computes to ~57 dBA, below the typical 65 dBA threshold. This is correct A-weighted behavior, not a bug — **Total: 376 tests passing**
+- **Blocking mode removed entirely** — the `_CALLBACK_STREAMS_ENABLED` flag and the `sd.rec()` + `sd.wait()` code path have been deleted. With proven sample loss at every block boundary, there is no valid reason to offer blocking mode as a fallback. The flag, the conditional branch in `read_block()`, and the `TestBlockingMode` test class have all been removed. References in README, plugins.py, and older CHANGELOG entries are now historical context only — **Total: 375 tests passing**
+
+### Clear All Incidents is now a true reset
+
+- **Hard clear replaces soft delete** — "Clear All Incidents" now performs a full database reset: all incident rows are hard-deleted (including previously soft-deleted ones), the SQLite autoincrement counter is reset so the next incident starts at ID 1, all referenced WAV snippet files are removed from disk, the autodismissed quarantine folder is emptied, and VACUUM reclaims disk space. Previously, "clear" only set `deleted=1`, leaving ghost rows, orphaned WAV files, and an ever-climbing ID counter. `soft_delete_all_incidents()` is preserved for programmatic use but the UI action calls `hard_clear_all_incidents()`
+- **Browser caches cleared on reset** — the "Clear All Incidents" button now also purges all Service Worker caches (which hold offline-cached snippet audio) and removes the timeline view state from localStorage before submitting the server-side clear. This ensures a true clean slate — no stale audio data from deleted incidents lingering in the browser — **Total: 378 tests passing**
+
+### Birdsong recalibration & mower dB floor
+
+- **Birdsong threshold recalibration** — after re-recording with continuous capture (no more blocking-mode gaps), robin + background fan hum (incident 5) was misclassified as `unknown (multiple)` with spurious mower entries. Three fixes applied: (1) `birdsong_lowband_max` raised from 0.10 to 0.15 — continuous capture faithfully represents fan/HVAC bass that blocking mode masked; (2) `birdsong_flatness_min` lowered from 0.50 to 0.30 — robin chirps have sharp harmonic peaks (flatness 0.09–0.43) that never reached the original threshold; (3) extreme highband flatness bypass — when `highband_ratio ≥ peak_highband_min` (0.89), the flatness requirement is bypassed entirely, since above-0.89 highband with near-zero lowband is unmistakably birdsong regardless of flatness
+- **Impulse birdsong exemption threshold aligned** — `impulse_birdsong_lowband_max` raised from 0.10 to 0.15 to match the new `birdsong_lowband_max`, preventing robin chirps with incidental fan bass from triggering impulse before birdsong can evaluate them
+- **Mower minimum dB floor** — new `mower_min_db` config key (default 70.0 dBA). Computer fans, HVAC, and similar quiet sources at 55–65 dBA can spectrally mimic a mower (moderate flatness, mid centroid, very stable amplitude) but are far too quiet to be actual lawn equipment. The dB floor rejects these without affecting real mower detection (calibration data: 70+ dBA at any meaningful distance). Incident 5's fan-only tail blocks (61 dBA) no longer false-positive as mower
+
+### Regression harness decoupled from database
+
+- **File-based classification data** — regression tests now replay WAV files from `tests/classification_data/` (version-controlled) instead of looking up snippet paths in the incident database. Recordings are the empirical source of truth, completely decoupled from `local_data/` and the incident lifecycle. Hard-clearing incidents, re-recording, or any database operation no longer affects the regression baseline. Beyond regression testing, these recordings can seed a clean database for full reclassification after engine or filter changes, without needing to manually re-record each sound type -  **Total: 379 tests passing**
+
+### Database seeding from classification data
+
+- **Seed CLI** (`noise_warden/seed.py`) — `python -m noise_warden.seed` discovers all WAV files in `tests/classification_data/`, runs each through the full DSP pipeline via `analyze_clip()`, creates a fully-finalized incident row (timestamps, dB stats, classification, journal), and copies the WAV into the snippets directory with a descriptive filename (`incident_{id}_{source}.wav`). Provides a known-state database for testing UI, reclassification workflows, and engine changes without manual re-recording. `--dry-run` mode analyzes clips without touching the database. `--verbose` shows per-clip block tables. Config auto-detected (local → default) or specified via `-c` — **Total: 388 tests passing**
+
+### Birdsong Path C — extreme spectral purity
+
+- **Path C added to `looks_like_birdsong()`** — when ≥95% of energy resides above half-Nyquist (`highband_ratio ≥ 0.95`) with high centroid (≥2800 Hz) and minimal bass (shared lowband check), the spectral shape alone is diagnostic of birdsong regardless of amplitude dynamics. No common mechanical or environmental noise source (mowers ~0.80 max, HVAC/fans broadband, traffic low-frequency) concentrates energy this extremely. Catches clean bursty recordings where Path A fails on variance and Path B fails because consecutive loud chirps keep the running mean elevated. A dB floor (`mean - 15 dB`) rejects near-silence blocks where noise artifacts produce misleading spectral shapes
+- **Clean robin recording** — replaced `robin_with_fan.wav` (robin + computer fan hum) with `birdsong-american_robin.wav` (pure robin, 44.1 kHz, 40s). The clean recording has extreme amplitude variance (39–92 dBA) with genuine silence between chirps, which broke both Path A (env_std 7–18 vs max 3.0) and Path B (delta only +1 to +8 dB vs threshold 10). Path C correctly classifies 28/40 blocks as birdsong
+- **Config keys added** — `birdsong_purity_highband_min` (default 0.95), `birdsong_purity_db_margin` (default 15.0)
+
+### EQ classification data tool
+
+- **`scripts/eq_classification_data.py`** — formal, extensible tool for reshaping YouTube-sourced recordings to approximate real-world spectral characteristics. Supports frequency-domain EQ (overlap-add FFT), auto-trim to stable segments, and shaped noise mixing (pink/brown) to raise spectral flatness. Per-profile configuration with before/after spectral analysis and reclassify verification
+- **Mower EQ profile working** — YouTube mower recording trimmed to stable 64-second segment (removes quiet intro/outro that inflated env_std from 8.6 to 1.6), EQ'd with bass boost + treble rolloff, pink noise mixed at -16 dB. Result: 57/64 blocks classify as mower (centroid 3503, flatness 0.350, env_std 1.786). Added to regression clips as "pending"
+- **Adaptive mode** — profiles can specify `"adaptive": True` with numerical targets instead of fixed EQ bands. Binary-searches for the minimum spectral tilt (dB/octave) that achieves the centroid target, then the minimum noise level for flatness. An outer retry loop compensates for noise-induced centroid drift. The mower profile now uses adaptive mode — drop any mower recording into `tests/classification_data/`, point the profile at it, and it auto-computes the correct EQ
+- **Diesel EQ profile documented as irreconcilable** — the diesel filter requires centroid ≤400 AND flatness 0.40–0.65, which are mathematically opposed when reshaping a YouTube recording with no bass content. Noise loud enough for flatness pushes centroid too high; noise quiet enough for centroid drops flatness below threshold. Needs real outdoor recording
+
+ — **Total: 392 tests passing**
+
+### Reclassify journal comparison fix
+
+- **Tuple vs list false positive** — `analyze_clip()` returns journal entries as Python tuples `(0, "birdsong")`, but `json.dumps()` → `json.loads()` round-trips them as lists `[0, "birdsong"]`. The reclassify endpoint's `old_journal != new_journal` comparison always reported `journal_changed=True` even when content was identical, creating an infinite loop of "changes detected → apply → changes still detected". Fix: normalize `new_journal` to lists before comparison — **Total: 394 tests passing**
+
+### Web UI seed button
+
+- **"Re-seed from Classification Data" button** — visible on the incidents page only when the database is empty. Calls `POST /incidents/seed` to discover and replay all `tests/classification_data/` WAV files through the DSP pipeline, creating fully-finalized incidents. Auth-protected. Provides a one-click way to repopulate known-state data after a hard clear — **Total: 394 tests passing**
+
+### Incident tail trimming
+
+- **Silent tail removed at finalization** — during the `song_gap_merge_sec` window (default 12s), sub-threshold audio blocks accumulate at the end of every incident. These contribute nothing meaningful but inflate `avg_db` downward and pad the WAV snippet with dead air. At finalization, the engine now detects the gap-timeout tail (blocks after `last_above`), keeps one block for context, and trims the rest from: (1) `dbs` before computing `avg_db`, (2) `dur` for journal dominant-classification duration attribution, and (3) the WAV snippet file. `peak_db` still uses un-trimmed data (valid evidence), and drive-by detection uses the full fade-out shape. A note in the code marks that precision could be improved by trimming to the last positively-classified block instead of last above-threshold block — **Total: 399 tests passing**
+
+</details>
+
 ## v10 - 2026-04-06 — "Smooth Operator Edition"
 
 Polish pass addressing observations from initial local testing. Dashboard decluttered, incidents page brought to parity with dashboard formatting, thresholds page filtered to relevant categories, offline experience hardened, and auto-purge guarded against silent data loss.
