@@ -2,24 +2,213 @@
 
 ## TESTING RESOURCES:
 
-To help ensure that we don't corrupt our analysis engine, these are the source sound recordings used for initial calibration (TODO: record high-quality audio only, instead of YouTube videos, and add to repository to utilize for known state calibration and quicker self-diagnosis and parameter modification):
+To help ensure that we don't corrupt our analysis engine, these are the source sound recordings used for initial calibration (NOTE: quality microphone and FLAC recordings give us the truest data to analyze, which are not available via YouTube compressed uploads):
 
-- lawn mower: https://www.youtube.com/watch?v=jzwom7I02ks
+- lawn mower:
+  - gas: https://creazilla.com/media/audio/15433161/domestic-machines-lawn-mower-fuel
+  - electric: https://creazilla.com/media/audio/15475724/electric-lawn-mower
 - birdsong (robin): https://www.youtube.com/watch?v=CCh-Ga7bu6M
-- diesel truck (TERRIBLE IDEA): https://www.youtube.com/watch?v=3B_2mc2l10s&t=228
+- rolling thunder (light rain): https://freesound.org/people/tim.kahn/sounds/536171/
+- cracking thunder: https://freesound.org/people/Erdie/sounds/23221/
 
-Additionally, real-world recordings are saved in `tests/classification_data/` as
-version-controlled WAV files — empirical sources of truth decoupled from the
-incident database. These are replayed through the DSP pipeline during regression
-tests to prevent threshold changes from silently breaking known-good calibrations,
-and can seed a clean database for full reclassification after engine or filter
-changes without needing to manually re-record each sound type.
+> [!WARNING]
+> WARNING: DO NOT USE YOUTUBE RECORDINGS--THEY TEND TO EXHIBIT THE EXACT _OPPOSITE_ OF REAL-LIFE FULL_SPECTRUM RECORDINGS.
 
-## v11 - 2026-04-09 — "Tweaker Edition"
+Past Bad Ideas:
+
+- (TERRIBLE IDEA--basically the inverse of real-life): https://www.youtube.com/watch?v=jzwom7I02ks
+- diesel truck (TERRIBLE IDEA--inverse of real-life): https://www.youtube.com/watch?v=3B_2mc2l10s&t=228
+
+Additionally, real-world recordings are saved in `tests/classification_data/` as version-controlled WAV files — empirical sources of truth decoupled from the incident database. These are replayed through the DSP pipeline during regression tests to prevent threshold changes from silently breaking known-good calibrations, and can seed a clean database for full reclassification after engine or filter changes without needing to manually re-record each sound type.
+
+## v12 - 2026-04-11 — "Pro Edition"
+
+Enhancements to assist in the inevitable tweaking required to actually deploy this solution. Many configuration defaults tweaked after analyzing real-world input. Regression tests built up to continue to only get better without future silent breakages.
 
 <details>
 
+<summary>Key details</summary>
+
+### Conversation filter tightening
+
+- **Music score guard** — `looks_like_conversation()` now rejects blocks where `music_like_score(features)` exceeds `max_music_score` (default 0.55). The filter chain runs *before* `_classify_sound()` in the engine loop, so without this guard, vocal music with a matching centroid (500–2500 Hz) and syllable-like modulation would be misclassified as conversation before the music classifier ever ran. Real conversation scores 0.43–0.53 (light bass, moderate tonal); music through walls scores 0.65+ (heavy bass + strong tonal). The 0.55 threshold sits in the clean gap between these distributions. Corrected the misleading docstring that previously claimed "the music_like_score check in the engine runs first"
+- **Minimum dB floor** — new `conversation_min_db` config key (default 0.0 — disabled). When set to e.g. 60.0, rejects quiet ambient conversations below nuisance level. Analogous to the mower filter's `mower_min_db` parameter
+- **Midband energy minimum** — new `conversation_midband_min` config key (default 0.25). Speech concentrates energy in the formant/midband region (250–4000 Hz). Blocks with very little midband energy are more likely broad environmental noise than human voices, even if centroid and modulation happen to match
+- **Config keys added** — `conversation_max_music_score`, `conversation_min_db`, `conversation_midband_min` in `noise_warden.yaml`
+- **9 new conversation sensitivity tests** — music score guard (reject vocal music, allow speech, configurable threshold, disable at zero), min dB floor (reject quiet, disabled by default), midband minimum (reject low midband, configurable) — **Total: 423 tests passing**
+
+### Classification journal display for all incidents
+
+- **Single-entry journals now visible** — the source timeline section in the incident detail popup previously required `journal.length > 1` (multi-source incidents only). Now displays for any journal with ≥ 1 entry. For seeded incidents with a single classification, this provides confirmation that the DSP pipeline ran and identified the source correctly. Journal highlighting, click-to-seek, and unknown dimming all work as before
+- **Timeline page journal fix** — the `/timeline` route was missing `class_journal` from the incident data it serialized to the client. Timeline popups never showed the source timeline for any incident — live or seeded. Fixed by adding `class_journal` to the timeline's incident builder
+
+### Engine hardening
+
+- **`capture.close()` wired on shutdown** — `Engine.stop()` now calls `self.capture.close()` to release the `InputStream` audio resource. Previously, the stop path called `relay.cleanup()` but skipped audio teardown. In blocking-via-sd.rec mode this was harmless (sd.rec exits naturally), but with callback streams the `InputStream` would leak until process exit
+- **Audio reinit closes old capture** — the error-handler path that creates a new `AudioCapture` on I/O failure now calls `self.capture.close()` before instantiating the replacement. Previously, the old capture was silently abandoned, leaking the `InputStream` if callback mode was active
+
+### Thunder Path B — sustained rumble detection
+
+- **Dual-path thunder detection** — `looks_like_thunder()` now has two detection paths. Path A (original) targets sharp cracks: single-block 18+ dB delta with high bass (lowband > 0.55) and broadband energy (flatness > 0.45). New Path B targets sustained rumble from mellow/distant storms: very low centroid (≤ 1300), extremely low flatness (≤ 0.15, energy concentrated not spread), dominant midband (≥ 0.40), and loud (≥ 95 dBA). Requires `min_history` ≥ 6 blocks. Root cause: mellow thunderstorms have the *opposite* spectral profile from Path A — gradual ramps (max ~5–8 dB/block), very low flatness (0.06–0.17), and variable lowband. The critical separator from mower: mower flatness is always ≥ 0.25, while thunder rumble is < 0.15
+- **Recording quality matters** — investigation revealed that consumer microphones lack bass content entirely (lowband max 0.41), making thunder classification impossible. Replaced source recording with Sennheiser MKH 8020SP material that faithfully captures real thunder bass (lowband 0.57–0.70 on loud claps)
+- **Config keys added** — `thunder_rumble_centroid_max`, `thunder_rumble_flatness_max`, `thunder_rumble_midband_min`, `thunder_rumble_min_db`, `thunder_rumble_min_history`, `thunder_rumble_window` in both config YAMLs — **Total: 407 tests passing**
+
+### Priority-aware holdover
+
+- **Higher-priority filters can break lower-priority holdovers** — `apply_filter_holdover()` now consults `FILTER_PRIORITY` (derived from `FILTER_CHAIN` order) and a configurable `holdover_priority_breakers` list (default: `"thunder"`). When a holdover-breaker filter matches raw during a lower-priority holdover, it breaks through immediately instead of being suppressed. Each breaker-eligible filter has strong internal consistency guarantees (e.g., thunder Path B requires 6+ blocks of sustained matching before it fires), so the break is genuine, not a transient blip. Non-breaker filters (impulse, weedwhacker, etc.) continue to be suppressed by active holdovers, preserving the existing transient-suppression behavior
+- **Canonical case** — thunder-and-light-rain recording: mellow rain spectrally mimics a mower (centroid 1200–3500, flatness 0.25–0.37, low env_std), triggering mower holdover. When a thunder clap hits (centroid < 1000, flatness < 0.08, 104+ dB), thunder now breaks through instead of being absorbed by mower holdover. Result: thunder 55 blocks (was 25), mower 15 (was 25), dominant classification `thunder (multiple)`
+- **`FILTER_PRIORITY` dict** — auto-derived from `FILTER_CHAIN` — lower index = higher priority. Used only by `apply_filter_holdover()`
+- **Config key added** — `holdover_priority_breakers: thunder` in both config YAMLs. Comma-separated list of filter names eligible to break holdovers. Extensible without code changes
+- **Regression clips added** — `thunder-and-light-rain.wav` (locked, expected `thunder (multiple)`) and `thunder-cracks.wav` (locked, expected `unknown (multiple)`) added to `test_classification_regression.py` — **Total: 414 tests passing**
+
+### Dominant classification accuracy
+
+- **Unknown/none exclusion** — `_compute_dominant()` in `reclassify.py` and the parallel inline logic in `engine._finalize_incident()` now exclude `"unknown"` and `"none"` from the duration-weighted classification contest. Falls back to the full set only if every entry is ignorable. Root cause: recordings with long silence between sound events (e.g., thunder-cracks.wav with 85 blocks of "none" vs. 14 blocks of actual sources) were classified as `"unknown (multiple)"` instead of the real dominant source. Regression expectation for thunder-cracks.wav updated from `"unknown (multiple)"` to `"thunder (multiple)"`
+- **3 new tests** — `test_unknown_excluded_from_dominant`, `test_none_excluded_from_dominant`, `test_all_unknown_falls_back`
+
+### Timeline and display polish
+
+- **Timeline block labels show classification** — blocks now display `"mower (+12.3dB, 2m 15s)"` instead of `"65 dB · 2m 15s"`. The classification label (with trailing "(multiple)" stripped) immediately communicates the source type at a glance. Label child element always rendered (was gated to blocks ≥ 22px), using flexbox centering to fill the block — short blocks clip naturally via `overflow:hidden`
+- **Daytime/nighttime terminology** — all user-facing "day"/"night" period labels changed to "daytime"/"nighttime" across popup badges, threshold labels, thresholds page column headers, and the web route period string. Ordinance data dictionary keys (`day`/`night`) are structural and unchanged
+
+### Regression clips — real-world source recordings
+
+- **mower-gas.wav** (locked) — real outdoor gas mower. Classifies as `mower (multiple)` after birdsong variance tightening. Only 1/51 blocks hits mower (centroid 3920) — coverage would improve by raising `mower_centroid_max_hz` since this mower's centroid averages 5000–7000 Hz
+- **mower-electric.wav** (pending) — real outdoor electric mower. Classifies as `weedwhacker (multiple)` — a reasonable misclassification given the similar high-frequency whine. May warrant a broader "lawn equipment" category in future
+- **birdsong-morning.wav** (locked) — real outdoor multi-bird morning chorus including robins. 130/141 blocks classify as birdsong via Path A. env_std 0.13–0.77 — the calibration anchor for the tightened `birdsong_amplitude_std_max`
+- **birdsong-chorus.wav** (locked) — real outdoor multi-species chorus (wrens, mourning doves, robins). Lower centroid than morning chorus (mean 3799 Hz). Was misclassified as `mower (multiple)` before mower filter tightening — the key calibration clip for the mower–birdsong boundary
+- **YouTube mower recordings retired** — `mower.wav` (raw, 130/134 blocks unclassified) and `mower-eq.wav` (artificially EQ'd to force-fit mower filter thresholds) deleted from `classification_data/`. Spectral comparison against the real gas mower recording showed the YouTube material had fundamentally different energy distributions — the EQ process invented a mower profile that doesn't exist in nature. Real-world recordings now serve as the sole calibration anchors
+
+### Birdsong Path A variance tightening
+
+- **`birdsong_amplitude_std_max` reduced from 3.0 to 1.0** — birdsong Path A (sustained/tonal detection) now requires much tighter amplitude stability. Real sustained birdsong (multi-bird morning chorus) peaks at env_std 0.77. Gas mower false-positive blocks had env_std 1.29–2.34, sitting in a clear gap above the new threshold. The bursty Path B (variance ≥ 8.0) and extreme purity Path C are unaffected — they don't check `variance_max`. Calibrated against three recordings: birdsong-morning.wav (sustained, max 0.77), birdsong-american_robin.wav (bursty, 2.5–15.8), and mower-gas.wav (false positives at 1.29–2.34)
+
+### Mower filter tightening
+
+- **Flatness threshold raised from 0.25 to 0.28** — bird chorus recordings with lower-frequency species (wrens, mourning doves) produced blocks with flatness 0.251–0.269 that squeaked past the old 0.25 floor. Real gas mower minimum flatness is 0.282 — clean separation. Eliminated 4 of 5 false mower blocks from birdsong-chorus.wav
+- **Highband ceiling added (`mower_highband_max`: 0.75)** — mowers are mid-frequency drones; real mower blocks peak at highband 0.664. Bird choruses with matching centroid + flatness have highband 0.80+. The ceiling catches the remaining false-positive block (highband 0.805) that flatness alone couldn't reject. All legitimate mower blocks across all clips (gas mower, thunder-rain, thunder-cracks) have highband ≤ 0.664
+- **Config keys updated** — `mower_flatness_threshold: 0.28`, `mower_highband_max: 0.75` in both config YAMLs
+- **2 new mower tests** — `test_high_highband_rejected` (chorus-like profile rejected), `test_highband_at_ceiling_passes` (boundary inclusion)
+
+### Rain filter recalibration
+
+- **Real-world calibration from `rain.wav`** — the rain filter was previously calibrated from guesswork (flatness threshold 0.72, variance 2.5). Real outdoor rain recorded at 100+ dBA showed flatness 0.27–0.38, env_std < 0.50, lowband 0.08–0.14, and centroid 3130–4023. The old 0.72 threshold was so high that 100% of rain blocks fell through to the mower filter instead
+- **Flatness threshold reduced from 0.72 to 0.27** — real rain is only moderately flat (broadband but not white noise). The old threshold was looking for something flatter than rain actually is
+- **Variance threshold reduced from 2.5 to 1.5** — rain amplitude is extremely steady once established (env_std < 0.50). Tighter variance improves specificity
+- **Lowband minimum added (`rain_lowband_min`: 0.07)** — the key separator from mower. Rain excites bass evenly (lowband 0.08–0.14) while mowers have very little bass (lowband 0.02–0.06) because engine vibration is a mechanical mid-frequency drone. This single parameter prevents nearly all mower/rain confusion
+- **Centroid ceiling added (`rain_centroid_max_hz`: 5000)** — prevents birdsong blocks with incidental bass content (from ambient fan/HVAC, lowband 0.12–0.19) from being absorbed by the rain filter. Rain centroid maxes at ~4023 Hz; birdsong false-positives start at 5800+
+- **rain.wav** (locked) — real outdoor rain, classifies as `rain (multiple)`. 68/73 blocks classified as rain
+- **Existing rain unit tests recalibrated** — all 14 references to old 0.72/2.5 thresholds updated to 0.27/1.5. Feature dicts updated to realistic rain spectral profiles. 8 new rain sensitivity tests added for lowband_min boundaries, centroid_max boundaries, and configurable overrides for both
+- **TestIdentifyFilter config updated** — `DEFAULT_DET` dict now includes `rain_lowband_min` and `rain_centroid_max_hz` keys. Two tests with flatness 0.30 (which now trips the recalibrated rain filter) fixed with lower flatness values
+
+### Diesel filter recalibration
+
+- **Complete rewrite from real recording** — the diesel filter was previously calibrated from guesswork targeting heavy truck idle (centroid ≤ 400, flatness 0.40–0.65, lowband ≥ 0.45). Real diesel car at ~71 dBA showed a completely different profile: flatness 0.12–0.16 (very tonal engine harmonics), centroid 1441–2023 Hz (mid-frequency, not bass), lowband 0.14–0.25, midband 0.22–0.35, env_std ~2.0 steady. The old filter matched 0 of 21 blocks
+- **Tonal harmonics are the key feature** — diesel engines produce strong periodic harmonics from the firing cycle, resulting in extremely low spectral flatness. This is the defining characteristic and the primary separator from all other categories
+- **Parameters completely replaced**:
+  - `diesel_centroid_max_hz`: 400 → 3600 (real car centroid goes up to 2023; headroom for trucks)
+  - `diesel_centroid_min_hz`: new, 1200 (separates from very low-frequency thunder rumble)
+  - `diesel_flatness_max`: 0.65 → 0.20 (real car 0.12–0.16; clean gap from mower ≥ 0.28 and rain ≥ 0.27)
+  - `diesel_lowband_min`: 0.45 → 0.10 (real car 0.14–0.25; separates from birdsong ≤ 0.09)
+  - `diesel_midband_min`: new, 0.20 (engine energy in mid frequencies)
+  - `diesel_env_std_max`: 3.0 → 3.0 (kept tight to limit thunder ambient false-positives)
+  - `diesel_flatness_min` removed (no longer a flatness band; just a ceiling)
+- **Thunder overlap managed via tight thresholds** — initial calibration with flatness_max=0.30 and env_std_max=4.5 caught 70 false-positive blocks in thunder-and-light-rain.wav (ambient storm rumble has similar tonal character). Tightened to flatness_max=0.20 and env_std_max=3.0, reducing to 48 blocks — thunder (55 blocks) now clearly wins the dominant contest
+- **diesel-car.wav** (locked) — real diesel car, classifies as `diesel (multiple)`. 9/21 blocks classify as diesel once min_history (8) is satisfied and env_std stabilizes
+- **All diesel unit tests rewritten** — 7 core tests updated to real-world profile, plus 7 sensitivity tests recalibrated (centroid min/max boundaries, flatness boundary, lowband boundary, midband boundary, min_history, configurable env_std). 2 engine integration tests updated
+
+### Birdsong Path D — multi-species chorus detection
+
+- **Problem** — birdsong-chorus.wav (real outdoor multi-species chorus: wrens, mourning doves, robins) classified only 1/165 blocks as birdsong, with the rest falling through to unknown. The chorus env_std median (4.9) far exceeds Path A's 1.0 ceiling, highband median (0.679) sits just below Path A's 0.70 threshold, and centroids (1330–2885) are too low for Paths B/C (need ≥ 2800)
+- **Solution** — Path D uses temporal highband variance via a new `feature_history` buffer (maintained by engine and reclassify tool, 24 blocks deep). Multi-species choruses produce significant block-to-block variation in highband_ratio (std 0.05–0.16) as different species alternate calls, while mowers (std 0.03–0.09) and other mechanical sources produce stable values
+- **Two safety margins prevent false positives:**
+  1. Window-wide lowband ceiling: ALL blocks in the 12-block window must have lowband ≤ 0.12. This rejects thunder (0.55+ on crack blocks), mower (windows always contain some 0.12+ blocks), rain (0.16+), diesel (0.19+), and birdsong-morning (0.17+)
+  2. Minimum highband std ≥ 0.10: rejects monotone steady-state sources. Mower-gas max hb_std: 0.106 (7/91 windows pass, not enough to flip dominant)
+- **Plumbing** — `identify_filter()` and all 8 `_check_*` functions accept optional `feature_history` parameter (only `_check_birdsong` uses it). Engine maintains `self.feature_history` (24-block sliding window). Reclassify tool mirrors the same buffer
+- **Result** — 78/165 blocks now classify as birdsong (77 via Path D, 1 via Path A). Dominant: `birdsong (multiple)` ✓
+- **Cross-validated against all 10 regression clips** — no regressions. Clean separation on lb_max_in_window (chorus ≤ 0.133 vs mower-gas ≥ 0.123) and hb_std (chorus median 0.112 vs mower-gas median 0.085)
+- **Config keys added** — `birdsong_chorus_highband_std_min` (0.10), `birdsong_chorus_lowband_max` (0.12), `birdsong_chorus_min_history` (12) in both YAML configs
+- **6 Path D core tests** — chorus accepted, no feature history falls through, short history rejected, high lowband in window rejected, low highband variance rejected, Path A still fires when Path D available
+- **5 Path D sensitivity tests** — highband std boundary, lowband max boundary, chorus min history boundary, custom min history, custom highband std min
+
+### Amplified bass filter + music score guard
+
+- **Problem** — `idiot-neighbor-mild-85db.wav` (real neighbor playing boosted bass music through garage walls at ~90 dB) had 16/59 blocks stolen by rain and 7/59 by mower. The bass-through-walls spectral profile (steady broadband, decent lowband) overlaps rain/mower thresholds, causing misclassification
+- **Two-pronged solution:**
+  1. **Music score guard on rain + mower** — both `looks_like_rain()` and `looks_like_mower()` now reject blocks where `music_like_score(features)` exceeds `max_music_score` (default 0.70). Safe threshold: rain mscore maxes at 0.593, mower-gas at 0.548, mower-electric at 0.637 (0/137 blocks ≥ 0.70). Bass music: 58/59 blocks ≥ 0.70. Provides defense-in-depth alongside the dedicated filter
+  2. **Dedicated `amplified_bass` exclusion filter** — new `looks_like_amplified_bass()` function in `dsp.py`. Detects bass-heavy music through walls using music_like_score (≥ 0.60), lowband (≥ 0.20), centroid (≤ 4000 Hz), amplitude stability (env_std ≤ 3.0), and a dB floor (≥ 65.0). Inserted into FILTER_CHAIN between birdsong and rain (priority 3). The music score is the primary discriminator — no other filter's source material scores above 0.60 with this lowband + centroid combination
+- **Real-world calibration** — corrected initial centroid estimate from "1200–1900 Hz" to actual 2041–3545 Hz after diagnostic analysis revealed the earlier summary was wrong. Updated centroid_max from 2000 to 4000 and lowband_min from 0.35 to 0.20 based on actual per-block spectral data
+- **Filter chain now 9 filters** — thunder → impulse → birdsong → **amplified_bass** → rain → weedwhacker → mower → diesel → conversation
+- **Config keys added** — `amplified_bass_min_music_score` (0.60), `amplified_bass_lowband_min` (0.20), `amplified_bass_centroid_max_hz` (4000), `amplified_bass_env_std_max` (3.0), `amplified_bass_min_history` (6), `amplified_bass_min_beat_confidence` (0.20), `rain_max_music_score` (0.70), `mower_max_music_score` (0.70) in both config YAMLs
+- **Regression clip added** — `idiot-neighbor-mild-85db.wav` (locked, expected `amplified_bass (multiple)`)
+- **10 amplified bass core tests** — bass profile detected, low mscore/lowband/centroid/env rejected, quiet rejected, short history rejected, no db_now skips floor, mscore boundary, diesel/rain don't match
+- **12 amplified bass sensitivity tests** — min_history boundary, lowband boundary (with mscore isolation), centroid boundary, dB boundary, custom min_db, env_std boundary
+- **6 music score guard tests** — rain rejected by high mscore, rain passes with real mscore, rain guard configurable; same trio for mower
+- **2 existing test fixtures adjusted** — fan fixture lowband 0.39→0.10 (unrealistically bass-heavy for HVAC), engine no-filter fixture lowband 0.4→0.20 (was triggering new amplified_bass filter)
+- **`amplified_bass_min_db` removed** — the noise_floor_db gate (50 dBA) and ordinance recording thresholds already ensure only nuisance-level sounds reach DSP analysis; the min_music_score check is a far stronger discriminator than a dB floor for this category
+
+### Beat confidence bug fix
+
+- **`seed.py` used block 0's bconf — always 0.0** — `beat_confidence_from_history()` requires 8+ dB readings to produce a non-zero value, but the seeder was grabbing `result["blocks"][0]["bconf"]` (block 0 has only 1 reading). Changed to use `result["blocks"][-1]` which has the full history. Same fix applied to `music_like_score` for consistency (mscore works per-block but block 0's spectrum isn't representative of the clip)
+- **`reclassify --update` now writes `beat_confidence` and `music_like_score`** — the single-incident and batch reclassify UPDATE statements previously only wrote `classification` and `class_journal`. Now also updates `beat_confidence` and `music_like_score` from the last block, so existing seeded incidents can be corrected by re-running `reclassify --update`
+
+### Intra-block beat detection
+
+- **Problem** — beat confidence was measured only at macro scale (inter-block dB variation), detecting amplitude patterns repeating every 2–8 seconds (7.5–30 BPM). Actual musical beats at 80–180 BPM occur *within* each 1-second block and get averaged into flat RMS readings — invisible to inter-block correlation. The prior docstring incorrectly claimed "lag 2 = 120 BPM" when 1 block/sec resolution means lag 2 = 30 BPM
+- **Solution** — new `intra_block_beat_confidence(block, sr)` computes a short-time RMS energy envelope at 10ms hop (100 frames/sec), then autocorrelates at lags 33–75 (corresponding to 180–80 BPM). Clear amplitude pulses from musical beats produce high autocorrelation peaks. A coefficient-of-variation guard (< 5%) catches constant-energy signals (pure tones, steady noise) whose near-zero-variance envelopes would otherwise produce spuriously high correlation from float-precision noise
+- **Normalization fix** — removed the `(corr+1)/2` normalization from both intra and inter-block functions. Raw normalized autocorrelation is already in [0,1] for the positive-max we take; the `(+1)/2` shift was compressing all values into [0.5,1.0], making the metric useless for discrimination (rain: 0.68, gas mower: 0.90, bass music: 0.84 — everything looked the same)
+- **Inter-block removed from combined function** — `beat_confidence()` now uses intra-block only. The inter-block component was measuring dB *stability*, not rhythm — any steady source (mower: 0.805, thunder-rain: 0.773) autocorrelates strongly simply because dB levels don't change much between blocks. `_inter_block_beat_confidence()` is retained but no longer contributes to the combined score
+- **Beat confidence wired into amplified_bass filter** — new `min_beat_confidence` parameter (default 0.20, config key `amplified_bass_min_beat_confidence`) gates the filter to require rhythmic content. The `beat_confidence` value is now threaded through `identify_filter()` → `_check_*()` dispatch. At 0.20, 90% of real bass music blocks pass; non-musical sources that could clear the other amplified_bass gates (mscore, lowband, centroid) are already rejected by the mscore gate
+- **Reclassify summary now shows beat/music values** — `print_summary()` displays the last block's music_like_score and beat_confidence, providing visibility without needing `--verbose`
+- **Threshold recalibration** — global `min_beat_confidence`: 0.38 → 0.20; `amplified_bass_min_beat_confidence`: 0.20 (new). Both calibrated for the raw [0,1] scale where bass music scores 0.04–0.86 (median 0.54, p25 0.30)
+- **Validation against regression clips (final raw values):**
+  - Bass music: **0.68** ← clearly highest among non-engine sources
+  - Diesel: 0.31 (genuinely periodic engine firing — correct)
+  - Birdsong morning: 0.26
+  - Robin: 0.19
+  - Mower electric: 0.14
+  - Thunder-rain: 0.14
+  - Thunder-cracks: 0.09
+  - Rain: 0.00
+  - Gas mower: 0.00
+  - Birdsong chorus: 0.00
+- **11 tests updated** — `TestCombinedBeatConfidence` rewritten (3 tests: equals intra, ignores inter, accepts db_history param), `TestIntraBlockBeatConfidence` thresholds recalibrated for raw scale, amplified_bass beat_confidence gate tests added (3 tests: low bconf rejected, high accepted, None skips check)
+
+### Classification suffix "+" logic
+
+- **Problem** — when an incident's journal contains one real classification and one or more `unknown` entries, `_compute_dominant()` produced `"class (multiple)"` — implying multiple distinct sources were present, when in reality it's just one source with some unclassifiable blocks. Misleading in the UI and for analysis
+- **Solution** — new three-way suffix: bare name (single source only), `"class+"` (one real source + ignorable entries like `unknown`/`none`), `"class (multiple)"` (two or more real sources). Updated `_compute_dominant()` in `reclassify.py` and the parallel inline logic in `engine._finalize_incident()`
+- **Timeline regex updated** — `timeline.html` strip regex now handles both suffixes: `.replace(/ \(multiple\)$/, '').replace(/\+$/, '')`
+- **Test fix** — existing `_compute_dominant` test that used `"mower"` (which backdates and erases unknown) changed to `"music_like"` to properly exercise the unknown+real suffix path
+
+**Total: 493 tests passing**
+
+### Open-window bass recalibration + flatness diesel guard
+
+- **Problem** — two new recordings of the same neighbor's bass music (recorded with windows/doors open instead of through garage walls) misclassified entirely: `medium-90db` as `"mower (multiple)"` and `medium-with-truck` as `"rain (multiple)"`. With more spectrum passing through open windows, the signal becomes less bass-dominant: lowband drops from 0.43 (through-wall median) to 0.19, mscore drops from 0.73 to 0.50, centroid rises from 2800 to 2977. The original amplified_bass thresholds (mscore ≥ 0.60, lowband ≥ 0.20) were calibrated entirely from through-wall recordings and missed this scenario
+- **Threshold matrix testing** — surveyed spectral profiles of all 7 relevant clips (3 bass, rain, 2 mower, diesel) and tested 6 threshold proposals. Zero false positives on all non-bass clips across all proposals — the separation between bass music and rain/mower/diesel is multi-dimensional and robust
+- **New thresholds:**
+  - `amplified_bass_min_music_score`: 0.60 → **0.45** (open-window median 0.50; rain max 0.503 but blocked by lowband)
+  - `amplified_bass_lowband_min`: 0.20 → **0.16** (open-window median 0.19; rain max 0.137, margin 0.023)
+  - `amplified_bass_flatness_min`: **0.20** (NEW) — diesel guard replacing beat confidence. Diesel flatness median 0.151 (max 0.285 but only 1/21 blocks); bass music minimum 0.207 across all recordings. Clean separation
+  - `amplified_bass_min_beat_confidence`: 0.20 → **0.0** (disabled) — truck/wind noise overlays destroy rhythm detection. The medium-with-truck clip has bconf median 0.00. Flatness handles diesel separation instead
+- **Results after recalibration:**
+  - `medium-90db`: **37/49** amplified_bass → `amplified_bass (multiple)` (was 0/49)
+  - `medium-with-truck`: **28/33** amplified_bass → `amplified_bass (multiple)` (was 1/33)
+  - `mild-85db` (original): 24/29 → `amplified_bass (multiple)` (unchanged ✓)
+  - Rain, mower (both), diesel, birdsong (3), thunder (2): all unchanged, zero false positives ✓
+- **Regression clips added** — `idiot-neighbor-medium-90db.wav` (locked, expected `amplified_bass (multiple)`) and `idiot-neighbor-medium-with-truck.wav` (locked, expected `amplified_bass (multiple)`)
+- **Tests updated** — `test_low_beat_confidence_rejected` now explicitly passes `min_beat_confidence=0.20` (default is 0.0). New tests: `test_beat_confidence_disabled_by_default`, `test_low_flatness_rejected` (diesel guard). Boundary tests recalibrated: lowband boundary 0.20→0.16, mscore boundary adjusted accordingly
+
+**Total: 497 tests passing**
+
+</details>
+
+## v11 - 2026-04-09 — "Tweaker Edition"
+
 Enhancements to assist in the inevitable tweaking required to actually deploy this solution. Many configuration defaults tweaked after analyzing sample input.
+
+<details>
 
 <summary>Key details</summary>
 

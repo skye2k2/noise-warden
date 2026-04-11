@@ -350,10 +350,10 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 | `filters` | Per-filter enable toggles and tuning parameters for impulse, drive-by, mower-like, thunder-like, and rain-like exclusions |
 | `web` | Host, port, dashboard refresh interval |
 
-### TROUBLESHOOTING configuration tweaking
+### Troubleshooting configuration tweaking and adding your own calibration test sounds
 
 > [!TIP]
-> If you, like me, do not have access to high-end recording equipment, you might try calibrating and testing your noise-warden configuration using a handy YouTube or sound site recording. _Extensive_ analysis of exactly this kind of source data has revealed that YouTube submissions and subsequent compression completely washes out the volume of diesel engines, to the point of not being able to ever trigger the detection criteria. You can try if you want, but be warned.
+> If you, like me, do not have access to high-end recording equipment, you might try calibrating and testing your noise-warden configuration using a handy YouTube or sound site recording. _Extensive_ analysis of exactly this kind of source data has revealed that YouTube submissions and subsequent compression completely washes out the volume of diesel engines, to the point of not being able to ever trigger the detection criteria. You can try if you want, but be warned. However, high-fidelity FLAC recordings by design contain the data we need as part of the digital signal processing engine, provided that the microphone used was not absolute garbage. Many times you can find helpful audiophiles on [freesound.org](freesound.org) whose audio files (pun intended) meet our criteria. You can then download, downsample, decouple, and export to an uncompressed mono WAV at a sample rate of 44.1khz and 16-bit depth using your sound editor of choice.
 
 ## Features
 
@@ -499,8 +499,9 @@ Add to crontab (`crontab -e`):
 - TODO: We could also potentially provide clean recordings of birds (robin, seagull, dove, quail, crow, sparrow-finch-things, roosters) to either identify and record or definitively _exclude_, based on spectral matching. Then potentially other things, like car alarms, lawn mowers, and weedwhackers.
 - TODO: Consider alternate usage scenario as a cheap sleep snoring monitor--enabled for _nighttime_ only, coupled with a deep sleep monitor, some correlations could be determined. And easier than having a recorder run _all_ night, and then needing to scrub eight hours of recording for potential data.
 - TODO: Consider minority impulse and unknown entries to not be technically part of the (multiple) stipulation.
-- TODO: The yaml configuration has some odd sorting, like which things are put under `audio` versus `detection`. I might change audio to recording, and move things like noise_floor_db and calibration_offset_db into it.
-- TODO: How did a _lawn mower_ get a music-like score of .55 and actual birdsong only get a score of .19? TODOTODO: After re-recording, see what our new values are
+- TODO: Now that we have a number of different classifications, i see them being applied a little too strictly, like in thunder-and-light-rain and thunder-cracks--if we are only going to classify something for a block or three, differently than the sweeping majority, it should not be bolded. Or maybe more, if we implement weighting and backtracking. Because, for example, we _know_ that thunder rumble trail off looks like a diesel, but the odds that someone started their diesel up _right_ as a thunderclap hits is extraordinarily low, so we should clamp.
+- TODO: The yaml configuration has some odd sorting and grouping, like which things are put under `audio` versus `detection`. I might change `audio` to `recording`, and move things like `noise_floor_db` and `calibration_offset_db` into it.
+- TODO: Make sure that the system will function the same with 48kHz sampling and recording.
 
 ### Architecture
 

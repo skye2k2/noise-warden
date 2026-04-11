@@ -6,7 +6,7 @@
 
   <h3>Ordinance Limits ({{ zone_label }})</h3>
   <table>
-    <tr><th>Category</th><th>Day ({{ ordinance.measurement.day_start }}:00–{{ ordinance.measurement.night_start }}:00)</th><th>Night ({{ ordinance.measurement.night_start }}:00–{{ ordinance.measurement.day_start }}:00)</th></tr>
+    <tr><th>Category</th><th>Daytime ({{ ordinance.measurement.day_start }}:00–{{ ordinance.measurement.night_start }}:00)</th><th>Nighttime ({{ ordinance.measurement.night_start }}:00–{{ ordinance.measurement.day_start }}:00)</th></tr>
     {% for key, vals in zone_thresholds.items() %}
     <tr{% if key == active_rule %} class="active-rule"{% endif %}>
       <td>{{ key }}{% if key == active_rule %} <span class="small">(active)</span>{% endif %}</td>
@@ -24,7 +24,7 @@
     <tr><td>Active rule</td><td>{{ active_rule }}</td></tr>
     <tr><td>Current threshold</td><td>{{ active_threshold }} dBA ({{ period }})</td></tr>
     <tr><td>Calibration offset</td><td>{{ cfg.detection.calibration_offset_db }} dB</td></tr>
-    <tr><td>Night hours</td><td>{{ cfg.detection.night_start_hour }}:00–{{ cfg.detection.night_end_hour }}:00</td></tr>
+    <tr><td>Nighttime hours</td><td>{{ cfg.detection.night_start_hour }}:00–{{ cfg.detection.night_end_hour }}:00</td></tr>
     <tr><td>Song gap merge</td><td>{{ cfg.detection.song_gap_merge_sec }} sec</td></tr>
     <tr><td>Drive-by max duration</td><td>{{ cfg.detection.driveby_max_duration_sec | default(30) }} sec</td></tr>
   </table>

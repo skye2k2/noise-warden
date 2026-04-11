@@ -69,21 +69,115 @@ REGRESSION_CLIPS = {
                 "Bursty amplitude with quiet gaps (39-92 dBA). Tests Path C "
                 "extreme spectral purity detection.",
     },
-    "mower-eq.wav": {
-        "expected": "mower",
-        "status": "pending",
-        "note": "YouTube mower recording, EQ'd + trimmed + pink noise mixed "
-                "via scripts/eq_classification_data.py.  57/64 blocks classify "
-                "as mower.  Pending replacement with real outdoor recording.",
+    "birdsong-chorus.wav": {
+        "expected": "birdsong+",
+        "status": "locked",
+        "note": "Real outdoor multi-species chorus (wrens, mourning doves, "
+                "robins). Path D (temporal highband variance) catches 77/165 "
+                "blocks; Path A catches 1. Previously only 1/165 — chorus "
+                "env_std median 4.9 far exceeds Path A's 1.0 ceiling. "
+                "Key discriminators: window-wide lowband ≤ 0.12 (rejects "
+                "mower/thunder), highband std ≥ 0.10 (rejects steady-state). "
+                "Key calibration clip for the chorus detection boundary.",
     },
-    # Future entries:
-    # "diesel-eq.wav": {
-    #     "expected": "diesel",
-    #     "status": "pending",
-    #     "note": "YouTube diesel — cannot match filter thresholds via EQ. "
-    #             "Centroid/flatness requirements are irreconcilable with "
-    #             "this source material. Needs real outdoor recording.",
-    # },
+    "birdsong-morning.wav": {
+        "expected": "birdsong",
+        "status": "locked",
+        "note": "Real outdoor multi-bird morning chorus including robins. "
+                "130/141 blocks classify as birdsong via Path A (sustained). "
+                "env_std 0.13–0.77, highband 0.59–0.87, midband 0.06–0.22. "
+                "Key calibration clip for birdsong_amplitude_std_max (1.0).",
+    },
+    "mower-electric.wav": {
+        "expected": "weedwhacker+",
+        "status": "pending",
+        "note": "Real outdoor electric mower recording. Classifies as "
+                "weedwhacker due to similar high-frequency whine profile — "
+                "a reasonable misclassification that may warrant a broader "
+                "'lawn equipment' category. 2/68 blocks weedwhacker, rest "
+                "unknown. Centroid 3800–7200 Hz, very low lowband (0.01–0.05), "
+                "high env_std during passes.",
+    },
+    "mower-gas.wav": {
+        "expected": "mower+",
+        "status": "locked",
+        "note": "Real outdoor gas mower recording. Centroid averages "
+                "5000–7000 Hz — far above mower_centroid_max of 4000 — so "
+                "only 1/51 blocks hits mower (centroid 3920). Was previously "
+                "misclassified as birdsong (multiple) before tightening "
+                "birdsong_amplitude_std_max from 3.0 to 1.0. Dominant is "
+                "derived from a single mower block; raising "
+                "mower_centroid_max_hz would improve block coverage. YouTube "
+                "mower recordings (mower.wav, mower-eq.wav) discarded — "
+                "artificial spectral profiles provided no calibration value.",
+    },
+    "rain.wav": {
+        "expected": "rain (multiple)",
+        "status": "locked",
+        "note": "Real outdoor heavy rain recording. 15/29 blocks classify as "
+                "rain once amplitude stabilizes (env_std < 0.50). 2 early blocks "
+                "hit mower during startup ramp (high env_std). Flatness 0.27–0.38, "
+                "lowband 0.08–0.14, centroid 3130–4023. Key calibration clip for "
+                "rain filter recalibration from uncalibrated 0.72 flatness threshold "
+                "to real-world 0.27. Lowband minimum (0.07) is the primary separator "
+                "from mower (lowband 0.02–0.06).",
+    },
+    "thunder-and-light-rain.wav": {
+        "expected": "thunder (multiple)",
+        "status": "locked",
+        "note": "Spliced Sennheiser MKH 8020SP thunderstorm — mellow rumble "
+                "with light rain.  Tests Path B sustained rumble detection and "
+                "priority holdover breaking mower holdover.  55/170 blocks "
+                "classify as thunder, 15 as mower.",
+    },
+    "thunder-cracks.wav": {
+        "expected": "thunder (multiple)",
+        "status": "locked",
+        "note": "High-fidelity isolated thunder cracks with quiet gaps. "
+                "Tests Path B crack detection. 8 thunder, 4 impulse blocks "
+                "amid 85 quiet blocks — dominant is thunder because unknown/"
+                "none blocks are excluded from the duration contest.",
+    },
+    # Diesel — real recording, filter recalibrated from actual spectral data
+    "diesel-car.wav": {
+        "expected": "diesel (multiple)",
+        "status": "locked",
+        "note": "Real diesel car at ~71 dBA. Calibration anchor for the "
+                "recalibrated diesel filter (tonal harmonics, mid centroid). "
+                "Steady-state: flatness 0.12–0.16, centroid 1441–2023. "
+                "Most blocks hit diesel once min_history (8) is satisfied.",
+    },
+    # Amplified bass — real recording, neighbor playing boosted bass music
+    "idiot-neighbor-mild-85db.wav": {
+        "expected": "amplified_bass (multiple)",
+        "status": "locked",
+        "note": "Real neighbor playing boosted bass music through garage walls, "
+                "measured at ~90 dB at the fenceline. 59 blocks. Lowband median "
+                "0.538, mscore median 0.816, beat_confidence 0.728, centroid "
+                "1200–1900. Previously 16 blocks stolen by rain, 7 by mower. "
+                "The amplified_bass filter + music score guard on rain/mower "
+                "corrects this. Key calibration clip for bass-through-walls.",
+    },
+    # Amplified bass — open windows/doors, broader spectrum than through walls
+    "idiot-neighbor-medium-90db.wav": {
+        "expected": "amplified_bass (multiple)",
+        "status": "locked",
+        "note": "Same neighbor, recorded with windows/doors open (~90 dB). "
+                "More spectrum passes through — lowband median 0.19, mscore "
+                "median 0.50, centroid median 2977. Requires the lowered "
+                "thresholds (mscore 0.45, lowband 0.16) plus flatness floor "
+                "(0.20) to classify correctly. 37/49 blocks amplified_bass.",
+    },
+    # Amplified bass + diesel truck overlay
+    "idiot-neighbor-medium-with-truck.wav": {
+        "expected": "amplified_bass (multiple)",
+        "status": "locked",
+        "note": "Same neighbor with open windows, plus diesel truck fired up "
+                "midway. Truck broadband noise destroys beat confidence (median "
+                "0.00) and suppresses mscore. 28/33 blocks classify as "
+                "amplified_bass with the flatness-based diesel guard. Key test "
+                "for multi-source scenarios where bconf is unreliable.",
+    },
 }
 
 

@@ -63,6 +63,9 @@ class FakeCapture:
     def reinitialize(self):
         pass
 
+    def close(self):
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Engine construction & lifecycle
@@ -99,6 +102,16 @@ class TestEngineLifecycle:
             with patch("noise_warden.engine.HAClient"):
                 engine = Engine(base_cfg, tmp_storage, tmp_state)
                 engine.stop()  # Should not raise
+
+    def test_stop_closes_audio_capture(self, base_cfg, tmp_storage, tmp_state):
+        """stop() should release audio resources via capture.close()."""
+        fake = FakeCapture([])
+        fake.close = MagicMock()
+        with patch("noise_warden.engine.AudioCapture", return_value=fake):
+            with patch("noise_warden.engine.HAClient"):
+                engine = Engine(base_cfg, tmp_storage, tmp_state)
+                engine.stop()
+                fake.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1290,9 +1303,10 @@ class TestIdentifyFilter:
         """Normal sound that passes all filters should return None."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
         engine.db_history = [65.0] * 20
-        # flatness 0.20 is below mower threshold (0.30), centroid 200 is below mower range (300+)
-        feats = {"flatness": 0.20, "centroid_hz": 200, "lowband_ratio": 0.4,
-                 "midband_ratio": 0.4, "highband_ratio": 0.2}
+        # flatness 0.20 is below mower threshold (0.30), centroid 200 is below mower range (300+),
+        # lowband 0.20 is below amplified_bass threshold (0.35)
+        feats = {"flatness": 0.20, "centroid_hz": 200, "lowband_ratio": 0.20,
+                 "midband_ratio": 0.60, "highband_ratio": 0.20}
         assert engine._identify_filter(feats, 68.0, 67.0) is None
 
     def test_impulse_detected(self, base_cfg, tmp_storage, tmp_state):
@@ -1394,13 +1408,14 @@ class TestIdentifyFilterTier3:
         assert engine._identify_filter(feats, 73.0, 72.0) == "weedwhacker"
 
     def test_diesel_detected(self, base_cfg, tmp_storage, tmp_state):
-        """Low centroid, bass-heavy, moderate flatness, very steady → diesel."""
+        """Mid centroid, very low flatness (tonal harmonics), steady → diesel."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine.db_history = [68.0, 68.5, 67.8, 68.2, 68.1, 67.9, 68.3, 68.0,
-                             67.8, 68.1, 68.2, 67.9]
-        feats = {"centroid_hz": 200, "flatness": 0.50, "lowband_ratio": 0.55,
-                 "midband_ratio": 0.30, "highband_ratio": 0.15}
-        assert engine._identify_filter(feats, 68.5, 68.0) == "diesel"
+        engine.db_history = [71.0, 71.5, 70.8, 71.2, 71.1, 70.9, 71.3, 71.0,
+                             70.8, 71.1, 71.2, 70.9]
+        # Real diesel car profile: tonal harmonics in mid-frequency range
+        feats = {"centroid_hz": 1800, "flatness": 0.15, "lowband_ratio": 0.22,
+                 "midband_ratio": 0.33, "highband_ratio": 0.45}
+        assert engine._identify_filter(feats, 71.5, 71.0) == "diesel"
 
     def test_conversation_detected(self, base_cfg, tmp_storage, tmp_state):
         """Mid-centroid, moderate flatness, syllable-level modulation → conversation.
@@ -1424,13 +1439,13 @@ class TestIdentifyFilterTier3:
         assert engine._identify_filter(feats, 71.0, 70.0) == "weedwhacker"
 
     def test_diesel_not_confused_with_mower(self, base_cfg, tmp_storage, tmp_state):
-        """Diesel (centroid 200) should not match mower (centroid 300–3000).
-        The centroid is below mower's minimum, so only diesel should fire."""
+        """Diesel (centroid 1800, flatness 0.15) should not match mower.
+        Mower requires flatness ≥ 0.28; diesel's tonal harmonics sit around 0.15."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine.db_history = [68.0] * 12
-        feats = {"centroid_hz": 200, "flatness": 0.50, "lowband_ratio": 0.55,
-                 "midband_ratio": 0.30, "highband_ratio": 0.15}
-        assert engine._identify_filter(feats, 68.5, 68.0) == "diesel"
+        engine.db_history = [71.0] * 12
+        feats = {"centroid_hz": 1800, "flatness": 0.15, "lowband_ratio": 0.22,
+                 "midband_ratio": 0.33, "highband_ratio": 0.45}
+        assert engine._identify_filter(feats, 71.5, 71.0) == "diesel"
 
 
 # ---------------------------------------------------------------------------
@@ -1518,6 +1533,20 @@ class TestClassificationJournal:
         assert journal[0][1] == "music"
         assert journal[1][1] == "birdsong"
         assert journal[2][1] == "music"
+
+    def test_finalize_single_real_plus_unknown_gets_plus_suffix(self, base_cfg, tmp_storage, tmp_state):
+        """One real source + unknown → 'class+' suffix (not '(multiple)').
+
+        Uses 'music_like' as the second classification because it has no
+        filter detection latency — filter-based classifications (mower, etc.)
+        would backdate and erase the initial 'unknown' entry in the journal."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "unknown", "respond")
+        engine._update_class_journal("music_like")
+        iid = engine.active["id"]
+        engine._finalize_incident()
+        inc = tmp_storage.get_incident(iid)
+        assert inc["classification"] == "music_like+"
 
     def test_driveby_overrides_multiple_classification(self, base_cfg, tmp_storage, tmp_state):
         """Drive-by reclassification should override '(multiple)' if the incident

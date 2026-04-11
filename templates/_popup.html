@@ -102,8 +102,8 @@ function popupInferPeriod(startTs) {
   var hour = new Date(startTs).getHours();
   var nightStart = (_POPUP_ORDINANCE.measurement && _POPUP_ORDINANCE.measurement.night_start) || 22;
   var dayStart = (_POPUP_ORDINANCE.measurement && _POPUP_ORDINANCE.measurement.day_start) || 7;
-  if (hour >= nightStart || hour < dayStart) { return 'night'; }
-  return 'day';
+  if (hour >= nightStart || hour < dayStart) { return 'nighttime'; }
+  return 'daytime';
 }
 
 function popupEscapeHtml(str) {
@@ -176,10 +176,11 @@ function showPopup(inc) {
 
   // Classification journal: show source transitions for multi-source incidents.
   // Each entry is [seconds_since_start, classification_name].
+  // For single-entry journals, show the classification as a confirmation line.
   if (inc.class_journal) {
     try {
       var journal = typeof inc.class_journal === 'string' ? JSON.parse(inc.class_journal) : inc.class_journal;
-      if (Array.isArray(journal) && journal.length > 1) {
+      if (Array.isArray(journal) && journal.length >= 1) {
         _popupJournal = journal;
         html += '<div class="popup-section">';
         html += '<div class="popup-lbl">Source timeline:</div>';

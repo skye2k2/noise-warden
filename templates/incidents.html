@@ -3,27 +3,29 @@
 <div class="card">
   <h2>Incidents</h2>
   <table>
-    <tr>
+    <tr class="header">
       <th>Start <span class="small" id="tz-offset-label"></span></th><th>End</th><th>Start dB</th><th>Peak</th><th>Avg</th><th>Duration</th>
-      <th>Music</th><th>Beat</th><th title="music · music_like · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · conversation · drive_by · forced_test">Class</th><th>Snippet</th><th>Notes</th><th>Delete</th>
+      <th title="Music-like score (0–1): How closely the spectral profile resembles music. &#10;&#10;0.00–0.30 = environmental (wind, HVAC, traffic) &#10;0.30–0.50 = mechanical (mower, diesel, fan) &#10;0.50–0.62 = ambiguous (could be tonal noise or distant music) &#10;0.62–0.80 = likely music (bass through walls, muffled speakers) &#10;0.80–1.00 = almost certainly music (clear rhythm + bass)">Music</th>
+      <th title="Beat confidence (0–1): Rhythmic periodicity of the amplitude envelope. &#10;&#10;0.00–0.40 = no detectable rhythm (nature, steady drones) &#10;0.40–0.55 = weak periodicity (engine idle, irregular traffic) &#10;0.55–0.70 = moderate rhythm (could be music or repetitive machinery) &#10;0.70–0.85 = strong beat (likely music with a clear tempo) &#10;0.85–1.00 = very strong beat (dance/electronic music, heavy bass)">Beat</th>
+      <th title="music · music_like · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · amplified_bass · conversation · drive_by · forced_test">Class</th><th>Snippet</th><th>Notes</th><th>Delete</th>
     </tr>
     {% for r in rows %}
     <tr>
       <td class="incident-ts" data-ts="{{ r.start_ts }}">{{ r.start_ts }}</td>
       <td class="incident-ts" data-ts="{{ r.end_ts or '' }}">{{ r.end_ts or "" }}</td>
-      <td>{{ r.start_db }}</td>
+      <td>{{ "%.1f"|format(r.start_db) }}</td>
       <td>{{ r.peak_db }}</td>
       <td>{{ r.avg_db }}</td>
       <td>{% if r.duration_sec is not none %}{% if r.duration_sec >= 3600 %}{{ "%.1f"|format(r.duration_sec / 3600) }}h{% elif r.duration_sec >= 60 %}{{ "%.1f"|format(r.duration_sec / 60) }}m{% else %}{{ r.duration_sec|int }}s{% endif %}{% endif %}</td>
-      <td>{{ r.music_like_score }}</td>
-      <td>{{ r.beat_confidence }}</td>
+      <td title="{% if r.music_like_score >= 0.80 %}Almost certainly music{% elif r.music_like_score >= 0.62 %}Likely music{% elif r.music_like_score >= 0.50 %}Ambiguous{% elif r.music_like_score >= 0.30 %}Mechanical{% else %}Environmental{% endif %}">{{ "%.2f"|format(r.music_like_score) }}</td>
+      <td title="{% if r.beat_confidence >= 0.85 %}Very strong beat{% elif r.beat_confidence >= 0.70 %}Strong beat{% elif r.beat_confidence >= 0.55 %}Moderate rhythm{% elif r.beat_confidence >= 0.40 %}Weak periodicity{% else %}No rhythm{% endif %}">{{ "%.2f"|format(r.beat_confidence) }}</td>
       <td>{{ r.classification }}</td>
       <td>{% if r.snippet_path %}<button class="snippet-play-btn"
         data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "class_journal": r.class_journal or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
         title="Play audio snippet">&#9654;</button>{% endif %}</td>
       <td>
         <form method="post" action="/incidents/{{ r.id }}/notes">
-          <textarea name="notes" style="min-height:70px;">{{ r.notes or "" }}</textarea>
+          <textarea name="notes">{{ r.notes or "" }}</textarea>
           <input type="submit" value="Save Notes">
         </form>
       </td>

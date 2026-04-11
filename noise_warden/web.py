@@ -311,6 +311,7 @@ def timeline(request: Request, view: str = "day"):
             "threshold_db": r.get("threshold_db"),
             "music_like_score": r.get("music_like_score"),
             "classification": r.get("classification", ""),
+            "class_journal": r.get("class_journal", ""),
             "mode": r.get("mode", ""),
             "responded": bool(r.get("responded")),
             "notes": r.get("notes", ""),
@@ -506,7 +507,7 @@ def thresholds(request: Request):
         "zone_thresholds": active_thresholds,
         "active_rule": rule_name,
         "active_threshold": threshold,
-        "period": "night" if night else "day",
+        "period": "nighttime" if night else "daytime",
     })
 
 @app.post("/control/resume")

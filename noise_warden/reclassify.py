@@ -27,7 +27,7 @@ import yaml
 
 from noise_warden.dsp import (
     apply_filter_holdover,
-    beat_confidence_from_history,
+    beat_confidence,
     dba_estimate,
     get_filter_detection_latency,
     identify_filter,
@@ -74,6 +74,7 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg):
     prev_filt = None
     prev_filt_run = 0
     holdover_gap = 0
+    feature_history = []
 
     for i in range(n_blocks):
         block = data[i * block_size : (i + 1) * block_size]
@@ -83,11 +84,15 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg):
         db_history.append(db_now)
 
         feats = spectrum_features(block, sr)
-        bconf = beat_confidence_from_history(db_history)
+        feature_history.append(feats)
+        feature_history = feature_history[-24:]
+        bconf = beat_confidence(block, sr, db_history)
         mscore = music_like_score(feats)
 
         prev = db_history[-2] if len(db_history) > 1 else db_now
-        raw_filt = identify_filter(feats, db_history, db_now, prev, detection_cfg)
+        raw_filt = identify_filter(feats, db_history, db_now, prev, detection_cfg,
+                                   feature_history=feature_history,
+                                   beat_confidence=bconf)
 
         # Apply holdover (same as engine._identify_filter)
         filt, prev_filt, prev_filt_run, holdover_gap = apply_filter_holdover(
@@ -146,8 +151,8 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg):
             "lowband": round(feats["lowband_ratio"], 3),
             "midband": round(feats["midband_ratio"], 3),
             "highband": round(feats["highband_ratio"], 3),
-            "mscore": round(mscore, 3),
-            "bconf": round(bconf, 3),
+            "mscore": round(mscore, 2),
+            "bconf": round(bconf, 2),
             "env_std": round(env_std, 2),
             "filter": filt,
             "classification": final,
@@ -179,11 +184,26 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg):
     }
 
 
+# Classifications that represent background noise or unidentified sound.
+# These should not win the dominant-classification contest — a 60-second
+# recording with 50 seconds of white noise and 10 seconds of thunder
+# should report "thunder", not "unknown".
+_IGNORABLE_CLASSES = {"unknown", "none"}
+
+
 def _compute_dominant(journal, duration):
     """Derive the dominant classification from a journal, matching engine logic.
 
     For single-source journals, returns that classification directly.
-    For multi-source, returns the longest-running classification with "(multiple)" appended.
+    For multi-source journals:
+      - If only one meaningful class (plus ignorable ones like unknown/none),
+        returns "class+" — the "+" indicates some unclassified blocks were
+        present but only one real source was identified.
+      - If 2+ meaningful classes, returns the longest-running one with
+        " (multiple)" appended.
+    Background noise ("unknown", "none") is excluded from the duration
+    contest and the suffix decision. Falls back to "unknown" only when
+    every journal entry is ignorable.
     """
     if not journal:
         return "unknown"
@@ -201,7 +221,18 @@ def _compute_dominant(journal, duration):
                 end_sec = duration
             durations[cls] = durations.get(cls, 0) + (end_sec - start_sec)
 
-        dominant = max(durations, key=durations.get)
+        # Filter out ignorable classifications before picking the winner.
+        # If all entries are ignorable, fall back to the longest one anyway.
+        meaningful = {k: v for k, v in durations.items() if k not in _IGNORABLE_CLASSES}
+        if meaningful:
+            dominant = max(meaningful, key=meaningful.get)
+        else:
+            dominant = max(durations, key=durations.get)
+
+        # "+" suffix when only one real source was identified alongside
+        # ignorable blocks; "(multiple)" when 2+ distinct real sources.
+        if len(meaningful) <= 1:
+            return f"{dominant}+"
         return f"{dominant} (multiple)"
 
     return journal[0][1]
@@ -235,6 +266,12 @@ def print_summary(result, old_class=None, old_journal=None):
     print(f"  dB range: {min(result['db_history']):.1f} – {max(result['db_history']):.1f}")
     print(f"  Peak dB: {result['peak_db']}  |  Avg dB: {result['avg_db']}")
     print(f"  Filter distribution: {result['filter_counts']}")
+
+    # Music/beat scores from the last block (what gets stored in DB)
+    if result["blocks"]:
+        last = result["blocks"][-1]
+        print(f"  Music score: {last.get('mscore', 0.0):.2f}  |  "
+              f"Beat confidence: {last.get('bconf', 0.0):.2f}")
 
     # Journal
     print(f"  Journal ({len(result['journal'])} entries):")
@@ -300,10 +337,15 @@ def reclassify_incident(storage, incident_id, detection_cfg, audio_cfg,
 
     if update:
         journal_json = json.dumps(result["journal"])
+        last_block = result["blocks"][-1] if result["blocks"] else {}
         with storage.conn() as c:
             c.execute(
-                "UPDATE incidents SET classification=?, class_journal=? WHERE id=?",
-                (result["dominant"], journal_json, incident_id)
+                "UPDATE incidents SET classification=?, class_journal=?, "
+                "beat_confidence=?, music_like_score=? WHERE id=?",
+                (result["dominant"], journal_json,
+                 last_block.get("bconf", 0.0),
+                 last_block.get("mscore", 0.0),
+                 incident_id)
             )
         print(f"  ★ DB updated: classification={result['dominant']}")
 
@@ -353,10 +395,15 @@ def reclassify_all(storage, detection_cfg, audio_cfg, verbose=False, update=Fals
 
         if update:
             journal_json = json.dumps(result["journal"])
+            last_block = result["blocks"][-1] if result["blocks"] else {}
             with storage.conn() as c:
                 c.execute(
-                    "UPDATE incidents SET classification=?, class_journal=? WHERE id=?",
-                    (result["dominant"], journal_json, iid)
+                    "UPDATE incidents SET classification=?, class_journal=?, "
+                    "beat_confidence=?, music_like_score=? WHERE id=?",
+                    (result["dominant"], journal_json,
+                     last_block.get("bconf", 0.0),
+                     last_block.get("mscore", 0.0),
+                     iid)
                 )
 
         # Progress logging every 25 incidents

@@ -71,7 +71,7 @@
 <div class="card">
   <h3>Recent Incidents ({{ incidents|length }})</h3>
   <table>
-    <tr><th>Start <span class="small" id="tz-offset-label"></span></th><th>Duration</th><th>Excess</th><th title="music · music_like · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · conversation · drive_by · forced_test">Class</th><th></th></tr>
+    <tr class="header"><th>Start <span class="small" id="tz-offset-label"></span></th><th>Duration</th><th>Excess</th><th title="music · music_like · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · conversation · drive_by · forced_test">Class</th><th></th></tr>
     {% for r in incidents %}
     <tr>
       <td class="incident-ts" data-ts="{{ r.start_ts }}">{{ r.start_ts }}</td>

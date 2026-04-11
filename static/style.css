@@ -175,9 +175,15 @@ textarea, input[type=text], input[type=number], select {
   border-radius: 4px;
 }
 
+table .header {
+  background-color: #d5d5d5;
+  position: sticky;
+  top: 0;
+}
+
 textarea {
   width: 100%;
-  min-height: 180px;
+  min-height: 30px;
 }
 
 /* Config page: textarea should use most of the vertical space */

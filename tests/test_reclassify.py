@@ -72,21 +72,42 @@ class TestComputeDominant:
         assert _compute_dominant(journal, 60) == "mower"
 
     def test_multiple_sources_picks_longest(self):
-        """Multiple sources — the one holding the most seconds wins."""
+        """One real source + unknown → 'class+' suffix."""
         # unknown for 5 seconds, mower for 55 seconds
         journal = [(0, "unknown"), (5, "mower")]
         result = _compute_dominant(journal, 60)
-        assert result == "mower (multiple)"
+        assert result == "mower+"
 
     def test_multiple_with_transitions(self):
-        """Complex journal with several transitions."""
+        """Multiple unknown/real transitions with one real source → 'class+'."""
         journal = [(0, "unknown"), (3, "mower"), (10, "unknown"), (12, "mower")]
         # unknown: 3s + 2s = 5s, mower: 7s + (60-12)=48s = 55s
         result = _compute_dominant(journal, 60)
-        assert result == "mower (multiple)"
+        assert result == "mower+"
 
     def test_empty_journal(self):
         assert _compute_dominant([], 60) == "unknown"
+
+    def test_unknown_excluded_from_dominant(self):
+        """Unknown blocks should not win even when they have the most duration.
+        A 100-second recording with 85 seconds of white noise and 15 seconds
+        of thunder should report 'thunder (multiple)', not 'unknown (multiple)'."""
+        journal = [(0, "unknown"), (85, "thunder"), (93, "impulse"), (97, "unknown")]
+        result = _compute_dominant(journal, 100)
+        assert result == "thunder (multiple)"
+
+    def test_none_excluded_from_dominant(self):
+        """'none' classifications (if they appear) should also be excluded."""
+        journal = [(0, "none"), (50, "mower")]
+        result = _compute_dominant(journal, 60)
+        assert result == "mower+"
+
+    def test_all_unknown_falls_back(self):
+        """When every journal entry is unknown, fall back to unknown anyway."""
+        journal = [(0, "unknown"), (30, "unknown")]
+        result = _compute_dominant(journal, 60)
+        # Single distinct class — returns it directly (not multiple)
+        assert result == "unknown"
 
     def test_tie_goes_to_first_max(self):
         """When two classifications tie on duration, max() picks one deterministically."""

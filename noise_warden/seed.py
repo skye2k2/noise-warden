@@ -65,8 +65,14 @@ def discover_clips(classification_dir):
 
 
 def seed_clip(storage, wav_path, filename, detection_cfg, audio_cfg, full_cfg,
-              snippets_dir, verbose=False):
+              snippets_dir, verbose=False, end_time=None):
     """Analyze a single WAV, create a finalized incident, and copy the snippet.
+
+    Args:
+        end_time: explicit end timestamp for this incident. When seed_all()
+            staggers clips at 15-minute intervals, each clip gets its own
+            time slot so they don't stack in the timeline view. Falls back
+            to now() if not provided (single-clip seeding).
 
     Returns a dict summarizing what was created, or None on failure.
     """
@@ -77,30 +83,33 @@ def seed_clip(storage, wav_path, filename, detection_cfg, audio_cfg, full_cfg,
         print_block_table(result["blocks"])
         print_summary(result)
 
-    # Use "now" offset by clip index so seeded incidents have distinct timestamps
-    # (the caller staggers these by passing a base time)
-    now = datetime.now().astimezone().replace(microsecond=0)
+    if end_time is None:
+        end_time = datetime.now().astimezone().replace(microsecond=0)
+
     duration_sec = result["n_blocks"]  # 1 block ≈ 1 second
-    start_time = now - timedelta(seconds=duration_sec)
+    start_time = end_time - timedelta(seconds=duration_sec)
 
     # Determine the ordinance threshold that would apply at this time
-    _rule_name, threshold_db = applicable_threshold(full_cfg, now)
+    _rule_name, threshold_db = applicable_threshold(full_cfg, end_time)
 
-    # Build the incident row — mirrors engine._begin_incident() fields
+    # Build the incident row — mirrors engine._begin_incident() fields.
+    # Use the LAST block's mscore/bconf — block 0 has almost no history,
+    # and beat_confidence_from_history() needs 8+ readings to be non-zero.
+    last_block = result["blocks"][-1] if result["blocks"] else {}
     row = {
         "start_ts": start_time.isoformat(),
-        "start_db": result["db_history"][0] if result["db_history"] else 0.0,
+        "start_db": round(result["db_history"][0], 1) if result["db_history"] else 0.0,
         "peak_db": result["peak_db"],
         "avg_db": result["avg_db"],
         "threshold_db": threshold_db,
-        "music_like_score": result["blocks"][0]["mscore"] if result["blocks"] else 0.0,
-        "beat_confidence": result["blocks"][0]["bconf"] if result["blocks"] else 0.0,
+        "music_like_score": last_block.get("mscore", 0.0),
+        "beat_confidence": last_block.get("bconf", 0.0),
         "classification": result["dominant"],
         "mode": "day",
         "responded": 0,
         "merge_count": 0,
         "snippet_path": None,  # Set after copy
-        "notes": f"Seeded from classification_data/{filename}",
+        "notes": f"Seeded from {filename}",
         "excluded": 0,
     }
 
@@ -116,7 +125,6 @@ def seed_clip(storage, wav_path, filename, detection_cfg, audio_cfg, full_cfg,
 
     # Finalize with full metrics, snippet path, and journal
     journal_json = json.dumps(result["journal"])
-    end_time = now
     storage.finalize_incident(
         incident_id,
         end_ts=end_time.isoformat(),
@@ -151,8 +159,16 @@ def seed_all(storage, classification_dir, detection_cfg, audio_cfg, full_cfg,
 
     print(f"[seed] Found {len(clips)} classification clip(s) in {classification_dir}")
 
+    # Stagger incident timestamps at 15-minute intervals counting backward
+    # from now, so seeded incidents spread out in the timeline view instead
+    # of stacking on the same timestamp.
+    interval = timedelta(minutes=15)
+    base_time = datetime.now().astimezone().replace(microsecond=0)
+
     results = []
     for i, (filename, wav_path) in enumerate(clips):
+        clip_end_time = base_time - (i * interval)
+
         if dry_run:
             result = analyze_clip(wav_path, detection_cfg, audio_cfg)
             print(f"  {i + 1}. {filename} → {result['dominant']} "
@@ -170,6 +186,7 @@ def seed_all(storage, classification_dir, detection_cfg, audio_cfg, full_cfg,
             summary = seed_clip(
                 storage, wav_path, filename, detection_cfg, audio_cfg,
                 full_cfg, snippets_dir, verbose=verbose,
+                end_time=clip_end_time,
             )
             if summary:
                 results.append(summary)

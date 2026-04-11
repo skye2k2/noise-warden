@@ -8,7 +8,7 @@ import soundfile as sf
 from .audio import AudioCapture
 from .dsp import (
     apply_filter_holdover, rms_dbfs, dba_estimate, spectrum_features,
-    beat_confidence_from_history, get_filter_detection_latency,
+    beat_confidence, get_filter_detection_latency,
     identify_filter, music_like_score,
 )
 from .ordinance import applicable_threshold, is_night
@@ -86,6 +86,7 @@ class Engine:
         # and deque doesn't support slicing. Converting to list at each DSP call
         # would cost more than the list re-slice here, so keep it simple.
         self.db_history = []
+        self.feature_history = []  # Recent spectrum_features dicts for temporal analysis (Path D chorus)
         self.active = None
         self._lock = threading.Lock()
         self._last_mqtt_publish = 0.0
@@ -171,6 +172,7 @@ class Engine:
             self.thread.join(timeout=5)
         self._stop_response()
         self.relay.cleanup()
+        self.capture.close()
         if self.active:
             self._finalize_incident(force=True)
         self.state.set(running=False, mode="stopped")
@@ -233,8 +235,8 @@ class Engine:
             "peak_db": round(db_now, 1),
             "avg_db": round(db_now, 1),
             "threshold_db": threshold,
-            "music_like_score": round(mscore, 3),
-            "beat_confidence": round(bconf, 3),
+            "music_like_score": round(mscore, 2),
+            "beat_confidence": round(bconf, 2),
             "classification": classification,
             "mode": mode,
             "responded": 0,
@@ -333,12 +335,14 @@ class Engine:
             # Non-fatal — the un-trimmed snippet is still usable evidence.
             print(f"[engine] Snippet tail trim failed for {wav_path}: {exc}")
 
-    def _identify_filter(self, features, db_now, prev_db):
+    def _identify_filter(self, features, db_now, prev_db, beat_confidence=None):
         """Delegate to dsp.identify_filter + apply holdover. The engine doesn't
         need to know about individual filter parameters or priority order.
         Tracks holdover state so sustained filters persist through brief gaps."""
         raw = identify_filter(
             features, self.db_history, db_now, prev_db, self.cfg["detection"],
+            feature_history=self.feature_history,
+            beat_confidence=beat_confidence,
         )
         effective, self._prev_filter, self._prev_filter_run, self._holdover_gap = (
             apply_filter_holdover(
@@ -423,8 +427,8 @@ class Engine:
             "peak_db": round(db_now, 1),
             "avg_db": round(db_now, 1),
             "threshold_db": threshold,
-            "music_like_score": round(mscore, 3),
-            "beat_confidence": round(bconf, 3),
+            "music_like_score": round(mscore, 2),
+            "beat_confidence": round(bconf, 2),
             "classification": filter_type,
             "mode": mode,
             "responded": 0,
@@ -573,8 +577,23 @@ class Engine:
                     end_sec = dur
                 durations[cls] = durations.get(cls, 0) + (end_sec - start_sec)
 
-            dominant = max(durations, key=durations.get)
-            updated_class = f"{dominant} (multiple)"
+            # Exclude background noise from the dominant-classification contest.
+            # A recording with 50s of white noise and 10s of thunder should report
+            # "thunder", not "unknown". Falls back to all entries if every
+            # classification is ignorable.
+            ignorable = {"unknown", "none"}
+            meaningful = {k: v for k, v in durations.items() if k not in ignorable}
+            if meaningful:
+                dominant = max(meaningful, key=meaningful.get)
+            else:
+                dominant = max(durations, key=durations.get)
+
+            # "+" suffix when only one real source was identified alongside
+            # ignorable blocks; "(multiple)" when 2+ distinct real sources.
+            if len(meaningful) <= 1:
+                updated_class = f"{dominant}+"
+            else:
+                updated_class = f"{dominant} (multiple)"
         elif len(unique_classes) == 1 and journal:
             # Single source — update classification to the journal's value in case
             # the initial classification was set before the filter had enough history
@@ -837,11 +856,14 @@ class Engine:
                     continue
 
                 features = spectrum_features(block, self.capture.sr)
-                bconf = beat_confidence_from_history(self.db_history)
+                self.feature_history.append(features)
+                self.feature_history = self.feature_history[-24:]  # Keep ~24 seconds of features
+                bconf = beat_confidence(block, self.capture.sr, self.db_history)
                 mscore = music_like_score(features)
 
                 prev = self.db_history[-2] if len(self.db_history) > 1 else db_now
-                filter_hit = self._identify_filter(features, db_now, prev)
+                filter_hit = self._identify_filter(features, db_now, prev,
+                                                   beat_confidence=bconf)
                 classify = filter_hit if filter_hit else self._classify_sound(mscore, bconf)
 
                 # Track classification transitions in the active incident's journal.
@@ -960,6 +982,9 @@ class Engine:
                 print(f"[engine] Audio I/O error (attempting reconnection): {error_msg}")
                 self.state.set(mic_ok=False, last_error=error_msg, mode="error")
                 try:
+                    # Close the old capture before creating a new one — prevents
+                    # InputStream resource leak when callback mode is active.
+                    self.capture.close()
                     a = self.cfg["audio"]
                     self.capture = AudioCapture(
                         sample_rate=int(a["sample_rate"]),
