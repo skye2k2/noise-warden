@@ -8,6 +8,7 @@ User=noisewarden
 Group=noisewarden
 WorkingDirectory=/opt/noise-warden/current
 Environment=NOISE_WARDEN_CONFIG=/opt/noise-warden/current/config/noise_warden.yaml
+ExecStartPre=/bin/sh -c 'test -d /opt/noise-warden/current/noise_warden || (echo "ERROR: /opt/noise-warden/current does not resolve to a valid project directory. Re-run install_pi.sh." && exit 1)'
 ExecStart=/opt/noise-warden/venv/bin/uvicorn noise_warden.main:app --host 0.0.0.0 --port 8787
 # Graceful shutdown: give the engine time to finalize active incidents and flush the DB
 TimeoutStopSec=15

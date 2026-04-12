@@ -110,7 +110,7 @@ The project uses a symlinked versioning layout that keeps **code disposable** an
 
 ```
 /opt/noise-warden/
-├── current -> /opt/noise-warden/noise-warden-v8   # symlink to active version
+├── current -> /opt/noise-warden/noise-warden-v12  # symlink to active version
 ├── deploy_noise_warden.sh                          # version-swap script (lives outside any version)
 ├── venv/                                           # shared Python virtualenv
 ├── shared/                                         # persistent data — survives upgrades
@@ -119,14 +119,15 @@ The project uses a symlinked versioning layout that keeps **code disposable** an
 │   ├── playlist/
 │   └── build/
 │       └── build_photo.jpg
-├── noise-warden-v8/                                # previous version (kept for rollback)
-└── noise-warden-v9/                                # active version
+├── noise-warden-v11/                               # previous version (kept for rollback)
+└── noise-warden-v12/                               # active version
 ```
 
 Key invariants:
 - `shared/` is **never** inside a version directory — the DB, WAV snippets, playlist, and build assets persist across upgrades
 - Config lives in the active version at `current/config/noise_warden.yaml` — copy forward when upgrading if you've made changes
 - The `deploy_noise_warden.sh` script is copied to `/opt/noise-warden/` on first install and stays there permanently
+- **Project files are always copied into `/opt/noise-warden/`** — the `install_pi.sh` script copies from wherever you extracted the archive. The symlink always points inside `/opt/`, so the `noisewarden` service user can always read the files regardless of where the source directory lives
 
 ### First-Time Installation
 
@@ -134,34 +135,32 @@ Key invariants:
 
 1. Transfer the version archive to the Pi:
     ```bash
-    scp noise-warden-v9.zip pi@<pi-ip>:~
+    scp noise-warden-v12.zip pi@<pi-ip>:~
     ```
 
-2. SSH in and set up the base directory structure:
+2. SSH in and extract anywhere — your Desktop, home directory, wherever:
     ```bash
     ssh pi@<pi-ip>
-    sudo mkdir -p /opt/noise-warden
-    sudo chown -R $USER:$USER /opt/noise-warden
-    cd /opt/noise-warden
-    mv ~/noise-warden-v9.zip .
-    unzip noise-warden-v9.zip
+    unzip ~/noise-warden-v12.zip
     ```
 
 3. Install system-level dependencies (these are not managed by pip):
     ```bash
-    sudo apt update && sudo apt install -y python3-venv portaudio19-dev libsndfile1 ffmpeg
+    sudo apt update && sudo apt install -y python3-venv portaudio19-dev libsndfile1 ffmpeg rsync
     ```
 
-4. Run the install script from inside the version directory:
+4. Run the install script from inside the extracted directory:
     ```bash
-    cd noise-warden-v9
+    cd ~/noise-warden-v12
     bash scripts/install_pi.sh
     ```
-    This will: create the `shared/` data directories, create a Python venv at `/opt/noise-warden/venv/`, install pip dependencies, copy `deploy_noise_warden.sh` up to the base directory, set the `current` symlink, create a `noisewarden` system user, and install the systemd service unit.
+    This will: copy the project into `/opt/noise-warden/noise-warden-v12/`, create the `shared/` data directories, set up a Python venv at `/opt/noise-warden/venv/`, install pip dependencies, copy `deploy_noise_warden.sh` up to the base directory, set the `current` symlink, create a `noisewarden` system user, install the systemd service unit, and run pre-flight validation to verify the service can start.
+
+    > **You can run this from anywhere** — the script copies files into `/opt/noise-warden/` so the system service can always reach them. You don't need to clone directly into `/opt/`.
 
 5. Edit the configuration:
     ```bash
-    nano config/noise_warden.yaml
+    sudo nano /opt/noise-warden/current/config/noise_warden.yaml
     ```
 
 6. Enable and start the service:
@@ -169,7 +168,26 @@ Key invariants:
     sudo systemctl enable --now noise-warden
     ```
 
-7. Open in browser: `http://<pi-ip>:8787/`
+7. Verify it's running:
+    ```bash
+    sudo systemctl status noise-warden
+    ```
+
+8. Open in browser: `http://<pi-ip>:8787/`
+
+</details>
+
+### Troubleshooting
+
+<details>
+
+**`status=200/CHDIR`** — the service can't access its working directory. This usually means the `current` symlink points outside `/opt/noise-warden/` (e.g., to `~/Desktop/...`). Fix: re-run `install_pi.sh` from the source directory — it will copy files into `/opt/` and fix the symlink.
+
+**`Module not found`** — the venv is missing dependencies. Fix: `source /opt/noise-warden/venv/bin/activate && pip install -r /opt/noise-warden/current/requirements.txt`
+
+**Permission denied** — the `noisewarden` user can't read project files. Fix: `sudo chown -R noisewarden:noisewarden /opt/noise-warden`
+
+**No audio device** — check `arecord -l` for available capture devices. Ensure the USB mic is connected, and the `noisewarden` user is in the `audio` group: `groups noisewarden`
 
 </details>
 
@@ -177,23 +195,35 @@ Key invariants:
 
 When you have a new version ready:
 
-1. Transfer and extract the new version alongside the old one:
+1. Transfer and extract the new version anywhere on the Pi:
     ```bash
-    scp noise-warden-v9.zip pi@<pi-ip>:~
+    scp noise-warden-v13.zip pi@<pi-ip>:~
     ssh pi@<pi-ip>
+    unzip ~/noise-warden-v13.zip
+    ```
+
+2. Run install_pi.sh from the new version (handles the copy into `/opt/`):
+    ```bash
+    cd ~/noise-warden-v13
+    bash scripts/install_pi.sh
+    ```
+
+3. If you've customized `config/noise_warden.yaml`, copy it forward:
+    ```bash
+    sudo cp /opt/noise-warden/noise-warden-v12/config/noise_warden.yaml \
+            /opt/noise-warden/noise-warden-v13/config/noise_warden.yaml
+    ```
+
+4. Start/restart the service:
+    ```bash
+    sudo systemctl restart noise-warden
+    sudo systemctl status noise-warden
+    ```
+
+    Or use the deploy script (which lives at the base level, outside any version):
+    ```bash
     cd /opt/noise-warden
-    mv ~/noise-warden-v9.zip .
-    unzip noise-warden-v9.zip
-    ```
-
-2. If you've customized `config/noise_warden.yaml`, copy it forward:
-    ```bash
-    cp current/config/noise_warden.yaml noise-warden-v9/config/noise_warden.yaml
-    ```
-
-3. Run the deploy script (which lives at the base level, outside any version):
-    ```bash
-    ./deploy_noise_warden.sh noise-warden-v9
+    ./deploy_noise_warden.sh noise-warden-v13
     ```
 
     The deploy script will: stop the service, swing the `current` symlink, rebuild/update the venv, install the new systemd unit, and restart the service. `shared/` is untouched.
