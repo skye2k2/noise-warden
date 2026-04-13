@@ -7,7 +7,7 @@ app:
   auth_token: ""  # optional bearer token; blank disables auth (LAN only)
 
 audio:
-  sample_rate: 22050                  # 22050 (wideband), 44100 (CD quality), or 48000 (studio). Lower = smaller files
+  sample_rate: 22050                  # 22050 (wideband), 44100 (CD quality), or 48000 (studio). Lower = smaller WAVs. If your USB mic rejects this rate, the app falls back to the device default automatically
   block_seconds: 1.0                  # Seconds per audio capture block. 1.0 is standard; smaller = more I/O overhead
   input_device: null                  # null = default audio device
   input_channels: 1

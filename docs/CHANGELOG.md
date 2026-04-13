@@ -21,6 +21,57 @@ Past Bad Ideas:
 
 Additionally, real-world recordings are saved in `tests/classification_data/` as version-controlled WAV files — empirical sources of truth decoupled from the incident database. These are replayed through the DSP pipeline during regression tests to prevent threshold changes from silently breaking known-good calibrations, and can seed a clean database for full reclassification after engine or filter changes without needing to manually re-record each sound type.
 
+## v13 - 2026-04-12 — "Deploy or Die Trying"
+
+First-time Raspberry Pi deployment revealed a cascade of real-world failure modes that the development environment had been silently masking. Each issue was discovered during actual Pi setup and addressed with both code hardening and documentation.
+
+<details>
+
+<summary>Key details</summary>
+
+### Copy-based installation (CHDIR fix)
+
+- **Problem** — `install_pi.sh` previously created a symlink from `/opt/noise-warden/<version>/` pointing to wherever the user extracted the archive (e.g., `~/Desktop/noise-warden-v12/`). The `noisewarden` system user couldn't traverse the source user's home directory, causing `status=200/CHDIR` on service start
+- **Solution** — complete rewrite of `install_pi.sh` to copy project files into `/opt/noise-warden/<version>/` via `rsync` instead of symlinking out. The `current` symlink always points inside `/opt/`, so the service user can always reach the files regardless of where the source was extracted
+- **Pre-flight validation** — install script now runs 6 checks after setup: WorkingDirectory exists, `current` symlink resolves to a valid project, `noisewarden` user can read the files, `uvicorn` is installed in the venv, config file is present, and `noisewarden` is in the `audio` group (FAIL if not). Audio device presence is checked with a WARNING (mic may not be plugged in yet)
+- **Deploy script improvements** — `deploy_noise_warden.sh` now lists available versions if no argument given, suggests `install_pi.sh` if the target directory doesn't exist, validates the target contains `noise_warden/main.py`, and fixes ownership after swap
+- **Service unit hardened** — `ExecStartPre` check validates the `current` symlink resolves to a valid project directory before starting uvicorn
+
+### Microphone setup documentation
+
+- **README step 5** — explicit "Connect your USB microphone" step with `arecord -l` verification
+- **README step 6** — `groups noisewarden` verification with `sudo usermod -a -G audio noisewarden` fix command
+- **Install script** — `usermod` warning now visible instead of silently swallowed by `2>/dev/null || true`
+
+### Sample rate auto-negotiation
+
+- **Problem** — Pi's ALSA doesn't auto-resample like macOS Core Audio. Requesting 22,050 Hz on a USB device that only supports 48,000 Hz causes `paInvalidSampleRate` and the service fails to start
+- **Solution** — new `AudioCapture._negotiate_sample_rate()` tests the configured rate via `sd.check_input_settings()` and falls back to the device's `default_samplerate` if unsupported. Logs a warning with the exact config fix: `sample_rate: <device_default>`
+- **README troubleshooting entry** — documents the symptom, cause, auto-fallback behavior, permanent fix, and how to check what rates the device supports
+
+### Stale device cache recovery
+
+- **Problem** — when PulseAudio/PipeWire audio profiles change at runtime (e.g., switching from "Analog Stereo Duplex" to "Analog Stereo Input"), PortAudio's per-process device cache goes stale. New `AudioCapture` instances query the same stale cache, producing an infinite "Error querying device -1" loop every 2 seconds
+- **Solution** — new `AudioCapture.refresh_device_list()` static method forces a PortAudio device rescan via `sd._terminate()` + `sd._initialize()`. Engine calls this before every reinit attempt
+- **Escalating backoff** — `audio_fail_count` tracks consecutive failures with backoff delay `min(30.0, 2.0 * (2 ** max(0, count - 2)))` → 2s, 2s, 4s, 8s, 16s, 30s cap. Prevents log spam while still recovering promptly when the profile settles
+- **10-failure warning** — after 10 consecutive audio failures, the journal logs a clear message recommending service restart. Counter resets on successful `read_block()` or reinit
+
+### Restart service button
+
+- **Problem** — several troubleshooting entries recommend restarting the service, but the only way to do so was via SSH (`sudo systemctl restart noise-warden`). For a Pi mounted in a closet, this is inconvenient
+- **Solution** — new `POST /control/restart` endpoint and red "Restart Service" button on the dashboard. Auth-protected. Uses self-termination via `os.kill(os.getpid(), signal.SIGTERM)` on a 1.5s timer (so the response reaches the client), relying on systemd `Restart=always` to bring the process back
+- **Systemd detection** — `_running_under_systemd()` checks for the `INVOCATION_ID` environment variable (set by systemd for all managed units). Under systemd: shows "Restart Service" button with auto-refresh holding page. Without systemd (local dev): shows "Stop Server" button with a "Server Stopped" page and manual restart instructions — no auto-refresh, no false promise of recovery
+- **Service unit change** — `Restart=on-failure` → `Restart=always`. systemd distinguishes between self-termination (restart) and explicit `systemctl stop` (stay stopped), so manual stops still work. Existing rate-limiting (`RestartSec=10`, `StartLimitBurst=5`) unchanged
+- **Confirm dialog** — browser `confirm()` prompt with context-appropriate warning text (systemd vs. local)
+
+### Starlette/FastAPI compatibility (Python 3.14)
+
+- **TemplateResponse signature updated** — all 7 `TemplateResponse` calls migrated from deprecated `TemplateResponse(name, {"request": request, ...})` to the new `TemplateResponse(request, name, {...})` signature. Eliminates 16 deprecation warnings per test run
+- **Pytest warning filters** — suppresses `PendingDeprecationWarning` from starlette's `import multipart` and `asyncio.iscoroutinefunction` deprecation (both upstream library issues on Python 3.14, not actionable in our code)
+- **Test count: 499 passed, 0 warnings**
+
+</details>
+
 ## v12 - 2026-04-11 — "Pro Edition"
 
 Enhancements to assist in the inevitable tweaking required to actually deploy this solution. Many configuration defaults tweaked after analyzing real-world input. Regression tests built up to continue to only get better without future silent breakages.

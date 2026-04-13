@@ -220,6 +220,58 @@ class TestPostMutations:
         assert resp.status_code == 303
         assert storage.get_incident(iid)["notes"] == "Bass was shaking my walls"
 
+    def test_restart_service_returns_holding_page(self, client, monkeypatch):
+        """POST /control/restart under systemd returns a 200 HTML holding page
+        with auto-refresh and schedules a SIGTERM via threading.Timer (which we
+        intercept so it cannot kill the test process)."""
+        import noise_warden.web as web_mod
+
+        timer_calls = []
+
+        class FakeTimer:
+            def __init__(self, delay, fn):
+                timer_calls.append((delay, fn))
+
+            def start(self):
+                pass  # Do NOT actually schedule termination
+
+        monkeypatch.setattr(web_mod.threading, "Timer", FakeTimer)
+        monkeypatch.setattr(web_mod, "_running_under_systemd", lambda: True)
+
+        resp = client.post("/control/restart", follow_redirects=False)
+        assert resp.status_code == 200
+        assert "Restarting" in resp.text
+        assert 'meta http-equiv="refresh"' in resp.text
+        # Verify the timer was created with a reasonable delay
+        assert len(timer_calls) == 1
+        assert timer_calls[0][0] == 1.5
+
+    def test_restart_without_systemd_returns_stopped_page(self, client, monkeypatch):
+        """POST /control/restart outside systemd returns a 'stopped' page
+        with no auto-refresh, since nothing will bring the server back."""
+        import noise_warden.web as web_mod
+
+        timer_calls = []
+
+        class FakeTimer:
+            def __init__(self, delay, fn):
+                timer_calls.append((delay, fn))
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(web_mod.threading, "Timer", FakeTimer)
+        monkeypatch.setattr(web_mod, "_running_under_systemd", lambda: False)
+
+        resp = client.post("/control/restart", follow_redirects=False)
+        assert resp.status_code == 200
+        assert "Server Stopped" in resp.text
+        assert "will not restart automatically" in resp.text.replace("<strong>", "").replace("</strong>", "")
+        # Should NOT have auto-refresh
+        assert 'meta http-equiv="refresh"' not in resp.text
+        # Timer is still scheduled (server does shut down)
+        assert len(timer_calls) == 1
+
 
 # ---------------------------------------------------------------------------
 # Auth enforcement on POST mutations

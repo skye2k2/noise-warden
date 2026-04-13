@@ -158,22 +158,37 @@ Key invariants:
 
     > **You can run this from anywhere** — the script copies files into `/opt/noise-warden/` so the system service can always reach them. You don't need to clone directly into `/opt/`.
 
-5. Edit the configuration:
+5. **Connect your USB microphone** and verify it's detected:
+    ```bash
+    arecord -l
+    ```
+    You should see at least one `card` entry (e.g., `card 1: Device [USB Audio Device]`). If nothing appears, check the USB connection or try a different port.
+
+6. Verify the `noisewarden` service user has audio access. The install script attempts this automatically, but confirm it took effect:
+    ```bash
+    groups noisewarden
+    ```
+    The output should include `audio`. If it doesn't:
+    ```bash
+    sudo usermod -a -G audio noisewarden
+    ```
+
+7. Edit the configuration:
     ```bash
     sudo nano /opt/noise-warden/current/config/noise_warden.yaml
     ```
 
-6. Enable and start the service:
+8. Enable and start the service:
     ```bash
     sudo systemctl enable --now noise-warden
     ```
 
-7. Verify it's running:
+9. Verify it's running:
     ```bash
     sudo systemctl status noise-warden
     ```
 
-8. Open in browser: `http://<pi-ip>:8787/`
+10. Open in browser: `http://<pi-ip>:8787/`
 
 </details>
 
@@ -187,7 +202,15 @@ Key invariants:
 
 **Permission denied** — the `noisewarden` user can't read project files. Fix: `sudo chown -R noisewarden:noisewarden /opt/noise-warden`
 
-**No audio device** — check `arecord -l` for available capture devices. Ensure the USB mic is connected, and the `noisewarden` user is in the `audio` group: `groups noisewarden`
+**Dashboard shows `mic ok: false`** — two common causes:
+1. **Microphone not plugged in.** Connect your USB mic, then verify with `arecord -l`. Restart the service afterward: `sudo systemctl restart noise-warden`
+2. **`noisewarden` user not in the `audio` group.** The service user needs audio group membership to access capture devices. Check: `groups noisewarden`. Fix: `sudo usermod -a -G audio noisewarden`, then restart the service. Group changes don't take effect until the process restarts.
+
+**No audio device / `arecord -l` shows nothing** — the USB microphone isn't connected or isn't recognized. Try a different USB port. If using a USB hub, try connecting directly to the Pi. Some mics need `alsa-utils` installed: `sudo apt install -y alsa-utils`
+
+**`paInvalidSampleRate` ALSA errors in journal** — the microphone doesn't support the configured sample rate (default 22050 Hz). Many cheap USB audio dongles only support 44100 or 48000 Hz. The app will automatically fall back to the device's default rate and log a warning, but to fix it permanently, set `sample_rate: 48000` (or `44100`) in your config. Check what your device supports: `arecord -D hw:1,0 --dump-hw-params /dev/null 2>&1 | grep RATE` (adjust `hw:1,0` to your card number from `arecord -l`)
+
+**`Error querying device -1` looping in journal** — the service's PortAudio device cache went stale. This typically happens when the PulseAudio/PipeWire audio profile for the USB mic is changed while the service is already running (e.g., switching from "Analog Stereo Duplex" to "Analog Stereo Input" in the OS sound settings). The engine now automatically forces a PortAudio device rescan on each reconnection attempt and uses escalating backoff (2s → 30s) to avoid log spam. In most cases, the service will self-recover within a few attempts once the profile settles. If it doesn't recover after ~10 attempts (the journal will say "10 consecutive audio failures"), use the **Restart Service** button on the dashboard, or from SSH: `sudo systemctl restart noise-warden`. You can verify the current profile with `pactl list cards` and confirm the mic is visible to ALSA with `arecord -l`. For a mic-only device (no speaker output), the `input:analog-stereo` profile is correct.
 
 </details>
 
@@ -532,6 +555,9 @@ Add to crontab (`crontab -e`):
 - TODO: Now that we have a number of different classifications, i see them being applied a little too strictly, like in thunder-and-light-rain and thunder-cracks--if we are only going to classify something for a block or three, differently than the sweeping majority, it should not be bolded. Or maybe more, if we implement weighting and backtracking. Because, for example, we _know_ that thunder rumble trail off looks like a diesel, but the odds that someone started their diesel up _right_ as a thunderclap hits is extraordinarily low, so we should clamp.
 - TODO: The yaml configuration has some odd sorting and grouping, like which things are put under `audio` versus `detection`. I might change `audio` to `recording`, and move things like `noise_floor_db` and `calibration_offset_db` into it.
 - TODO: Make sure that the system will function the same with 48kHz sampling and recording.
+- TODO: Even worth noting that configuring a mic with a given system will not necessarily carry over to another--actually, it seems like it could, given my recent recalibration.
+- TODO: Under windy conditions, that portion of the attic has a few locations that creak/rattle. Shim/reattach/glue/foam insulate as best as possible.
+- TODO: Add a profile for wind, if possible. The deadcat is doing its job, but the sharp edges of a roof cause some wind whistle.
 
 ### Architecture
 

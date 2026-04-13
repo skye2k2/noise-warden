@@ -33,3 +33,9 @@ testpaths = ["tests"]
 markers = [
     "hardware: tests requiring physical audio hardware (deselect with '-m not hardware')",
 ]
+# Suppress third-party deprecation warnings from starlette/fastapi on Python 3.14+.
+# These are internal to the libraries and not actionable in our code.
+filterwarnings = [
+    "ignore::PendingDeprecationWarning:starlette",
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
+]

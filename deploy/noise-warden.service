@@ -12,8 +12,11 @@ ExecStartPre=/bin/sh -c 'test -d /opt/noise-warden/current/noise_warden || (echo
 ExecStart=/opt/noise-warden/venv/bin/uvicorn noise_warden.main:app --host 0.0.0.0 --port 8787
 # Graceful shutdown: give the engine time to finalize active incidents and flush the DB
 TimeoutStopSec=15
-# Restart on failure only — don't restart on clean exit (e.g. manual stop)
-Restart=on-failure
+# Always restart when the process exits — systemd still honors explicit
+# 'systemctl stop' (won't restart after that). This enables the web UI's
+# "Restart Service" button, which self-terminates via SIGTERM and relies on
+# systemd to bring the process back up.
+Restart=always
 # Back off to avoid tight crash loops when config is broken or a dependency is missing
 RestartSec=10
 # Rate-limit restarts: max 5 attempts in 120 seconds, then give up

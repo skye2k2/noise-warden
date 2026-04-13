@@ -799,6 +799,7 @@ class Engine:
 
         last_cleanup = time.time()
         CLEANUP_INTERVAL = 86400  # Re-run cleanup once per day
+        audio_fail_count = 0      # Consecutive audio I/O failures (for backoff)
 
         while self.running:
             try:
@@ -808,6 +809,7 @@ class Engine:
 
                 block = self.capture.read_block()
                 self.state.set(mic_ok=True)
+                audio_fail_count = 0  # Successful read — reset failure counter
 
                 dbfs = rms_dbfs(block)
                 db_now = dba_estimate(dbfs, float(self.cfg["detection"]["calibration_offset_db"]))
@@ -978,9 +980,16 @@ class Engine:
                 # Audio I/O errors (USB disconnect, ALSA xrun, disk I/O, callback
                 # timeout) are often transient. Reinitialize the capture device and
                 # retry rather than spinning on a dead handle.
+                audio_fail_count += 1
                 error_msg = str(e)
-                print(f"[engine] Audio I/O error (attempting reconnection): {error_msg}")
+                print(f"[engine] Audio I/O error #{audio_fail_count} (attempting reconnection): {error_msg}")
                 self.state.set(mic_ok=False, last_error=error_msg, mode="error")
+
+                # Force PortAudio to rescan devices — the device cache goes
+                # stale when PulseAudio/PipeWire profiles change at runtime,
+                # causing every reinit to find device index -1 indefinitely.
+                AudioCapture.refresh_device_list()
+
                 try:
                     # Close the old capture before creating a new one — prevents
                     # InputStream resource leak when callback mode is active.
@@ -993,9 +1002,21 @@ class Engine:
                         device=a.get("input_device")
                     )
                     print("[engine] Audio device reinitialized successfully")
+                    audio_fail_count = 0  # Reset on success
                 except Exception as reinit_err:
                     print(f"[engine] Audio reinit failed: {reinit_err}")
-                time.sleep(2.0)  # Back off to avoid hammering a disconnected device
+
+                    if audio_fail_count >= 10:
+                        print(
+                            "[engine] WARNING: 10 consecutive audio failures. "
+                            "The audio device may be permanently unavailable. "
+                            "Check USB connection and restart the service: "
+                            "sudo systemctl restart noise-warden"
+                        )
+
+                # Escalating backoff: 2s, 2s, 4s, 8s, 16s, capped at 30s
+                backoff = min(30.0, 2.0 * (2 ** max(0, audio_fail_count - 2)))
+                time.sleep(backoff)
 
             except Exception as e:
                 # Unexpected errors — log but don't crash the loop

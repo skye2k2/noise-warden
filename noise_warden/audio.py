@@ -41,9 +41,69 @@ class AudioCapture:
         # Capture a fingerprint of the initial device for drift detection
         self._device_fingerprint = self._get_device_fingerprint()
 
+        # Validate the requested sample rate — many cheap USB audio devices
+        # only support 44100 or 48000. If the configured rate isn't supported,
+        # fall back to the device's default rate rather than crashing with a
+        # cryptic ALSA paInvalidSampleRate error.
+        self._negotiate_sample_rate()
+
         # Callback-mode resources (initialized lazily on first read_block)
         self._stream = None
         self._queue = queue.Queue(maxsize=128)
+
+    def _negotiate_sample_rate(self):
+        """Verify the device supports the requested sample rate; fall back if not.
+
+        Many cheap USB audio interfaces (common on Pi setups) only support
+        44100 or 48000 Hz. PortAudio raises paInvalidSampleRate deep inside
+        ALSA with no helpful message. This method tests the configured rate
+        and, if it fails, tries the device's default rate instead. The engine
+        doesn't care about the exact rate — DSP functions accept sr as a
+        parameter, and WAV headers record whatever rate was actually used.
+        """
+        try:
+            sd.check_input_settings(
+                device=self.device,
+                samplerate=self.sr,
+                channels=self.channels,
+                dtype="float32",
+            )
+            return  # Configured rate works
+        except (sd.PortAudioError, ValueError):
+            pass
+
+        # Configured rate not supported — try the device's default
+        try:
+            info = sd.query_devices(self.device, kind="input")
+            default_sr = int(info["default_samplerate"])
+        except (sd.PortAudioError, ValueError):
+            # Can't even query the device — let it fail later with context
+            return
+
+        if default_sr == self.sr:
+            return  # Same rate, failure must be something else
+
+        try:
+            sd.check_input_settings(
+                device=self.device,
+                samplerate=default_sr,
+                channels=self.channels,
+                dtype="float32",
+            )
+        except (sd.PortAudioError, ValueError):
+            # Default rate also fails — nothing we can do here
+            return
+
+        import logging
+        logger = logging.getLogger("noise_warden.audio")
+        logger.warning(
+            "Audio device does not support %d Hz — falling back to %d Hz "
+            "(device default). To avoid this warning, set sample_rate: %d "
+            "in your config.",
+            self.sr, default_sr, default_sr,
+        )
+        self.sr = default_sr
+        self.frames = int(default_sr * self.block_seconds)
 
     def _get_device_fingerprint(self):
         """Return a string identifying the current input device (name + channels + sample rate).
@@ -156,3 +216,28 @@ class AudioCapture:
     def close(self):
         """Release audio resources. Call during shutdown."""
         self._stop_stream()
+
+    @staticmethod
+    def refresh_device_list():
+        """Force PortAudio to rescan the system's audio devices.
+
+        PortAudio caches the device list at initialization time. If the
+        PulseAudio/PipeWire profile changes while the process is running
+        (e.g., switching a USB mic from "Analog Stereo Duplex" to "Analog
+        Stereo Input"), the cached device indices go stale — the old index
+        maps to nothing, and query_devices returns -1 or raises. Tearing
+        down and reinitializing the PortAudio backend forces a fresh scan
+        of the ALSA/PulseAudio device tree.
+
+        Call this before creating a new AudioCapture after a device error.
+        """
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            # If PortAudio is in a broken state, _terminate may fail.
+            # Try _initialize anyway — it's idempotent.
+            try:
+                sd._initialize()
+            except Exception:
+                pass

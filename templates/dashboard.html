@@ -43,6 +43,11 @@
     {% else %}
     <form method="post" action="/control/force-incident" style="display:inline-block;"><button>Start Test Incident</button></form>
     {% endif %}
+
+    <form method="post" action="/control/restart" style="display:inline-block; margin-left:16px;"
+      onsubmit="return confirm({% if has_systemd %}'Restart the noise-warden service?\n\nThe dashboard will be unavailable for ~15 seconds while the service restarts.'{% else %}'Stop the noise-warden server?\n\nNot running under systemd \u2014 the server will NOT restart automatically. You will need to restart it from the terminal.'{% endif %})">
+      <button class="destructive" title="{% if has_systemd %}Restart the systemd service{% else %}Stop the server (manual restart required){% endif %}">{% if has_systemd %}Restart Service{% else %}Stop Server{% endif %}</button>
+    </form>
   </div>
 
   <div style="margin-top:8px">

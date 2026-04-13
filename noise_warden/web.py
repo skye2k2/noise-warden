@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, io
+import json, os, io, signal, threading
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
@@ -34,6 +34,12 @@ static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
 os.makedirs(static_dir, exist_ok=True)
 os.makedirs(os.path.join(static_dir, "build"), exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+def _running_under_systemd():
+    """Detect whether we're running as a systemd service. systemd sets
+    INVOCATION_ID for every unit it manages — its absence means we're
+    running standalone (local dev, manual uvicorn, etc.)."""
+    return bool(os.environ.get("INVOCATION_ID"))
 
 def auth_ok(request: Request):
     token = cfg["app"].get("auth_token") or ""
@@ -81,14 +87,14 @@ def _persist_armed(armed: bool):
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
     incidents = storage.list_incidents(limit=20)
-    return templates.TemplateResponse("dashboard.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "dashboard.html", {
         "state": state.snapshot(),
         "incidents": incidents,
         "ordinance": ORDINANCE,
         "ordinance_json": json.dumps(ORDINANCE),
         "borderline_margin_db": float(cfg["detection"].get("borderline_margin_db", 5.0)),
         "cfg": cfg,
+        "has_systemd": _running_under_systemd(),
     })
 
 @app.get("/incidents", response_class=HTMLResponse)
@@ -97,8 +103,8 @@ def incidents(request: Request, page: int = 1):
     offset = (max(page,1)-1) * per_page
     total = storage.count_incidents()
     rows = storage.list_incidents(limit=per_page, offset=offset)
-    return templates.TemplateResponse("incidents.html", {
-        "request": request, "rows": rows, "page": page, "pages": max(1, (total + per_page - 1)//per_page),
+    return templates.TemplateResponse(request, "incidents.html", {
+        "rows": rows, "page": page, "pages": max(1, (total + per_page - 1)//per_page),
         "ordinance_json": json.dumps(ORDINANCE),
         "borderline_margin_db": float(cfg["detection"].get("borderline_margin_db", 5.0)),
     })
@@ -318,8 +324,7 @@ def timeline(request: Request, view: str = "day"):
             "has_snippet": bool(r.get("snippet_path")),
         })
 
-    return templates.TemplateResponse("timeline.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "timeline.html", {
         "view": view,
         "incidents_json": json.dumps(incidents),
         "ordinance_json": json.dumps(ORDINANCE),
@@ -331,7 +336,7 @@ def config_page(request: Request):
     cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
     with open(cfg_path, "r", encoding="utf-8") as f:
         raw = f.read()
-    return templates.TemplateResponse("config.html", {"request": request, "raw": raw, "message": request.query_params.get("msg")})
+    return templates.TemplateResponse(request, "config.html", {"raw": raw, "message": request.query_params.get("msg")})
 
 @app.post("/config/save")
 def save_config(request: Request, raw: str = Form(...)):
@@ -347,7 +352,7 @@ def save_config(request: Request, raw: str = Form(...)):
 def build_page(request: Request):
     meta = storage.get_build_meta()
     photo_path = "/static/build/build_photo.jpg" if os.path.exists(os.path.join(static_dir, "build", "build_photo.jpg")) else None
-    return templates.TemplateResponse("build.html", {"request": request, "meta": meta, "photo_path": photo_path})
+    return templates.TemplateResponse(request, "build.html", {"meta": meta, "photo_path": photo_path})
 
 @app.post("/build/upload")
 async def build_upload(request: Request, photo: UploadFile = File(None), notes: str = Form(""), ordinance_excerpt: str = Form("")):
@@ -364,8 +369,7 @@ async def build_upload(request: Request, photo: UploadFile = File(None), notes: 
 
 @app.get("/calibration", response_class=HTMLResponse)
 def calibration(request: Request):
-    return templates.TemplateResponse("calibration.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "calibration.html", {
         "profiles": storage.list_calibration_profiles(),
         "cfg": cfg,
     })
@@ -499,8 +503,7 @@ def thresholds(request: Request):
     ACTIVE_CATEGORIES = {"continuous_A2_A3", "intermittent_A2_A3", "impulse_A1_A3"}
     active_thresholds = {k: v for k, v in zone_data.items() if k in ACTIVE_CATEGORIES}
 
-    return templates.TemplateResponse("thresholds.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "thresholds.html", {
         "ordinance": ORDINANCE,
         "cfg": cfg,
         "zone_label": zone.replace("_", " ").title(),
@@ -567,6 +570,55 @@ def end_forced_incident(request: Request):
     must_auth(request)
     engine.end_forced_incident()
     return RedirectResponse(url="/", status_code=303)
+
+@app.post("/control/restart")
+def restart_service(request: Request):
+    """Restart the service via self-termination. Under systemd (Restart=always),
+    the process comes back automatically. Without systemd, the server just stops
+    and the user gets a 'stopped' page with manual restart instructions."""
+    must_auth(request)
+    under_systemd = _running_under_systemd()
+    print(f"[web] Service restart requested — self-terminating in 1.5s (systemd={under_systemd})")
+
+    # Schedule self-termination after a brief delay so the response reaches the client.
+    # SIGTERM triggers uvicorn's graceful shutdown.
+    def _self_terminate():
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Timer(1.5, _self_terminate).start()
+
+    if under_systemd:
+        return HTMLResponse(
+            '<!doctype html><html><head><meta charset="utf-8">'
+            '<meta http-equiv="refresh" content="15;url=/">'
+            '<title>Restarting\u2026</title>'
+            '<link rel="stylesheet" href="/static/style.css">'
+            '</head><body>'
+            '<div class="wrap"><div class="card">'
+            '<h2>Restarting Service\u2026</h2>'
+            '<p>The service is shutting down and will restart automatically. '
+            'This page will redirect to the dashboard in ~15 seconds.</p>'
+            '<p>If it doesn\'t come back, check: '
+            '<code>sudo systemctl status noise-warden</code></p>'
+            '</div></div></body></html>',
+            status_code=200,
+        )
+
+    # Not under systemd — no auto-restart. Show a stopped page.
+    return HTMLResponse(
+        '<!doctype html><html><head><meta charset="utf-8">'
+        '<title>Server Stopped</title>'
+        '<link rel="stylesheet" href="/static/style.css">'
+        '</head><body>'
+        '<div class="wrap"><div class="card">'
+        '<h2>Server Stopped</h2>'
+        '<p>The noise-warden process has been shut down. '
+        'Since this is not running under systemd, it will <strong>not</strong> restart automatically.</p>'
+        '<p>Restart manually from your terminal:</p>'
+        '<pre>uvicorn noise_warden.main:app --host 127.0.0.1 --port 8787 --reload</pre>'
+        '</div></div></body></html>',
+        status_code=200,
+    )
 
 @app.get("/export.csv")
 def export_csv(request: Request):

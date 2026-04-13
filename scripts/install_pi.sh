@@ -82,7 +82,14 @@ echo "  Dependencies installed."
 
 # --- Create system user ---
 sudo useradd -r -s /usr/sbin/nologin noisewarden 2>/dev/null || true
-sudo usermod -a -G audio noisewarden 2>/dev/null || true
+# Audio group is required for microphone access; warn loudly if it fails
+if sudo usermod -a -G audio noisewarden 2>/dev/null; then
+    echo "  Added noisewarden to audio group."
+else
+    echo "  WARNING: Could not add noisewarden to audio group."
+    echo "           The service will not be able to access the microphone."
+    echo "           Fix manually: sudo usermod -a -G audio noisewarden"
+fi
 # gpio group only exists on Raspberry Pi OS
 if getent group gpio >/dev/null 2>&1; then
     sudo usermod -a -G gpio noisewarden 2>/dev/null || true
@@ -141,6 +148,31 @@ else
     echo "  WARN: No config file at $CURRENT/config/noise_warden.yaml"
 fi
 
+# Check noisewarden is in the audio group
+if id -nG noisewarden 2>/dev/null | grep -qw audio; then
+    echo "  OK: noisewarden user is in the audio group"
+else
+    echo "  FAIL: noisewarden user is NOT in the audio group"
+    echo "        Fix: sudo usermod -a -G audio noisewarden"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# Check for audio capture devices (warn-only — mic may not be plugged in yet)
+WARNINGS=0
+if command -v arecord >/dev/null 2>&1; then
+    if arecord -l 2>/dev/null | grep -q "card"; then
+        echo "  OK: Audio capture device detected"
+    else
+        echo "  WARN: No audio capture device found — plug in your USB microphone"
+        echo "        before starting the service. Verify with: arecord -l"
+        WARNINGS=$((WARNINGS + 1))
+    fi
+else
+    echo "  WARN: arecord not found — cannot verify audio devices"
+    echo "        Install with: sudo apt install -y alsa-utils"
+    WARNINGS=$((WARNINGS + 1))
+fi
+
 echo ""
 if [ "$ERRORS" -gt 0 ]; then
     echo "=== $ERRORS pre-flight check(s) FAILED ==="
@@ -148,10 +180,16 @@ if [ "$ERRORS" -gt 0 ]; then
     exit 1
 fi
 
-echo "=== Install complete: $VERSION_NAME ==="
+if [ "$WARNINGS" -gt 0 ]; then
+    echo "=== Install complete with $WARNINGS warning(s): $VERSION_NAME ==="
+else
+    echo "=== Install complete: $VERSION_NAME ==="
+fi
 echo ""
 echo "Next steps:"
-echo "  1. Edit config:  sudo nano $CURRENT/config/noise_warden.yaml"
-echo "  2. Start:        sudo systemctl enable --now noise-warden"
-echo "  3. Check:        sudo systemctl status noise-warden"
-echo "  4. Open:         http://<pi-ip>:8787/"
+echo "  1. Plug in your USB microphone (if not already connected)"
+echo "  2. Verify it's detected:  arecord -l"
+echo "  3. Edit config:  sudo nano $CURRENT/config/noise_warden.yaml"
+echo "  4. Start:        sudo systemctl enable --now noise-warden"
+echo "  5. Check:        sudo systemctl status noise-warden"
+echo "  6. Open:         http://<pi-ip>:8787/"
