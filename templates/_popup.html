@@ -29,12 +29,9 @@
   .reclass-new { font-weight:bold; }
   .reclass-journal { margin-top:6px; font-size:12px; color:var(--text-muted); }
   .reclass-journal-entry { margin-left:8px; }
-  .reclass-btn { font-size:12px; padding:4px 10px; cursor:pointer; border:1px solid var(--border-light, #555); border-radius:4px; background:var(--bg-input, #2d2d2d); color:var(--text, #eee); margin-right:6px; }
-  .reclass-btn:hover { background:var(--border-light, #555); }
   .reclass-btn:disabled { opacity:0.5; cursor:not-allowed; }
   .reclass-apply-btn { background:#27ae60; color:#fff; border-color:#27ae60; }
   .reclass-apply-btn:hover { background:#219a52; }
-
 
   /* Waveform intensity display */
   .waveform-wrap { position:relative; width:100%; height:64px; margin:6px 0 4px; cursor:pointer; border-radius:4px; overflow:hidden; background:var(--bg-input, #2d2d2d); }
@@ -117,6 +114,9 @@ function popupEscapeHtml(str) {
  * @param {Object} inc - Incident object with standard DB fields + has_snippet boolean.
  */
 function showPopup(inc) {
+  // Remember which element opened the popup so we can return focus on close
+  _popupTrigger = document.activeElement;
+
   var startDate = new Date(inc.start_ts);
   var endDate = inc.end_ts ? new Date(inc.end_ts) : null;
   var peakDb = safeNum(inc.peak_db, inc.start_db);
@@ -155,7 +155,7 @@ function showPopup(inc) {
   // Violation comparison — THE HERO ELEMENT for authority presentation
   html += '<div class="popup-section">';
   html += '<div class="excess-badge ' + popupExcessClass(excessPeak) + '">';
-  html += '+' + excessPeak.toFixed(1) + ' dB above ' + period + ' limit';
+  html += (excessPeak >= 0 ? '+' : '') + excessPeak.toFixed(1) + ' dB ' + (excessPeak >= 0 ? 'above' : 'below') + ' ' + period + ' limit';
   html += '</div>';
   html += '<div style="margin-top:8px">';
   html += '<div><span class="popup-lbl">Ordinance threshold (' + period + '):</span> <span class="popup-val">' + thresholdDb + ' dBA</span></div>';
@@ -189,7 +189,7 @@ function showPopup(inc) {
           var atSec = entry[0];
           var cls = entry[1];
           var isUnknown = cls === 'unknown';
-          html += '<div class="journal-entry' + (isUnknown ? ' journal-unknown' : '') + '" data-seek-time="' + atSec + '">';
+          html += '<div class="journal-entry' + (isUnknown ? ' journal-unknown' : '') + '" tabindex="0" data-seek-time="' + atSec + '">';
           html += '<span class="popup-lbl">+' + popupFormatDuration(atSec) + ':</span> ';
           html += '<span class="popup-val">' + popupEscapeHtml(cls) + '</span>';
           html += '</div>';
@@ -211,7 +211,13 @@ function showPopup(inc) {
   if (inc.has_snippet && inc.id) {
     html += '<div class="popup-section">';
     html += '<button class="reclass-btn" id="reclass-btn" onclick="reclassifyIncident(' + inc.id + ')">Re-analyze with current config</button>';
+    html += '&nbsp;<button class="destructive" onclick="popupDeleteIncident(' + inc.id + ')">Delete incident</button>';
     html += '<div id="reclass-result"></div>';
+    html += '</div>';
+  } else if (inc.id) {
+    // No snippet, but still allow deletion
+    html += '<div class="popup-section">';
+    html += '<button class="destructive" onclick="popupDeleteIncident(' + inc.id + ')">Delete incident</button>';
     html += '</div>';
   }
 
@@ -232,14 +238,32 @@ function showPopup(inc) {
     // for metadata/playback, racing against the waveform fetch and causing
     // "plays for 1 second then stops" on first click).
     html += '<audio controls preload="auto" id="popup-audio" style="width:100%"></audio>';
+    html += '<div style="display:flex;align-items:center;gap:0.5em;margin-top:0.25em;font-size:0.85em">';
+    html += '<label for="volume-boost" style="white-space:nowrap">Volume boost:</label>';
+    html += '<select id="volume-boost">';
+    html += '<option value="1">1x</option>';
+    html += '<option value="2">2x</option>';
+    html += '<option value="3">3x</option>';
+    html += '<option value="4">4x</option>';
+    html += '<option value="5">5x</option>';
+    html += '</select>';
+    html += '<span id="volume-boost-note" style="color:var(--muted);font-size:0.8em"></span>';
+    html += '</div>';
     html += '</div>';
   }
 
   document.getElementById('popup-content').innerHTML = html;
   document.getElementById('popup-overlay').style.display = 'flex';
 
+  // Lock background scroll so spacebar/arrow keys don't move the page behind the popup
+  document.body.style.overflow = 'hidden';
+
   // Wire click-to-seek on source timeline journal entries
   _wireJournalSeek();
+
+  // Auto-focus the first journal entry for keyboard navigation
+  var firstEntry = document.querySelector('.journal-entry');
+  if (firstEntry) { firstEntry.focus(); }
 
   // Initialize waveform visualization after DOM is populated
   if (inc.has_snippet) {
@@ -266,13 +290,15 @@ function showPopup(inc) {
    of truth for audio data.
    ====================================================================== */
 var _popupJournal = null;
+var _popupTrigger = null;
 var _waveformAudioCtx = null;
 var _currentBlobUrl = null;
+var _gainNode = null;
 
 /**
- * Fetch and decode an audio snippet, render its intensity waveform, and
- * assign the fetched data to the <audio> element via a Blob URL. This
- * single fetch serves both the waveform canvas and audio playback.
+ * Fetch and decode an audio snippet, render its intensity waveform, set up
+ * gain-boosted playback, and assign the fetched data to the <audio> element
+ * via a Blob URL. This single fetch serves both waveform canvas and playback.
  */
 function _initWaveform(incidentId) {
   var canvas = document.getElementById('waveform-canvas');
@@ -282,6 +308,14 @@ function _initWaveform(incidentId) {
   var loadingEl = document.getElementById('waveform-loading');
   var audio = document.getElementById('popup-audio');
   if (!canvas || !audio || !wrap) { return; }
+
+  // Native <audio controls> uses a closed shadow root. Some browsers don't
+  // propagate keyboard events out of it — not even during capture phase on
+  // document. A listener directly on the host element catches the retargeted
+  // event reliably.
+  audio.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { hidePopup(); }
+  });
 
   // Revoke any previous Blob URL to avoid memory leaks across popup opens
   if (_currentBlobUrl) {
@@ -307,6 +341,45 @@ function _initWaveform(incidentId) {
       var blob = new Blob([arrayBuf], { type: 'audio/wav' });
       _currentBlobUrl = URL.createObjectURL(blob);
       audio.src = _currentBlobUrl;
+
+      // Route audio through a GainNode for volume boost (1x–5x).
+      // createMediaElementSource can only be called once per <audio>
+      // element, but we recreate the element on each popup open so this
+      // is safe. The native <audio controls> still handle play/pause/seek;
+      // the GainNode just amplifies the signal before it reaches speakers.
+      var source = _waveformAudioCtx.createMediaElementSource(audio);
+      _gainNode = _waveformAudioCtx.createGain();
+      _gainNode.gain.value = 1.0;
+      source.connect(_gainNode);
+      _gainNode.connect(_waveformAudioCtx.destination);
+
+      // Wire the volume boost selector
+      var boostSelect = document.getElementById('volume-boost');
+      var boostNote = document.getElementById('volume-boost-note');
+      if (boostSelect) {
+        // Restore previous selection if user had already changed it
+        var stored = sessionStorage.getItem('nw-volume-boost');
+        if (stored && _gainNode) {
+          boostSelect.value = stored;
+          _gainNode.gain.value = parseFloat(stored);
+        }
+
+        boostSelect.addEventListener('change', function () {
+          var val = parseFloat(this.value);
+          if (_gainNode) {
+            _gainNode.gain.value = val;
+          }
+          sessionStorage.setItem('nw-volume-boost', this.value);
+          if (boostNote) {
+            boostNote.textContent = val > 1 ? '(may clip loud recordings)' : '';
+          }
+        });
+
+        // Set initial note
+        if (boostNote && parseFloat(boostSelect.value) > 1) {
+          boostNote.textContent = '(may clip loud recordings)';
+        }
+      }
 
       // decodeAudioData consumes the buffer in some browsers, so we pass
       // a copy to avoid invalidating the Blob we just created.
@@ -467,14 +540,23 @@ function _wireJournalSeek() {
   var entries = document.querySelectorAll('.journal-entry');
   if (!entries.length) { return; }
 
+  function seekToEntry(el) {
+    var audio = document.getElementById('popup-audio');
+    if (!audio || !audio.duration || !isFinite(audio.duration)) { return; }
+    var seekTime = parseFloat(el.getAttribute('data-seek-time'));
+    // Seek to half a block before the entry, clamped to valid range
+    audio.currentTime = Math.max(0, Math.min(seekTime - 0.5, audio.duration));
+    if (audio.paused) { audio.play(); }
+  }
+
   for (var i = 0; i < entries.length; i++) {
-    entries[i].addEventListener('click', function () {
-      var audio = document.getElementById('popup-audio');
-      if (!audio || !audio.duration || !isFinite(audio.duration)) { return; }
-      var seekTime = parseFloat(this.getAttribute('data-seek-time'));
-      // Seek to half a block before the entry, clamped to valid range
-      audio.currentTime = Math.max(0, Math.min(seekTime - 0.5, audio.duration));
-      if (audio.paused) { audio.play(); }
+    entries[i].addEventListener('click', function () { seekToEntry(this); });
+    // Spacebar activates journal entries for keyboard-only users
+    entries[i].addEventListener('keyup', function (e) {
+      if (e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        seekToEntry(this);
+      }
     });
   }
 }
@@ -525,6 +607,13 @@ function hidePopup() {
     URL.revokeObjectURL(_currentBlobUrl);
     _currentBlobUrl = null;
   }
+  // Restore background scroll
+  document.body.style.overflow = '';
+  // Return focus to the element that opened the popup
+  if (_popupTrigger && typeof _popupTrigger.focus === 'function') {
+    _popupTrigger.focus();
+    _popupTrigger = null;
+  }
 }
 
 /* ======================================================================
@@ -560,6 +649,25 @@ function reclassifyIncident(incidentId) {
       btn.textContent = 'Re-analyze with current config';
       btn.disabled = false;
       resultDiv.innerHTML = '<div style="color:#e74c3c;margin-top:6px">' + popupEscapeHtml(err.message) + '</div>';
+    });
+}
+
+/**
+ * Delete an incident from within the detail popup. Uses a POST to the same
+ * endpoint as the table-row delete form, then closes the popup and reloads
+ * the page to reflect the deletion.
+ */
+function popupDeleteIncident(incidentId) {
+  if (!confirm('Delete incident #' + incidentId + '?')) { return; }
+
+  fetch('/incidents/' + incidentId + '/delete', { method: 'POST' })
+    .then(function (resp) {
+      if (!resp.ok) { throw new Error('Delete failed (' + resp.status + ')'); }
+      hidePopup();
+      window.location.reload();
+    })
+    .catch(function (err) {
+      alert('Failed to delete incident: ' + err.message);
     });
 }
 
@@ -657,7 +765,9 @@ function applyReclassification(incidentId) {
     });
 }
 
+// Capture phase ensures Escape works even when focus is inside the
+// native <audio controls> shadow DOM (which swallows bubbling key events).
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape') { hidePopup(); }
-});
+}, true);
 </script>

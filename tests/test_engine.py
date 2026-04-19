@@ -169,7 +169,7 @@ class TestEngineProcessing:
 
         incidents = tmp_storage.list_incidents()
         assert len(incidents) >= 1, "Expected at least one incident from loud signal"
-        assert incidents[0]["classification"] in ("music", "music_like", "unknown")
+        assert incidents[0]["classification"] in ("music", "music_like", "engine_noise", "unknown")
 
     def test_silence_creates_no_incident(self, base_cfg, tmp_storage, tmp_state):
         """Silence should never create an incident."""
@@ -421,6 +421,8 @@ class TestTailTrim:
         all_dbs = active_dbs + tail_dbs
 
         now = datetime.now(tz=timezone.utc)
+        # Set snippet_post_seconds to control exactly how many tail blocks survive
+        base_cfg["audio"]["snippet_post_seconds"] = 2
         engine.active = {
             "id": tmp_storage.create_incident({
                 "start_ts": "2026-01-01T00:00:00+00:00",
@@ -447,12 +449,12 @@ class TestTailTrim:
         incident = tmp_storage.list_incidents()[0]
 
         # avg_db should be close to 70 (the active portion), not dragged down
-        # toward 40 by the silent tail. With 11 blocks (10 active + 1 kept
-        # for context), the single 40 dB block has minimal impact — but the
-        # exponential weighting favors later blocks, so the lone context block
-        # at 40 dB pulls the average down slightly more than a flat mean would.
-        # Without trimming, 12 tail blocks at 40 dB would drag avg below 55.
-        assert incident["avg_db"] >= 65.0, (
+        # toward 40 by the silent tail. With 12 blocks (10 active + 2 kept for
+        # snippet_post_seconds context), the two 40 dB blocks have moderate impact
+        # — the exponential weighting favors later blocks, so the tail pulls the
+        # average down. Without trimming, 12 tail blocks at 40 dB would drag avg
+        # well below 55. With post_seconds=2, we keep 2 of 12 tail blocks.
+        assert incident["avg_db"] >= 60.0, (
             f"avg_db {incident['avg_db']} too low — silent tail not trimmed"
         )
 
@@ -461,6 +463,7 @@ class TestTailTrim:
         full gap-timeout span."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
         base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["audio"]["snippet_post_seconds"] = 2
         base_cfg["detection"]["driveby_max_duration_sec"] = 0
 
         active_dbs = [70.0] * 10
@@ -491,8 +494,8 @@ class TestTailTrim:
             engine._finalize_incident()
 
         incident = tmp_storage.list_incidents()[0]
-        # 22 total blocks, 11 blocks trimmed → dur ≈ 11s (not 22s)
-        assert incident["duration_sec"] <= 12, (
+        # 22 total blocks, 10 blocks trimmed (12 tail - 2 post_seconds) → dur ≈ 12s
+        assert incident["duration_sec"] <= 13, (
             f"duration_sec {incident['duration_sec']} too high — tail not trimmed"
         )
 
@@ -537,6 +540,7 @@ class TestTailTrim:
     def test_tail_trim_truncates_wav(self, base_cfg, tmp_storage, tmp_state, tmp_path):
         """WAV snippet should be truncated to remove silent tail blocks."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["audio"]["snippet_post_seconds"] = 2
         base_cfg["detection"]["driveby_max_duration_sec"] = 0
 
         sr = 22050
@@ -578,8 +582,9 @@ class TestTailTrim:
             engine._finalize_incident()
 
         trimmed_audio, _ = _sf.read(wav_path)
-        # 11 blocks trimmed (12 tail - 1 kept) → should be shorter
-        expected_trim = (n_tail - 1) * block_samples
+        # 10 blocks trimmed (12 tail - 2 post_seconds kept) → should be shorter
+        post_blocks = 2  # matches snippet_post_seconds / block_seconds
+        expected_trim = (n_tail - post_blocks) * block_samples
         assert len(trimmed_audio) == original_samples - expected_trim, (
             f"Expected {original_samples - expected_trim} samples, got {len(trimmed_audio)}"
         )
@@ -617,6 +622,131 @@ class TestTailTrim:
         incident = tmp_storage.list_incidents()[0]
         # All 10 blocks at 70 dB — avg should be ~70
         assert incident["avg_db"] >= 69.5
+
+
+# ---------------------------------------------------------------------------
+# Minimum incident duration auto-dismiss
+# ---------------------------------------------------------------------------
+
+class TestMinIncidentDuration:
+    """Verify that min_incident_seconds uses active duration (time above
+    threshold), not the stored duration that includes post-padding."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_short_active_dismissed_despite_long_tail(self, base_cfg, tmp_storage, tmp_state):
+        """2 seconds active + 8 seconds tail padding → stored dur ~10s, but
+        active_dur is only 2s, which is below min_incident_seconds=3.
+        Should be auto-dismissed as too_short."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["audio"]["min_incident_seconds"] = 3
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+
+        now = datetime.now(tz=timezone.utc)
+        engine.active = {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+                "threshold_db": 65.0, "music_like_score": 0.5,
+                "beat_confidence": 0.3, "classification": "unknown",
+                "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=10),
+            "dbs": [70.0, 70.0] + [40.0] * 8,
+            "classification": "unknown",
+            "class_journal": [(0, "unknown")],
+            "period": "day",
+            "responded": False,
+            # last_above was 8 seconds ago — only 2 seconds were active
+            "last_above": now - timedelta(seconds=8),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        # Should be dismissed — 0 non-excluded incidents remain
+        incidents = tmp_storage.list_incidents()
+        assert len(incidents) == 0, (
+            "Short active incident should be auto-dismissed despite long tail padding"
+        )
+
+    def test_sufficient_active_kept(self, base_cfg, tmp_storage, tmp_state):
+        """4 seconds active + 8 seconds tail → active_dur=4 ≥ min=3.
+        Should NOT be dismissed."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["audio"]["min_incident_seconds"] = 3
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+
+        now = datetime.now(tz=timezone.utc)
+        engine.active = {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+                "threshold_db": 65.0, "music_like_score": 0.5,
+                "beat_confidence": 0.3, "classification": "unknown",
+                "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=12),
+            "dbs": [70.0] * 4 + [40.0] * 8,
+            "classification": "unknown",
+            "class_journal": [(0, "unknown")],
+            "period": "day",
+            "responded": False,
+            # last_above was 8 seconds ago — 4 seconds were active
+            "last_above": now - timedelta(seconds=8),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        incidents = tmp_storage.list_incidents()
+        assert len(incidents) == 1, (
+            "Incident with 4s active duration should not be dismissed (min=3)"
+        )
+
+    def test_disabled_at_zero(self, base_cfg, tmp_storage, tmp_state):
+        """min_incident_seconds=0 should disable the check entirely."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["audio"]["min_incident_seconds"] = 0
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+
+        now = datetime.now(tz=timezone.utc)
+        engine.active = {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+                "threshold_db": 65.0, "music_like_score": 0.5,
+                "beat_confidence": 0.3, "classification": "unknown",
+                "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=1),
+            "dbs": [70.0],
+            "classification": "unknown",
+            "class_journal": [(0, "unknown")],
+            "period": "day",
+            "responded": False,
+            "last_above": now,
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        incidents = tmp_storage.list_incidents()
+        assert len(incidents) == 1, (
+            "min_incident_seconds=0 should disable auto-dismiss"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +825,161 @@ class TestDriveByQuarantine:
         assert inc is not None
         assert inc["classification"] == "drive_by"
         assert inc["excluded"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Borderline auto-dismiss
+# ---------------------------------------------------------------------------
+
+class TestBorderlineAutoDismiss:
+
+    def test_borderline_incident_dismissed_when_disabled(self, base_cfg, tmp_storage, tmp_state, tmp_path):
+        """When record_borderline_events is false, incidents whose peak is within
+        the borderline margin should be auto-dismissed as 'borderline'."""
+        base_cfg["detection"]["record_borderline_events"] = False
+        base_cfg["detection"]["borderline_margin_db"] = 10.0
+        # Disable drive-by filter so it doesn't dismiss our test incident first
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+
+        # Create snippet file
+        snippets_dir = os.path.join(str(tmp_path), "snippets")
+        os.makedirs(snippets_dir)
+        snippet_file = os.path.join(snippets_dir, "incident_1_test.wav")
+        with open(snippet_file, "wb") as f:
+            f.write(b"RIFF" + b"\x00" * 40)
+
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                engine = Engine(base_cfg, tmp_storage, tmp_state)
+
+        # Create the incident in the DB
+        row = {
+            "start_ts": "2026-04-01T12:00:00+00:00",
+            "start_db": 60, "peak_db": 60, "avg_db": 58,
+            "threshold_db": 55, "music_like_score": 0.3,
+            "beat_confidence": 0.2, "classification": "unknown",
+            "mode": "continuous",
+        }
+        iid = tmp_storage.create_incident(row)
+
+        # Set up active incident — steady readings at ~60 dB with threshold 55 dB
+        # = 5 dB excess, within 10 dB borderline margin → should be dismissed
+        start = datetime.now(timezone.utc) - timedelta(seconds=15)
+        engine.active = {
+            "id": iid,
+            "start": start,
+            "dbs": [58, 60, 60, 60, 59, 60, 60, 59, 60, 60, 59, 60, 59, 60, 58],
+            "classification": "unknown",
+            "period": "day",
+            "responded": False,
+            "last_above": datetime.now(timezone.utc) - timedelta(seconds=2),
+            "threshold_db": 55.0,
+            "tmp_wav": snippet_file,
+            "recording": True,
+            "class_journal": [(0, "unknown")],
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        # Snippet should be quarantined to autodismissed/
+        assert not os.path.exists(snippet_file)
+        quarantine_path = os.path.join(snippets_dir, "autodismissed", "incident_1_test.wav")
+        assert os.path.exists(quarantine_path)
+
+        # Incident should be classified as borderline and excluded
+        inc = tmp_storage.get_incident(iid)
+        assert inc is not None
+        assert inc["classification"] == "borderline"
+        assert inc["excluded"] == 1
+
+    def test_borderline_incident_kept_when_enabled(self, base_cfg, tmp_storage, tmp_state, tmp_path):
+        """When record_borderline_events is true (default), borderline incidents
+        are recorded normally — no auto-dismiss."""
+        base_cfg["detection"]["record_borderline_events"] = True
+        base_cfg["detection"]["borderline_margin_db"] = 10.0
+        base_cfg["audio"]["min_incident_seconds"] = 0  # disable too_short
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0  # disable drive-by
+
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                engine = Engine(base_cfg, tmp_storage, tmp_state)
+
+        row = {
+            "start_ts": "2026-04-01T12:00:00+00:00",
+            "start_db": 60, "peak_db": 60, "avg_db": 58,
+            "threshold_db": 55, "music_like_score": 0.3,
+            "beat_confidence": 0.2, "classification": "unknown",
+            "mode": "continuous",
+        }
+        iid = tmp_storage.create_incident(row)
+
+        start = datetime.now(timezone.utc) - timedelta(seconds=15)
+        engine.active = {
+            "id": iid,
+            "start": start,
+            "dbs": [58, 60, 60, 60, 59, 60, 60, 59, 60, 60, 59, 60, 59, 60, 58],
+            "classification": "unknown",
+            "period": "day",
+            "responded": False,
+            "last_above": datetime.now(timezone.utc) - timedelta(seconds=2),
+            "threshold_db": 55.0,
+            "tmp_wav": None,
+            "recording": False,
+            "class_journal": [(0, "unknown")],
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        # Incident should NOT be excluded
+        inc = tmp_storage.get_incident(iid)
+        assert inc is not None
+        assert inc["excluded"] == 0
+
+    def test_above_margin_not_dismissed(self, base_cfg, tmp_storage, tmp_state, tmp_path):
+        """Incidents whose peak exceeds the borderline margin should never be
+        dismissed, even when record_borderline_events is false."""
+        base_cfg["detection"]["record_borderline_events"] = False
+        base_cfg["detection"]["borderline_margin_db"] = 10.0
+        base_cfg["audio"]["min_incident_seconds"] = 0
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0  # disable drive-by
+
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                engine = Engine(base_cfg, tmp_storage, tmp_state)
+
+        row = {
+            "start_ts": "2026-04-01T12:00:00+00:00",
+            "start_db": 70, "peak_db": 70, "avg_db": 68,
+            "threshold_db": 55, "music_like_score": 0.3,
+            "beat_confidence": 0.2, "classification": "unknown",
+            "mode": "continuous",
+        }
+        iid = tmp_storage.create_incident(row)
+
+        # Peak 75 dB - threshold 55 dB = 20 dB excess, well above 10 dB margin
+        start = datetime.now(timezone.utc) - timedelta(seconds=15)
+        engine.active = {
+            "id": iid,
+            "start": start,
+            "dbs": [68, 70, 75, 73, 74, 72, 73, 71, 70, 72, 73, 74, 72, 71, 70],
+            "classification": "unknown",
+            "period": "day",
+            "responded": False,
+            "last_above": datetime.now(timezone.utc) - timedelta(seconds=2),
+            "threshold_db": 55.0,
+            "tmp_wav": None,
+            "recording": False,
+            "class_journal": [(0, "unknown")],
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        inc = tmp_storage.get_incident(iid)
+        assert inc is not None
+        assert inc["excluded"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1213,6 +1498,10 @@ class TestNoiseFloorGate:
         base_cfg["detection"]["song_gap_merge_sec"] = 0.5  # Short gap for fast test
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
 
+        # Disable min_incident_seconds — this test only cares about the gate
+        # behavior, not duration filtering.
+        base_cfg["audio"]["min_incident_seconds"] = 0
+
         # Manually set up an active incident
         row = {
             "start_ts": datetime.now(timezone.utc).isoformat(),
@@ -1285,6 +1574,32 @@ class TestClassifySound:
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
         threshold = float(base_cfg["detection"]["min_music_like_score"])
         assert engine._classify_sound(threshold, 0.10) == "music_like"
+
+    def test_high_midband_returns_engine_noise(self, base_cfg, tmp_storage, tmp_state):
+        """Dominant midband (engine-like) should classify as engine_noise.
+
+        Engine sounds concentrate energy in 180–1200 Hz (midband > 0.50),
+        while music follows a 'smiley EQ' with lower midband.
+        """
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine_feats = {"midband_ratio": 0.65, "lowband_ratio": 0.10,
+                        "highband_ratio": 0.25, "flatness": 0.30,
+                        "centroid_hz": 2000}
+        # Even with high mscore and bconf, dominant midband → engine_noise
+        assert engine._classify_sound(0.80, 0.60, features=engine_feats) == "engine_noise"
+
+    def test_moderate_midband_allows_music(self, base_cfg, tmp_storage, tmp_state):
+        """Music-typical midband (< 0.50) should still classify normally."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        music_feats = {"midband_ratio": 0.33, "lowband_ratio": 0.40,
+                       "highband_ratio": 0.27, "flatness": 0.35,
+                       "centroid_hz": 2500}
+        assert engine._classify_sound(0.80, 0.50, features=music_feats) == "music"
+
+    def test_no_features_backward_compatible(self, base_cfg, tmp_storage, tmp_state):
+        """Without features parameter, midband guard is skipped (backward compat)."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert engine._classify_sound(0.80, 0.50) == "music"
 
 
 # ---------------------------------------------------------------------------
@@ -1458,6 +1773,9 @@ class TestClassificationJournal:
     and the '(multiple)' classification suffix on finalization."""
 
     def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        # Disable min_incident_seconds — these tests finalize immediately,
+        # producing ~0s duration incidents. Duration filtering is not under test.
+        base_cfg["audio"]["min_incident_seconds"] = 0
         with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
             with patch("noise_warden.engine.HAClient"):
                 return Engine(base_cfg, tmp_storage, tmp_state)

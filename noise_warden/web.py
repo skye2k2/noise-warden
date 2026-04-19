@@ -13,7 +13,7 @@ from .storage import Storage
 from .state import StateStore
 from .engine import Engine
 from .ordinance import ORDINANCE, applicable_threshold, is_night
-from .reclassify import analyze_clip
+from .reclassify import analyze_clip, reclassify_all
 from .seed import seed_all, DEFAULT_CLASSIFICATION_DIR
 
 cfg = load_yaml()
@@ -137,7 +137,8 @@ def seed_from_classification_data(request: Request):
     duplication of seeded rows alongside real incident data.
     """
     must_auth(request)
-    if storage.count_incidents() > 0:
+    # Guard against seeding when ANY incidents exist (including excluded ones)
+    if storage.count_incidents(include_excluded=True) > 0:
         return RedirectResponse(url="/incidents?msg=seed-blocked", status_code=303)
 
     snippets_dir = os.path.join(cfg["app"]["shared_dir"], "snippets")
@@ -207,6 +208,21 @@ def reclassify_incident_api(request: Request, incident_id: int, apply: bool = Fa
         "peak_db": result["peak_db"],
         "avg_db": result["avg_db"],
     })
+
+@app.post("/incidents/reclassify-all")
+def reclassify_all_api(request: Request, apply: bool = False):
+    """Re-run the DSP pipeline on every incident with a snippet WAV.
+
+    Returns a JSON summary of what changed. With ?apply=true, writes
+    updated classifications, journals, beat_confidence, and music_like_score
+    back to the database. Can take several seconds for large databases —
+    the client should indicate progress.
+    """
+    must_auth(request)
+    result = reclassify_all(storage, cfg["detection"], cfg["audio"], update=apply)
+    print(f"[web] Reclassify-all: {result['processed']} processed, "
+          f"{len(result['changed'])} changed, applied={apply}")
+    return JSONResponse(result)
 
 @app.get("/snippets/{incident_id}")
 def get_snippet(request: Request, incident_id: int):

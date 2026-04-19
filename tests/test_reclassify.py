@@ -8,6 +8,7 @@ import pytest
 import soundfile as sf
 
 from noise_warden.reclassify import analyze_clip, _compute_dominant
+from noise_warden.reclassify import denoise_snippet, normalize_snippet
 from noise_warden.storage import Storage
 
 
@@ -177,8 +178,9 @@ class TestAnalyzeClip:
         block = result["blocks"][0]
 
         expected_keys = {
-            "block", "dba", "centroid_hz", "flatness", "lowband", "midband",
-            "highband", "mscore", "bconf", "env_std", "filter", "classification",
+            "block", "dba", "centroid_hz", "envelope_cv", "flatness",
+            "harmonic_ratio", "lowband", "midband", "highband", "mscore",
+            "bconf", "env_std", "filter", "classification",
         }
         assert set(block.keys()) == expected_keys
 
@@ -297,3 +299,306 @@ class TestReclassifyIncident:
             storage, 9999, _minimal_detection_cfg(), _minimal_audio_cfg()
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# normalize_snippet
+# ---------------------------------------------------------------------------
+
+class TestNormalizeSnippet:
+    """Tests for the standalone normalize_snippet function."""
+
+    def test_boosts_quiet_recording(self, tmp_path):
+        """A quiet recording (-40 dBFS peak) should be boosted to target."""
+        wav_path = str(tmp_path / "quiet.wav")
+        # amplitude 0.01 ≈ -40 dBFS peak
+        _write_wav(wav_path, _make_tone(440, 2.0, amplitude=0.01))
+
+        result = normalize_snippet(wav_path, target_peak_dbfs=-6.0)
+
+        assert result is not None
+        assert result["action"] == "normalized"
+        assert result["gain_db"] > 0
+        assert result["new_peak_dbfs"] == -6.0
+
+        # Verify the file was actually modified — peak should be near target
+        data, _ = sf.read(wav_path, dtype="float32")
+        actual_peak_dbfs = 20.0 * np.log10(float(np.max(np.abs(data))))
+        assert abs(actual_peak_dbfs - (-6.0)) < 0.5
+
+    def test_skips_loud_recording(self, tmp_path):
+        """A recording already louder than target should be left alone."""
+        wav_path = str(tmp_path / "loud.wav")
+        # amplitude 0.8 ≈ -1.9 dBFS peak — well above -6 target
+        _write_wav(wav_path, _make_tone(440, 2.0, amplitude=0.8))
+
+        result = normalize_snippet(wav_path, target_peak_dbfs=-6.0)
+
+        assert result is None
+
+    def test_skips_silent_recording(self, tmp_path):
+        """An essentially silent file should be skipped (no extreme boost)."""
+        wav_path = str(tmp_path / "silent.wav")
+        data = np.zeros(22050, dtype=np.float32)
+        _write_wav(wav_path, data)
+
+        result = normalize_snippet(wav_path, target_peak_dbfs=-6.0)
+
+        assert result is None
+
+    def test_custom_target(self, tmp_path):
+        """Should respect a custom target_peak_dbfs value."""
+        wav_path = str(tmp_path / "custom.wav")
+        _write_wav(wav_path, _make_tone(440, 2.0, amplitude=0.01))
+
+        result = normalize_snippet(wav_path, target_peak_dbfs=-12.0)
+
+        assert result is not None
+        assert result["new_peak_dbfs"] == -12.0
+
+    def test_nonexistent_file_returns_none(self, tmp_path):
+        """Missing file should not raise — returns None gracefully."""
+        result = normalize_snippet(str(tmp_path / "missing.wav"))
+
+        assert result is None
+
+
+class TestReclassifyIncidentNormalize:
+    """Tests for normalize integration in reclassify_incident."""
+
+    def _make_db_with_quiet_incident(self, tmp_path):
+        """Create a DB with one incident whose snippet is very quiet."""
+        wav_path = str(tmp_path / "quiet_snippet.wav")
+        # Very quiet recording — ~-40 dBFS
+        _write_wav(wav_path, _make_noise(10, amplitude=0.01))
+
+        db_path = str(tmp_path / "test.db")
+        storage = Storage(db_path)
+        iid = storage.create_incident({
+            "start_ts": "2026-04-18T12:00:00-06:00",
+            "start_db": 70.0,
+            "peak_db": 85.0,
+            "avg_db": 78.0,
+            "threshold_db": 65.0,
+            "music_like_score": 0.3,
+            "beat_confidence": 0.2,
+            "classification": "unknown",
+            "mode": "continuous",
+            "responded": 0,
+            "merge_count": 0,
+            "snippet_path": wav_path,
+            "notes": "",
+        })
+        storage.finalize_incident(
+            iid, "2026-04-18T12:01:00-06:00", 60, 85.0, 78.0, wav_path,
+            class_journal=json.dumps([(0, "unknown")]),
+            classification="unknown",
+        )
+        return storage, iid, wav_path
+
+    def test_normalize_flag_boosts_snippet(self, tmp_path):
+        """With normalize=True, snippet should be boosted after analysis."""
+        from noise_warden.reclassify import reclassify_incident
+
+        storage, iid, wav_path = self._make_db_with_quiet_incident(tmp_path)
+
+        # Read original peak for comparison
+        orig_data, _ = sf.read(wav_path, dtype="float32")
+        orig_peak = float(np.max(np.abs(orig_data)))
+
+        result = reclassify_incident(
+            storage, iid, _minimal_detection_cfg(), _minimal_audio_cfg(),
+            normalize=True, target_peak_dbfs=-6.0,
+        )
+
+        assert result is not None
+        assert result.get("normalized") is not None
+        assert result["normalized"]["action"] == "normalized"
+
+        # The file should have been modified
+        new_data, _ = sf.read(wav_path, dtype="float32")
+        new_peak = float(np.max(np.abs(new_data)))
+        assert new_peak > orig_peak
+
+    def test_no_normalize_flag_leaves_snippet(self, tmp_path):
+        """Without normalize=True, snippet should be left untouched."""
+        from noise_warden.reclassify import reclassify_incident
+
+        storage, iid, wav_path = self._make_db_with_quiet_incident(tmp_path)
+
+        orig_data, _ = sf.read(wav_path, dtype="float32")
+        orig_peak = float(np.max(np.abs(orig_data)))
+
+        result = reclassify_incident(
+            storage, iid, _minimal_detection_cfg(), _minimal_audio_cfg(),
+            normalize=False,
+        )
+
+        assert result is not None
+        assert "normalized" not in result
+
+        # File should be unchanged
+        new_data, _ = sf.read(wav_path, dtype="float32")
+        new_peak = float(np.max(np.abs(new_data)))
+        assert abs(new_peak - orig_peak) < 1e-6
+
+
+class TestDenoiseSnippet:
+    """Tests for the standalone denoise_snippet function."""
+
+    def test_reduces_noise_preserves_tone(self, tmp_path):
+        """A tone embedded in white noise should emerge cleaner after denoising.
+        The tone's spectral bin should remain strong relative to its neighbors."""
+        wav_path = str(tmp_path / "noisy_tone.wav")
+        sr = 22050
+        duration = 3.0
+        # Loud tone + moderate noise — the tone should survive denoising
+        tone = _make_tone(1000, duration, sr=sr, amplitude=0.5)
+        noise = _make_noise(duration, sr=sr, amplitude=0.15)
+        _write_wav(wav_path, tone + noise, sr=sr)
+
+        result = denoise_snippet(wav_path, percentile=10, alpha=1.0, beta=0.02)
+
+        assert result is not None
+        assert result["action"] == "denoised"
+        assert "noise_floor_db" in result
+        assert "snr_improvement_db" in result
+
+        # Verify the 1000 Hz tone survived denoising: its spectral energy
+        # should be significantly above the median magnitude (the noise floor).
+        data, _ = sf.read(wav_path, dtype="float32")
+        fft_mag = np.abs(np.fft.rfft(data[:sr]))  # first second
+        freqs = np.fft.rfftfreq(sr, 1.0 / sr)
+        tone_bin = np.argmin(np.abs(freqs - 1000))
+        # The tone bin should be well above the median noise floor
+        median_mag = float(np.median(fft_mag[50:]))  # skip DC/very-low
+        tone_mag = float(fft_mag[tone_bin])
+        assert tone_mag > median_mag * 2, (
+            f"Tone at 1000 Hz ({tone_mag:.1f}) should be >2x median ({median_mag:.1f})"
+        )
+
+    def test_skips_too_short_file(self, tmp_path):
+        """Files shorter than one FFT frame should be skipped gracefully."""
+        wav_path = str(tmp_path / "tiny.wav")
+        # 512 samples < 1024 default fft_size
+        data = np.zeros(512, dtype=np.float32)
+        _write_wav(wav_path, data)
+
+        result = denoise_snippet(wav_path)
+
+        assert result is None
+
+    def test_handles_silent_file(self, tmp_path):
+        """A silent file (all zeros) should be processed without error."""
+        wav_path = str(tmp_path / "silent.wav")
+        data = np.zeros(22050 * 2, dtype=np.float32)
+        _write_wav(wav_path, data)
+
+        result = denoise_snippet(wav_path)
+
+        # Should still return a result (denoised silence is still silence)
+        assert result is not None
+        assert result["action"] == "denoised"
+
+    def test_nonexistent_file_returns_none(self, tmp_path):
+        """Missing file should not raise — returns None gracefully."""
+        result = denoise_snippet(str(tmp_path / "missing.wav"))
+
+        assert result is None
+
+    def test_custom_parameters(self, tmp_path):
+        """Custom percentile/alpha/beta should be accepted without error."""
+        wav_path = str(tmp_path / "custom.wav")
+        tone = _make_tone(440, 2.0, amplitude=0.3)
+        noise = _make_noise(2.0, amplitude=0.1)
+        _write_wav(wav_path, tone + noise)
+
+        result = denoise_snippet(
+            wav_path,
+            percentile=20,
+            alpha=1.5,
+            beta=0.05,
+            fft_size=2048,
+            hop_size=512,
+        )
+
+        assert result is not None
+        assert result["action"] == "denoised"
+
+
+class TestReclassifyIncidentDenoise:
+    """Tests for denoise integration in reclassify_incident."""
+
+    def _make_db_with_noisy_incident(self, tmp_path):
+        """Create a DB with one incident whose snippet has noise + tone."""
+        wav_path = str(tmp_path / "noisy_snippet.wav")
+        tone = _make_tone(800, 10, amplitude=0.3)
+        noise = _make_noise(10, amplitude=0.1)
+        _write_wav(wav_path, tone + noise)
+
+        db_path = str(tmp_path / "test.db")
+        storage = Storage(db_path)
+        iid = storage.create_incident({
+            "start_ts": "2026-04-18T12:00:00-06:00",
+            "start_db": 70.0,
+            "peak_db": 85.0,
+            "avg_db": 78.0,
+            "threshold_db": 65.0,
+            "music_like_score": 0.3,
+            "beat_confidence": 0.2,
+            "classification": "unknown",
+            "mode": "continuous",
+            "responded": 0,
+            "merge_count": 0,
+            "snippet_path": wav_path,
+            "notes": "",
+        })
+        storage.finalize_incident(
+            iid, "2026-04-18T12:01:00-06:00", 60, 85.0, 78.0, wav_path,
+            class_journal=json.dumps([(0, "unknown")]),
+            classification="unknown",
+        )
+        return storage, iid, wav_path
+
+    def test_denoise_flag_processes_snippet(self, tmp_path):
+        """With denoise=True, snippet should be denoised after analysis."""
+        from noise_warden.reclassify import reclassify_incident
+
+        storage, iid, wav_path = self._make_db_with_noisy_incident(tmp_path)
+
+        # Read original data for comparison
+        orig_data, _ = sf.read(wav_path, dtype="float32")
+
+        result = reclassify_incident(
+            storage, iid, _minimal_detection_cfg(), _minimal_audio_cfg(),
+            denoise=True,
+        )
+
+        assert result is not None
+        assert result.get("denoised") is not None
+        assert result["denoised"]["action"] == "denoised"
+
+        # The file should have been modified
+        new_data, _ = sf.read(wav_path, dtype="float32")
+        # Not byte-identical — denoising changes the waveform
+        assert not np.array_equal(orig_data, new_data)
+
+    def test_no_denoise_flag_leaves_snippet(self, tmp_path):
+        """Without denoise=True, snippet should be left untouched."""
+        from noise_warden.reclassify import reclassify_incident
+
+        storage, iid, wav_path = self._make_db_with_noisy_incident(tmp_path)
+
+        orig_data, _ = sf.read(wav_path, dtype="float32")
+
+        result = reclassify_incident(
+            storage, iid, _minimal_detection_cfg(), _minimal_audio_cfg(),
+            denoise=False,
+        )
+
+        assert result is not None
+        assert "denoised" not in result
+
+        # File should be unchanged
+        new_data, _ = sf.read(wav_path, dtype="float32")
+        assert np.array_equal(orig_data, new_data)

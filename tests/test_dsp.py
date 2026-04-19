@@ -21,10 +21,12 @@ from noise_warden.dsp import (
     looks_like_birdsong,
     looks_like_conversation,
     looks_like_diesel,
+    looks_like_flyover,
     looks_like_mower,
     looks_like_rain,
     looks_like_thunder,
     looks_like_weedwhacker,
+    looks_like_wind,
     music_like_score,
     rms_dbfs,
     spectrum_features,
@@ -100,7 +102,8 @@ class TestSpectrumFeatures:
 
     def test_returns_expected_keys(self, low_tone):
         feats = spectrum_features(low_tone, 16000)
-        expected_keys = {"centroid_hz", "flatness", "lowband_ratio", "midband_ratio", "highband_ratio"}
+        expected_keys = {"centroid_hz", "envelope_cv", "flatness", "harmonic_ratio",
+                         "lowband_ratio", "midband_ratio", "highband_ratio"}
         assert set(feats.keys()) == expected_keys
 
     def test_low_tone_has_dominant_lowband(self, low_tone):
@@ -331,6 +334,35 @@ class TestMusicLikeScore:
         for feats in extremes:
             score = music_like_score(feats)
             assert 0.0 <= score <= 1.0
+
+    def test_midband_penalty_reduces_engine_scores(self):
+        """High midband (engine-like) should reduce the music score.
+
+        Engine sounds concentrate energy in 180–1200 Hz, pushing midband > 0.40.
+        Music follows a "smiley EQ" with scooped mids (midband typically < 0.35).
+        """
+        base_feats = {
+            "lowband_ratio": 0.15, "flatness": 0.35, "centroid_hz": 2000,
+            "highband_ratio": 0.40,
+        }
+        # Low midband (music-like): no penalty
+        low_mid = {**base_feats, "midband_ratio": 0.30}
+        # High midband (engine-like): penalty applied
+        high_mid = {**base_feats, "midband_ratio": 0.65}
+
+        score_low = music_like_score(low_mid)
+        score_high = music_like_score(high_mid)
+        assert score_low > score_high, "High midband should reduce music score"
+
+    def test_midband_penalty_preserves_music(self):
+        """Real bass music (midband ~0.33) should not be penalized."""
+        music_feats = {
+            "lowband_ratio": 0.45, "midband_ratio": 0.33,
+            "highband_ratio": 0.22, "flatness": 0.35, "centroid_hz": 2500,
+        }
+        score = music_like_score(music_feats)
+        # Should still score high (above min_music_like_score of 0.62)
+        assert score > 0.60
 
 
 # ---------------------------------------------------------------------------
@@ -1071,10 +1103,10 @@ class TestThunderSensitivity:
                                   recent_db=history) is False
 
     def test_path_b_rejects_quiet_rumble(self):
-        """Below the dB floor (95) — ambient droning, not thunder."""
+        """Below the dB floor (40.0) — sub-noise-floor silence, not thunder."""
         feats = self._rumble_feats()
-        history = [80.0] * 10
-        assert looks_like_thunder(feats, 90.0, 88.0, 18.0,
+        history = [30.0] * 10
+        assert looks_like_thunder(feats, 35.0, 33.0, 18.0,
                                   recent_db=history) is False
 
     def test_path_b_rejects_high_flatness(self):
@@ -1086,8 +1118,8 @@ class TestThunderSensitivity:
                                   recent_db=history) is False
 
     def test_path_b_rejects_high_centroid(self):
-        """Centroid above 1300 Hz — too high for thunder rumble."""
-        feats = self._rumble_feats(centroid=1400)
+        """Centroid above 1500 Hz — too high for thunder rumble."""
+        feats = self._rumble_feats(centroid=1600)
         history = [90.0] * 10
         assert looks_like_thunder(feats, 100.0, 98.0, 18.0,
                                   recent_db=history) is False
@@ -1842,6 +1874,159 @@ class TestConversationSensitivity:
         assert looks_like_conversation(feats, speech_db, midband_min=0.20) is True
 
 
+# ---------------------------------------------------------------------------
+# looks_like_wind
+# ---------------------------------------------------------------------------
+
+class TestLooksLikeWind:
+    """Wind: broadband aero noise with moderate-high centroid and limited bass."""
+
+    # Real wind profile from wind-and-faint-windchimes.wav (median values)
+    WIND_FEATS = {
+        "flatness": 0.43, "centroid_hz": 4500, "lowband_ratio": 0.20,
+        "midband_ratio": 0.30, "highband_ratio": 0.47,
+    }
+    STABLE_DB = [60.0] * 12
+
+    def test_real_wind_profile_detected(self):
+        """Real wind spectral signature: broadband, mid-high centroid, moderate lowband."""
+        assert looks_like_wind(self.WIND_FEATS, self.STABLE_DB) is True
+
+    def test_low_flatness_not_wind(self):
+        """Tonal sounds (diesel-like) are not wind."""
+        feats = {**self.WIND_FEATS, "flatness": 0.20}
+        assert looks_like_wind(feats, self.STABLE_DB) is False
+
+    def test_high_lowband_not_wind(self):
+        """Bass-heavy sounds (close to amplified bass) are not wind."""
+        feats = {**self.WIND_FEATS, "lowband_ratio": 0.35}
+        assert looks_like_wind(feats, self.STABLE_DB) is False
+
+    def test_low_lowband_not_wind(self):
+        """Very low lowband (like mower) is not wind — wind has air pressure bass."""
+        feats = {**self.WIND_FEATS, "lowband_ratio": 0.05}
+        assert looks_like_wind(feats, self.STABLE_DB) is False
+
+    def test_low_centroid_not_wind(self):
+        """Low centroid (like diesel/mower) is not wind."""
+        feats = {**self.WIND_FEATS, "centroid_hz": 1800}
+        assert looks_like_wind(feats, self.STABLE_DB) is False
+
+    def test_high_env_std_not_wind(self):
+        """Erratic amplitude is not wind — wind is steady once established."""
+        wild_db = [50.0, 80.0, 50.0, 80.0, 50.0, 80.0, 50.0, 80.0, 50.0, 80.0, 50.0, 80.0]
+        assert looks_like_wind(self.WIND_FEATS, wild_db) is False
+
+    def test_low_highband_not_wind(self):
+        """Wind has significant high-frequency energy from whistle effect."""
+        feats = {**self.WIND_FEATS, "highband_ratio": 0.20}
+        assert looks_like_wind(feats, self.STABLE_DB) is False
+
+    def test_short_history_not_wind(self):
+        assert looks_like_wind(self.WIND_FEATS, [60.0, 60.0]) is False
+
+    def test_music_score_guard(self):
+        """High music score rejects — bass music can mimic wind flatness."""
+        # High lowband pushes mscore above 0.70 threshold
+        bass_feats = {**self.WIND_FEATS, "lowband_ratio": 0.50, "flatness": 0.35}
+        assert looks_like_wind(bass_feats, self.STABLE_DB) is False
+
+    def test_rain_separation(self):
+        """Rain profile (low lowband) should not match wind."""
+        rain_feats = {"flatness": 0.35, "centroid_hz": 3500, "lowband_ratio": 0.10,
+                      "midband_ratio": 0.40, "highband_ratio": 0.50}
+        assert looks_like_wind(rain_feats, self.STABLE_DB) is False
+
+    def test_high_highband_not_wind(self):
+        """Very high highband (birdsong territory 0.65+) is not wind.
+        Real wind maxes at 0.595; ceiling prevents birdsong warmup blocks
+        from being misclassified as wind."""
+        feats = {**self.WIND_FEATS, "highband_ratio": 0.70}
+        assert looks_like_wind(feats, self.STABLE_DB) is False
+        # Just below ceiling — should still pass
+        feats_ok = {**self.WIND_FEATS, "highband_ratio": 0.60}
+        assert looks_like_wind(feats_ok, self.STABLE_DB) is True
+
+
+# ---------------------------------------------------------------------------
+# looks_like_flyover
+# ---------------------------------------------------------------------------
+
+class TestLooksLikeFlyover:
+    """Flyover: aerial/transient vehicle engine sounds."""
+
+    # Real plane flyover profile (median values from plane-flyover.wav)
+    PLANE_FEATS = {
+        "flatness": 0.39, "centroid_hz": 4500, "lowband_ratio": 0.28,
+        "midband_ratio": 0.31, "highband_ratio": 0.40,
+    }
+    # Real engine speed profile (core blocks from engine-speed-launch.wav)
+    ENGINE_FEATS = {
+        "flatness": 0.17, "centroid_hz": 2000, "lowband_ratio": 0.12,
+        "midband_ratio": 0.66, "highband_ratio": 0.24,
+    }
+    STABLE_DB = [70.0] * 12
+
+    def test_plane_profile_detected(self):
+        assert looks_like_flyover(self.PLANE_FEATS, self.STABLE_DB) is True
+
+    def test_engine_speed_profile_detected(self):
+        assert looks_like_flyover(self.ENGINE_FEATS, self.STABLE_DB) is True
+
+    def test_short_history_not_flyover(self):
+        assert looks_like_flyover(self.PLANE_FEATS, [70.0, 70.0]) is False
+
+    def test_high_bconf_rejected(self):
+        """High beat confidence indicates music, not engine noise."""
+        assert looks_like_flyover(
+            self.PLANE_FEATS, self.STABLE_DB,
+            beat_confidence_val=0.60) is False
+
+    def test_low_bconf_accepted(self):
+        """Engine noise has low beat confidence — should pass."""
+        assert looks_like_flyover(
+            self.PLANE_FEATS, self.STABLE_DB,
+            beat_confidence_val=0.20) is True
+
+    def test_bconf_guard_disabled(self):
+        """When max_beat_confidence=0, guard is disabled."""
+        assert looks_like_flyover(
+            self.PLANE_FEATS, self.STABLE_DB,
+            max_beat_confidence=0, beat_confidence_val=0.90) is True
+
+    def test_mower_blocks_rejected_by_highband(self):
+        """Escaped mower blocks have highband 0.56–0.82 — above ceiling."""
+        mower_feats = {"flatness": 0.40, "centroid_hz": 5500, "lowband_ratio": 0.04,
+                       "midband_ratio": 0.22, "highband_ratio": 0.74}
+        assert looks_like_flyover(mower_feats, self.STABLE_DB) is False
+
+    def test_mower_blocks_rejected_by_lowband(self):
+        """Escaped mower blocks have lowband 0.02–0.06 — below floor."""
+        mower_feats = {"flatness": 0.40, "centroid_hz": 5500, "lowband_ratio": 0.04,
+                       "midband_ratio": 0.22, "highband_ratio": 0.55}
+        assert looks_like_flyover(mower_feats, self.STABLE_DB) is False
+
+    def test_high_flatness_rejected(self):
+        """Broadband rain/wind-like flatness above ceiling is not flyover."""
+        feats = {**self.PLANE_FEATS, "flatness": 0.60}
+        assert looks_like_flyover(feats, self.STABLE_DB) is False
+
+    def test_low_flatness_accepted(self):
+        """Tonal engine sounds (diesel-like at flatness 0.15) are still flyover."""
+        feats = {**self.ENGINE_FEATS, "flatness": 0.15}
+        assert looks_like_flyover(feats, self.STABLE_DB) is True
+
+    def test_low_midband_rejected(self):
+        """Low midband (non-engine) should not match."""
+        feats = {**self.PLANE_FEATS, "midband_ratio": 0.10}
+        assert looks_like_flyover(feats, self.STABLE_DB) is False
+
+    def test_high_env_std_rejected(self):
+        """Wildly erratic amplitude (conversation-level) is not flyover."""
+        wild_db = [40.0, 90.0, 40.0, 90.0, 40.0, 90.0, 40.0, 90.0, 40.0, 90.0, 40.0, 90.0]
+        assert looks_like_flyover(self.PLANE_FEATS, wild_db) is False
+
+
 # ===========================================================================
 # identify_filter — orchestration layer
 # ===========================================================================
@@ -1864,9 +2049,12 @@ class TestIdentifyFilter:
 
     def test_no_filter_returns_none(self):
         """Normal sound that passes all filters should return None."""
-        # Low flatness (0.15) ensures this doesn't trip the rain filter (threshold 0.27)
-        feats = {"flatness": 0.15, "centroid_hz": 500, "lowband_ratio": 0.4,
-                 "midband_ratio": 0.4, "highband_ratio": 0.2}
+        # Centroid 800 avoids diesel (≥ 1200), flyover (≥ 1400), and
+        # weedwhacker (≥ 2000). Flatness 0.16 avoids thunder Path B (≤ 0.15),
+        # rain (≥ 0.27), and wind (≥ 0.30). Lowband 0.08 avoids diesel (≥ 0.10)
+        # and flyover (≥ 0.10). Conversation needs env_std ≥ 4.0 (stable = 0).
+        feats = {"flatness": 0.16, "centroid_hz": 800, "lowband_ratio": 0.08,
+                 "midband_ratio": 0.30, "highband_ratio": 0.62}
         db_history = [65.0] * 20
         assert identify_filter(feats, db_history, 68.0, 67.0, self.DEFAULT_DET) is None
 
@@ -1898,9 +2086,10 @@ class TestIdentifyFilter:
 
     def test_config_overrides_respected(self):
         """Custom config values should change filter behavior."""
-        # Low flatness (0.15) avoids tripping the rain filter when impulse is bypassed
+        # Flatness 0.15 avoids rain. Midband 0.39 avoids thunder Path B (≥ 0.40).
+        # Centroid 500 avoids diesel (≥ 1200), flyover (≥ 1400).
         feats = {"lowband_ratio": 0.20, "flatness": 0.15, "centroid_hz": 500,
-                 "midband_ratio": 0.40, "highband_ratio": 0.40}
+                 "midband_ratio": 0.39, "highband_ratio": 0.41}
         db_history = [50.0] * 20
         # 16 dB jump — above default impulse threshold (14) but below custom (20)
         cfg = {**self.DEFAULT_DET, "impulse_peak_delta_db": "20.0"}
@@ -2153,3 +2342,17 @@ class TestFilterDetectionLatency:
     def test_config_override_diesel(self):
         custom = {"diesel_min_history": 5}
         assert get_filter_detection_latency("diesel", custom) == 5
+
+    def test_wind_default(self):
+        assert get_filter_detection_latency("wind", self.DET) == 6
+
+    def test_flyover_default(self):
+        assert get_filter_detection_latency("flyover", self.DET) == 4
+
+    def test_config_override_flyover(self):
+        custom = {"flyover_min_history": 6}
+        assert get_filter_detection_latency("flyover", custom) == 6
+
+    def test_config_override_wind(self):
+        custom = {"wind_min_history": 8}
+        assert get_filter_detection_latency("wind", custom) == 8

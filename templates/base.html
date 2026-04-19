@@ -48,29 +48,44 @@ function toggleTheme() {
   });
 })();
 
-/* Offline detection: disable mutation-heavy pages and hide save/delete buttons.
-   Config and Calibration pages require network to save changes — navigating to
-   them offline would show stale forms with non-functional save buttons. */
+/* Server-reachability detection and offline state management.
+   ─────────────────────────────────────────────────────────────
+   navigator.onLine is unreliable — it reflects network hardware state, not
+   server reachability. On a LAN, the phone has WiFi so navigator.onLine is
+   always true, even when the Pi's service is down. Instead, we detect server
+   reachability by actually fetching /api/health and persist the state in
+   sessionStorage so it survives SW-cached page navigations.
+
+   Pages with their own pollers (dashboard.html) set window._nwPageHasPoller
+   and call window._nwServerReachable(bool) directly, so the base heartbeat
+   skips redundant fetches on those pages. */
 (function () {
+  var HEARTBEAT_INTERVAL = 10000;
+  var STORAGE_KEY = 'nw-server-unreachable';
+
   function applyOfflineState(offline) {
     // Dim and disable Config/Calibration nav links
     document.querySelectorAll('.online-only-link').forEach(function (link) {
       if (offline) {
         link.classList.add('disabled-offline');
-        link.setAttribute('data-href', link.getAttribute('href'));
-        link.removeAttribute('href');
-        link.title = 'Unavailable offline';
+        // Save the href so we can restore it later, but only if not already saved
+        if (link.getAttribute('href')) {
+          link.setAttribute('data-href', link.getAttribute('href'));
+          link.removeAttribute('href');
+        }
+        link.title = 'Unavailable while server is unreachable';
       } else {
         link.classList.remove('disabled-offline');
         var savedHref = link.getAttribute('data-href');
         if (savedHref) {
           link.setAttribute('href', savedHref);
+          link.removeAttribute('data-href');
         }
         link.title = '';
       }
     });
 
-    // Hide all destructive/mutation buttons and forms when offline
+    // Hide all destructive/mutation buttons and forms when server is down
     document.querySelectorAll('.destructive, form[method="post"]').forEach(function (el) {
       if (offline) {
         el.classList.add('hidden-offline');
@@ -79,35 +94,82 @@ function toggleTheme() {
       }
     });
 
-    // Show a small offline indicator
+    // Show/hide the offline indicator banner
     var indicator = document.getElementById('offline-indicator');
     if (indicator) {
       indicator.style.display = offline ? 'block' : 'none';
     }
   }
 
-  // Create a subtle offline indicator bar
+  // Global callback for page-specific pollers (dashboard.html pollState)
+  window._nwServerReachable = function (reachable) {
+    if (reachable) {
+      sessionStorage.removeItem(STORAGE_KEY);
+      applyOfflineState(false);
+    } else {
+      sessionStorage.setItem(STORAGE_KEY, '1');
+      applyOfflineState(true);
+    }
+  };
+
+  // Create the offline indicator bar
   var bar = document.createElement('div');
   bar.id = 'offline-indicator';
-  bar.textContent = '⚡ Offline — viewing cached data. Controls disabled.';
+  bar.textContent = '⚡ Server unreachable — viewing cached data. Controls disabled.';
   bar.style.display = 'none';
   document.querySelector('.wrap').prepend(bar);
 
-  // Initial check + event listeners for online/offline transitions
-  if (!navigator.onLine) { applyOfflineState(true); }
-  window.addEventListener('offline', function () { applyOfflineState(true); });
-  window.addEventListener('online', function () { applyOfflineState(false); });
+  // Restore persisted offline state immediately — before any fetch completes —
+  // so the banner and disabled nav links are visible on cached page navigations.
+  if (sessionStorage.getItem(STORAGE_KEY)) {
+    applyOfflineState(true);
+  }
+
+  // Also honor the browser's built-in offline events as a fast path
+  window.addEventListener('offline', function () { window._nwServerReachable(false); });
+  window.addEventListener('online', function () {
+    // Browser thinks we're online — verify with a real fetch before restoring
+    fetch('/api/health').then(function (r) {
+      if (r.ok) { window._nwServerReachable(true); }
+    }).catch(function () { /* still unreachable */ });
+  });
+
+  // Start a lightweight heartbeat on pages that don't have their own poller.
+  // Runs after a short delay to let page-specific pollers claim the flag first.
+  setTimeout(function () {
+    if (window._nwPageHasPoller) { return; }
+
+    function heartbeat() {
+      fetch('/api/health').then(function (r) {
+        if (r.ok) {
+          window._nwServerReachable(true);
+        } else {
+          window._nwServerReachable(false);
+        }
+      }).catch(function () {
+        window._nwServerReachable(false);
+      });
+    }
+
+    // Immediate check, then periodic
+    heartbeat();
+    setInterval(heartbeat, HEARTBEAT_INTERVAL);
+  }, 500);
 })();
 
 /* Register the Service Worker globally so all pages benefit from caching.
    The SW intercepts /snippets/ fetches (caching them for offline use) and
-   handles cached page responses. Previously only registered from the
-   timeline page, meaning snippet plays from dashboard or incidents wouldn't
-   populate the cache until the user had visited the timeline at least once. */
+   handles cached page responses.
+
+   NOTE: Service Workers require a secure context (HTTPS or localhost). On the
+   Pi, the install script generates a self-signed TLS certificate so the SW
+   can register when accessed via https://<pi-ip>:8787/. Locally, the
+   localhost exception means no cert is needed. */
 (function () {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(function () {
-      // Registration failed — pages still function, just no offline support
+      // Registration failed — pages still function, just no offline support.
+      // This is expected over plain HTTP to a non-localhost address.
     });
   }
 })();

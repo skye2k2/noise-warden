@@ -9,7 +9,8 @@ Group=noisewarden
 WorkingDirectory=/opt/noise-warden/current
 Environment=NOISE_WARDEN_CONFIG=/opt/noise-warden/current/config/noise_warden.yaml
 ExecStartPre=/bin/sh -c 'test -d /opt/noise-warden/current/noise_warden || (echo "ERROR: /opt/noise-warden/current does not resolve to a valid project directory. Re-run install_pi.sh." && exit 1)'
-ExecStart=/opt/noise-warden/venv/bin/uvicorn noise_warden.main:app --host 0.0.0.0 --port 8787
+ExecStartPre=/bin/sh -c 'test -f /opt/noise-warden/tls/cert.pem || (echo "ERROR: TLS certificate not found at /opt/noise-warden/tls/cert.pem. Re-run install_pi.sh." && exit 1)'
+ExecStart=/opt/noise-warden/venv/bin/uvicorn noise_warden.main:app --host 0.0.0.0 --port 8787 --ssl-certfile /opt/noise-warden/tls/cert.pem --ssl-keyfile /opt/noise-warden/tls/key.pem
 # Graceful shutdown: give the engine time to finalize active incidents and flush the DB
 TimeoutStopSec=15
 # Always restart when the process exits — systemd still honors explicit

@@ -98,6 +98,28 @@ fi
 # --- Set ownership for the service user ---
 sudo chown -R noisewarden:noisewarden "$BASE"
 
+# --- Generate self-signed TLS certificate (required for Service Worker) ---
+# Service Workers only register on secure contexts (HTTPS or localhost).
+# Without TLS, the browser silently refuses to register the SW, and all
+# offline caching (page navigation, snippet pre-loading) is disabled.
+# The cert is self-signed — users accept the browser warning once per device.
+TLS_DIR="$BASE/tls"
+if [ ! -f "$TLS_DIR/cert.pem" ]; then
+    echo "Generating self-signed TLS certificate ..."
+    sudo mkdir -p "$TLS_DIR"
+    HOSTNAME_VAL=$(hostname -f 2>/dev/null || hostname)
+    sudo openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$TLS_DIR/key.pem" \
+        -out "$TLS_DIR/cert.pem" \
+        -days 3650 \
+        -subj "/CN=$HOSTNAME_VAL" 2>/dev/null
+    sudo chown -R noisewarden:noisewarden "$TLS_DIR"
+    echo "  TLS certificate generated at $TLS_DIR/"
+    echo "  On first visit, accept the browser's certificate warning."
+else
+    echo "TLS certificate already exists at $TLS_DIR/ — skipping generation."
+fi
+
 # --- Install systemd service ---
 sudo cp "$CURRENT/deploy/noise-warden.service" /etc/systemd/system/noise-warden.service
 sudo systemctl daemon-reload
@@ -192,4 +214,5 @@ echo "  2. Verify it's detected:  arecord -l"
 echo "  3. Edit config:  sudo nano $CURRENT/config/noise_warden.yaml"
 echo "  4. Start:        sudo systemctl enable --now noise-warden"
 echo "  5. Check:        sudo systemctl status noise-warden"
-echo "  6. Open:         http://<pi-ip>:8787/"
+echo "  6. Open:         https://<pi-ip>:8787/"
+echo "     (Accept the self-signed certificate warning on first visit)"

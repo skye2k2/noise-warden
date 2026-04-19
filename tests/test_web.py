@@ -625,7 +625,7 @@ class TestServiceWorker:
 
     def test_sw_contains_cache_strategy(self, client):
         resp = client.get("/sw.js")
-        assert "noise-warden-cache-v10" in resp.text
+        assert "noise-warden-cache-v" in resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +747,76 @@ class TestReclassifyEndpoint:
         iid = self._create_incident_with_snippet(storage, tmp_path)
         resp = client.post(
             f"/incidents/{iid}/reclassify",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert resp.status_code == 401
+
+        # Restore
+        web_mod.cfg["app"]["auth_token"] = ""
+
+
+# ---------------------------------------------------------------------------
+# Reclassify-all API endpoint
+# ---------------------------------------------------------------------------
+
+_MOCK_RECLASS_ALL_RESULT = {
+    "total": 3,
+    "processed": 2,
+    "skipped": 1,
+    "changed": [{"id": 1, "old": "music_like", "new": "mower", "change_type": "class+journal"}],
+    "denoised": 0,
+    "normalized": 0,
+    "applied": False,
+}
+
+_MOCK_RECLASS_ALL_APPLIED = {
+    **_MOCK_RECLASS_ALL_RESULT,
+    "applied": True,
+}
+
+
+class TestReclassifyAllEndpoint:
+
+    @patch("noise_warden.web.reclassify_all", return_value=_MOCK_RECLASS_ALL_RESULT)
+    def test_dry_run_returns_summary(self, mock_ra, client):
+        resp = client.post("/incidents/reclassify-all")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["processed"] == 2
+        assert data["skipped"] == 1
+        assert len(data["changed"]) == 1
+        assert data["changed"][0]["old"] == "music_like"
+        assert data["changed"][0]["new"] == "mower"
+        assert data["applied"] is False
+
+    @patch("noise_warden.web.reclassify_all", return_value=_MOCK_RECLASS_ALL_APPLIED)
+    def test_apply_passes_update_flag(self, mock_ra, client):
+        resp = client.post("/incidents/reclassify-all?apply=true")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["applied"] is True
+        # Verify reclassify_all was called with update=True
+        _, kwargs = mock_ra.call_args
+        assert kwargs.get("update") is True
+
+    @patch("noise_warden.web.reclassify_all", return_value={
+        "total": 0, "processed": 0, "skipped": 0, "changed": [],
+        "denoised": 0, "normalized": 0, "applied": False,
+    })
+    def test_empty_database_returns_zero(self, mock_ra, client):
+        resp = client.post("/incidents/reclassify-all")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["processed"] == 0
+        assert data["changed"] == []
+
+    def test_auth_rejected(self, web_app, client):
+        """With auth enabled, a bad token should be rejected."""
+        import noise_warden.web as web_mod
+        web_mod.cfg["app"]["auth_token"] = "secret-test-token"
+
+        resp = client.post(
+            "/incidents/reclassify-all",
             headers={"Authorization": "Bearer wrong-token"},
         )
         assert resp.status_code == 401

@@ -495,7 +495,7 @@ function buildDayColumn(dayStart, hourPx, gridPx, showLabels, startHour, endHour
 
     // Build label: "classification (+X.YdB, duration)" — e.g. "mower (+12.3dB, 2m 15s)"
     var classLabel = (inc.classification || 'unknown').replace(/ \(multiple\)$/, '').replace(/\+$/, '');
-    var blockLabel = classLabel + ' (+' + excess.toFixed(1) + 'dB, ' + formatDuration(inc.duration_sec) + ')';
+    var blockLabel = classLabel + ' ' + (excess >= 0 ? '+' : '') + excess.toFixed(1) + 'dB, ' + formatDuration(inc.duration_sec);
     block.title = blockLabel;
 
     // Closure captures the correct incident reference per iteration

@@ -27,6 +27,9 @@
   --hour-line: #f0f0f0;
   --now-line: #3498db;
   --popup-overlay: rgba(0,0,0,.5);
+  --table-header: #ddd;
+  --table-focus: #fc8;
+  --table-hover: #eee;
 
   /* Borderline incident: slightly darker than card background */
   --excess-borderline: #c8c8c8;
@@ -34,7 +37,7 @@
 
 /* Monokai-inspired dark theme — charcoal grays, bright accents */
 [data-theme="dark"] {
-  --bg: #1e1e1e;
+  --bg: #363636;
   --bg-card: #272822;
   --bg-nav: #1a1a1a;
   --bg-nav-active: #333;
@@ -55,6 +58,9 @@
   --hour-line: #3e3d32;
   --now-line: #66d9ef;
   --popup-overlay: rgba(0,0,0,.75);
+  --table-header: #4d4d4d;
+  --table-focus: #740;
+  --table-hover: #363636;
 
   /* Borderline incident: muted olive, distinct from card bg */
   --excess-borderline: #4e4d3a;
@@ -74,19 +80,19 @@ nav {
   color: var(--text-nav);
   padding: 1px;
   display: flex;
+  flex-wrap: wrap;
 }
 
 nav a {
   color: var(--text-nav);
-  margin-right: 0 8px;
   padding: 12px;
   text-decoration: none;
 }
 
-nav a.active {
+nav a.active,
+nav a:hover {
   background-color: var(--bg-nav-active);
   color: var(--text-nav-active);
-  text-underline-offset: 4px;
 }
 
 /* Push the theme toggle to the right side of the nav */
@@ -133,6 +139,20 @@ th, td {
   vertical-align: top;
 }
 
+table .header {
+  background-color: var(--table-header);
+  position: sticky;
+  top: 0;
+}
+
+tr:hover {
+  background-color: var(--table-hover);
+}
+
+tr:focus-within {
+background-color: var(--table-focus);
+}
+
 /* ---- Form elements ---- */
 button, input[type=submit] {
   padding: 8px 12px;
@@ -144,9 +164,9 @@ button, input[type=submit] {
 }
 
 button.destructive {
-  background: #c0392b;
+  background: #676767;
   color: #fff;
-  border-color: #922b21;
+  border-color: #b61000;
 }
 
 button.snippet-play-btn {
@@ -173,12 +193,6 @@ textarea, input[type=text], input[type=number], select {
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 4px;
-}
-
-table .header {
-  background-color: #d5d5d5;
-  position: sticky;
-  top: 0;
 }
 
 textarea {
@@ -209,6 +223,11 @@ textarea {
   color: var(--pill-text);
   border: 1px solid var(--pill-outline);
   margin-right: 6px;
+  transition: opacity 0.3s;
+}
+.pill.stale {
+  opacity: 0.45;
+  font-style: italic;
 }
 
 audio {
@@ -271,6 +290,16 @@ tr.active-rule {
   margin-bottom: 12px;
   font-size: 13px;
 }
+
 [data-theme="dark"] #offline-indicator {
   background: #922b21;
+}
+
+/* ---- Narrow-screen adjustments ---- */
+@media screen and (max-width: 600px) {
+  nav a { padding: 8px 6px; font-size: 13px; }
+  #theme-toggle { padding: 4px 6px; font-size: 12px; }
+
+  /* Let the table scroll horizontally on very small screens */
+  table { display: block; overflow-x: auto; }
 }

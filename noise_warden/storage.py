@@ -201,9 +201,11 @@ class Storage:
         with self.conn() as c:
             return [dict(r) for r in c.execute(q, params).fetchall()]
 
-    def count_incidents(self, since=None):
+    def count_incidents(self, since=None, include_excluded=False):
         q = "SELECT COUNT(*) FROM incidents WHERE deleted=0"
         params = []
+        if not include_excluded:
+            q += " AND (excluded IS NULL OR excluded=0)"
         if since:
             q += " AND start_ts >= ?"
             params.append(since)

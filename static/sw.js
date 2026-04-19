@@ -10,7 +10,7 @@
  * - Config and calibration pages: network only (mutations disabled offline)
  * - Everything else: pass through (don't interfere with other routes)
  */
-const CACHE = 'noise-warden-cache-v10'
+const CACHE = 'noise-warden-cache-v11'
 
 /* Static assets to pre-cache on install — these rarely change between page loads */
 const PRECACHE_ASSETS = [
@@ -20,13 +20,28 @@ const PRECACHE_ASSETS = [
 
 /* Pages that are useful offline (read-only views). Cached on first visit via
    network-first strategy. Config and calibration are intentionally excluded
-   because saving changes offline would silently fail. */
+   because saving changes offline would silently fail.
+   Also eagerly fetched during SW install so they're available offline even
+   if the user hasn't visited them yet (e.g., timeline, incidents). */
 const CACHEABLE_PAGES = ['/timeline', '/', '/incidents', '/build', '/thresholds']
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE)
-      .then(cache => cache.addAll(PRECACHE_ASSETS))
+      .then(cache => {
+        return cache.addAll(PRECACHE_ASSETS).then(() => {
+          // Best-effort: eagerly cache all navigable pages so they're available
+          // offline even before the user visits them. Uses allSettled so a single
+          // page failure (e.g., server error) doesn't block installation.
+          return Promise.allSettled(
+            CACHEABLE_PAGES.map(url =>
+              fetch(url).then(resp => {
+                if (resp.ok) { return cache.put(url, resp); }
+              })
+            )
+          );
+        });
+      })
       .then(() => self.skipWaiting())
   )
 })

@@ -112,6 +112,9 @@ The project uses a symlinked versioning layout that keeps **code disposable** an
 /opt/noise-warden/
 ├── current -> /opt/noise-warden/noise-warden-v12  # symlink to active version
 ├── deploy_noise_warden.sh                          # version-swap script (lives outside any version)
+├── tls/                                            # self-signed TLS cert (generated on first install)
+│   ├── cert.pem
+│   └── key.pem
 ├── venv/                                           # shared Python virtualenv
 ├── shared/                                         # persistent data — survives upgrades
 │   ├── noise_warden.db
@@ -146,7 +149,7 @@ Key invariants:
 
 3. Install system-level dependencies (these are not managed by pip):
     ```bash
-    sudo apt update && sudo apt install -y python3-venv portaudio19-dev libsndfile1 ffmpeg rsync
+    sudo apt update && sudo apt install -y python3-venv portaudio19-dev libsndfile1 ffmpeg rsync openssl
     ```
 
 4. Run the install script from inside the extracted directory:
@@ -154,7 +157,7 @@ Key invariants:
     cd ~/noise-warden-v12
     bash scripts/install_pi.sh
     ```
-    This will: copy the project into `/opt/noise-warden/noise-warden-v12/`, create the `shared/` data directories, set up a Python venv at `/opt/noise-warden/venv/`, install pip dependencies, copy `deploy_noise_warden.sh` up to the base directory, set the `current` symlink, create a `noisewarden` system user, install the systemd service unit, and run pre-flight validation to verify the service can start.
+    This will: copy the project into `/opt/noise-warden/noise-warden-v12/`, create the `shared/` data directories, set up a Python venv at `/opt/noise-warden/venv/`, install pip dependencies, copy `deploy_noise_warden.sh` up to the base directory, set the `current` symlink, create a `noisewarden` system user, generate a self-signed TLS certificate (for Service Worker / offline caching support), install the systemd service unit, and run pre-flight validation to verify the service can start.
 
     > **You can run this from anywhere** — the script copies files into `/opt/noise-warden/` so the system service can always reach them. You don't need to clone directly into `/opt/`.
 
@@ -188,7 +191,9 @@ Key invariants:
     sudo systemctl status noise-warden
     ```
 
-10. Open in browser: `http://<pi-ip>:8787/`
+10. Open in browser: `https://<pi-ip>:8787/`
+
+    > **First visit:** Your browser will show a certificate warning because the TLS certificate is self-signed. This is expected — accept the warning to proceed. You only need to do this once per device. The certificate enables Service Worker registration, which is required by browsers for offline caching (page navigation, snippet pre-loading, etc.).
 
 </details>
 
@@ -211,6 +216,8 @@ Key invariants:
 **`paInvalidSampleRate` ALSA errors in journal** — the microphone doesn't support the configured sample rate (default 22050 Hz). Many cheap USB audio dongles only support 44100 or 48000 Hz. The app will automatically fall back to the device's default rate and log a warning, but to fix it permanently, set `sample_rate: 48000` (or `44100`) in your config. Check what your device supports: `arecord -D hw:1,0 --dump-hw-params /dev/null 2>&1 | grep RATE` (adjust `hw:1,0` to your card number from `arecord -l`)
 
 **`Error querying device -1` looping in journal** — the service's PortAudio device cache went stale. This typically happens when the PulseAudio/PipeWire audio profile for the USB mic is changed while the service is already running (e.g., switching from "Analog Stereo Duplex" to "Analog Stereo Input" in the OS sound settings). The engine now automatically forces a PortAudio device rescan on each reconnection attempt and uses escalating backoff (2s → 30s) to avoid log spam. In most cases, the service will self-recover within a few attempts once the profile settles. If it doesn't recover after ~10 attempts (the journal will say "10 consecutive audio failures"), use the **Restart Service** button on the dashboard, or from SSH: `sudo systemctl restart noise-warden`. You can verify the current profile with `pactl list cards` and confirm the mic is visible to ALSA with `arecord -l`. For a mic-only device (no speaker output), the `input:analog-stereo` profile is correct.
+
+**TLS certificate warning won't go away / pages not caching on phone** — the self-signed TLS certificate must be accepted in the browser for the Service Worker (and thus offline caching) to function. On iOS Safari, you may need to go to Settings → General → About → Certificate Trust Settings and enable the certificate. On Android Chrome, tapping "Advanced" → "Proceed" on the warning page is sufficient. If you regenerate the certificate (delete `/opt/noise-warden/tls/` and re-run `install_pi.sh`), you'll need to accept the new cert on all devices again.
 
 </details>
 
@@ -246,7 +253,7 @@ When you have a new version ready:
     Or use the deploy script (which lives at the base level, outside any version):
     ```bash
     cd /opt/noise-warden
-    ./deploy_noise_warden.sh noise-warden-v13
+    sudo ./deploy_noise_warden.sh noise-warden-v13
     ```
 
     The deploy script will: stop the service, swing the `current` symlink, rebuild/update the venv, install the new systemd unit, and restart the service. `shared/` is untouched.
@@ -388,7 +395,8 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 | Section | Purpose |
 |---------|---------|
 | `site` | City name and ordinance reference |
-| `audio` | Sample rate, block size, device selection, mic calibration offset, secondary/reference mic toggles, snippet pre/post buffer durations |
+| `audio` | Sample rate, block size, device selection, mic calibration offset, secondary/reference mic toggles, snippet pre/post buffer durations, spectral denoising (enable + percentile/alpha/beta tuning), snippet normalization (enable + target peak dBFS) |
+| `detection` | Zone, mode, armed state, calibration offset, noise floor gate, borderline margin + `record_borderline_events` toggle, day/night hours, music-focus thresholds, impulse/filter detection parameters, holdover tuning |
 
 **Recording quality**: The `audio.sample_rate` setting controls recording fidelity. Three options are available via the Calibration page or config YAML:
 
@@ -400,7 +408,7 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 | `gpio` | Relay pin, active-high/low, enable toggle |
 | `response` | Daytime audio response toggle, playlist directory, player command, amp power-on delay, response cooldown |
 | `rules` | Day/night schedule, dB thresholds, evaluation interval, release/merge/minimum duration timings, hysteresis |
-| `filters` | Per-filter enable toggles and tuning parameters for impulse, drive-by, mower-like, thunder-like, and rain-like exclusions |
+| `filters` | Per-filter enable toggles and tuning parameters for all 11 exclusion filters (thunder, impulse, birdsong, amplified bass, wind, rain, weedwhacker, mower, diesel, flyover, conversation) |
 | `web` | Host, port, dashboard refresh interval |
 
 ### Troubleshooting configuration tweaking and adding your own calibration test sounds
@@ -410,10 +418,10 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 
 ## Features
 
-- **Intelligent gating, recording, and logging of incidents** — hysteresis-based state machine prevents chatter at threshold boundaries; song-gap merging (default 10 sec) bundles closely-spaced noise events into single incidents
+- **Intelligent gating, recording, and logging of incidents** — hysteresis-based state machine prevents chatter at threshold boundaries; song-gap merging (default 10 sec) bundles closely-spaced noise events into single incidents. Optional `record_borderline_events: false` auto-dismisses incidents whose peak is within `borderline_margin_db` of the threshold (classified as 'borderline', snippet quarantined), keeping the log focused on clear violations
 - **WAV snippet evidence capture** — ring buffer preserves pre-trigger audio (15 sec default) plus post-trigger recording, saved per incident
-- **5 false-positive exclusion filters** — impulse, thunder-like, rain-like, mower-like, and drive-by patterns each with configurable tuning parameters
-- **Reclassify tool** — replay the DSP pipeline against saved snippets to test config changes before deploying them. Available as both a CLI module (see [Reclassify CLI](#reclassify-cli) below) and an in-popup UI button on every incident with a stored snippet
+- **11 noise exclusion filters** — thunder, impulse, birdsong, amplified bass, wind, rain, weedwhacker, mower, diesel, flyover, and conversation — each with individually configurable tuning parameters and holdover persistence through brief gaps
+- **Reclassify tool** — replay the DSP pipeline against saved snippets to test config changes before deploying them. Available as both a CLI module (see [Reclassify CLI](#reclassify-cli) below) and an in-popup UI button on every incident with a stored snippet. Batch mode (`--all`) compares both classification and journal timeline, reporting change types. Also supports `--denoise` to batch-denoise ambient hiss and `--normalize` to batch-normalize snippet volumes after analysis
 - **Web UI** for calibration, customization, and incident review:
   - Dashboard — live dB readout, arm/disarm/pause controls, detection mode switcher, force test incident, recording toggle, incident list with ▶ play buttons
   - Timeline — day/week/month incident viewer with severity-colored blocks, borderline filtering, and click-to-inspect detail popups
@@ -427,7 +435,6 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 - **REST API** — full programmatic access to status, incidents, controls, and configuration
 - **CSV export** of incident history for external analysis or evidence submission
 - **Home Assistant integration** — REST endpoint examples provided for status polling and control commands
-- **Noise exclusion profiles** for common false positives (lawn mower, thunder, rain, drive-bys, etc.)
 - **Ambient noise floor gate** — configurable minimum dBA threshold (default 50 dB) below which the DSP pipeline is skipped entirely. Reduces CPU load on the Pi and prevents constant analysis of background white noise. Adjustable via calibration page UI or YAML config
 - **GPIO relay + audio playback response** (optional, disabled by default) — powers amplifier and plays audio during daytime threshold violations. Real GPIO control via `gpiozero` when `_RELAY_HW_ENABLED = True` in `response.py`; boolean-only fallback on non-Pi systems
 - **Self-noise suppression** — automatically skips incident detection while the system is playing a response (and for a configurable cooldown window afterward), preventing the system from logging its own retaliation as a noise violation
@@ -435,7 +442,9 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 - **Dual-mic reference subtraction plugins** — `ReferenceSubtractor` (NLMS adaptive filter) and `DualMicDifferential` (spectral subtraction) in `plugins.py` with documented algorithms. Not yet wired into the engine loop — requires callback streams and a second `AudioCapture` instance
 - **Intensity waveform visualization** — Canvas-based RMS envelope displayed above the audio player in incident popups. Color-coded (teal → lime → yellow → orange → red) by amplitude so loud sections are immediately visible. Click anywhere on the waveform to seek; playback cursor tracks position in real-time
 - **Armed state persistence** — Pausing detection writes to YAML config so pauses survive server restarts and watch-mode reloads
-- **Offline-capable timeline** — Service worker caches the timeline page and audio snippets for offline review, with proper HTTP Range request handling for cached audio scrubbing
+- **Offline-capable UI** — Service worker eagerly pre-caches all navigable pages on first visit and caches audio snippets for offline review, with proper HTTP Range request handling for cached audio scrubbing. Server-reachability detection (not `navigator.onLine`) persists across page navigations via `sessionStorage`, graying out dashboard pills and disabling mutation controls when the server is unreachable. Requires HTTPS — the install script generates a self-signed TLS certificate for Pi deployment; `localhost` is exempt for local development
+- **Snippet spectral denoising** — self-adaptive spectral subtraction removes the omnipresent ambient hiss ("seashore whoosh") from USB microphone recordings. Uses minimum-statistics noise estimation per snippet (Martin 1994 simplified) — no manual noise profile capture required. Per-frequency-bin, the Nth percentile of magnitudes across all STFT frames is treated as the stationary noise floor, then subtracted with an oversubtraction factor and spectral floor to prevent musical-noise artifacts. Runs AFTER DSP analysis (classification uses the raw signal) and BEFORE normalization (so gain boost amplifies clean audio, not hiss). Enable with `snippet_denoise: true`; tunable via `denoise_percentile`, `denoise_alpha`, and `denoise_beta`. Existing snippets can be batch-denoised via `python -m noise_warden.reclassify --all --denoise`
+- **Snippet volume normalization** — USB microphones produce very quiet WAV files (-30 to -50 dBFS) despite measuring loud real-world sounds, because the calibration offset maps raw digital levels to dBA. Two complementary solutions: (1) **write-time normalization** (`snippet_normalize: true`) boosts each snippet's peak to −6 dBFS on save — only amplifies, never attenuates — so evidence recordings are immediately audible on any device; and (2) **playback volume boost** (1×–5× gain selector in the incident popup via WebAudio GainNode) for reviewing quiet legacy recordings without re-processing them. Existing snippets can be batch-normalized via `python -m noise_warden.reclassify --all --normalize`
 
 ### Reclassify CLI
 
@@ -456,6 +465,17 @@ python -m noise_warden.reclassify --all
 
 # Batch reclassify and write new classifications back to the database
 python -m noise_warden.reclassify --all --update
+
+# Batch-denoise all snippet WAVs (remove ambient hiss via spectral subtraction)
+# Denoising runs AFTER analysis, BEFORE normalization
+python -m noise_warden.reclassify --all --denoise
+
+# Batch-normalize all snippet WAVs (boost quiet recordings to -6 dBFS)
+# Normalization runs AFTER analysis and denoising
+python -m noise_warden.reclassify --all --normalize
+
+# Combine: reclassify + denoise + normalize + write changes back
+python -m noise_warden.reclassify --all --update --denoise --normalize
 
 # Use a specific config file (defaults to local config if present)
 python -m noise_warden.reclassify 63 -c config/noise_warden.yaml
@@ -555,9 +575,11 @@ Add to crontab (`crontab -e`):
 - TODO: Now that we have a number of different classifications, i see them being applied a little too strictly, like in thunder-and-light-rain and thunder-cracks--if we are only going to classify something for a block or three, differently than the sweeping majority, it should not be bolded. Or maybe more, if we implement weighting and backtracking. Because, for example, we _know_ that thunder rumble trail off looks like a diesel, but the odds that someone started their diesel up _right_ as a thunderclap hits is extraordinarily low, so we should clamp.
 - TODO: The yaml configuration has some odd sorting and grouping, like which things are put under `audio` versus `detection`. I might change `audio` to `recording`, and move things like `noise_floor_db` and `calibration_offset_db` into it.
 - TODO: Make sure that the system will function the same with 48kHz sampling and recording.
-- TODO: Even worth noting that configuring a mic with a given system will not necessarily carry over to another--actually, it seems like it could, given my recent recalibration.
 - TODO: Under windy conditions, that portion of the attic has a few locations that creak/rattle. Shim/reattach/glue/foam insulate as best as possible.
-- TODO: Add a profile for wind, if possible. The deadcat is doing its job, but the sharp edges of a roof cause some wind whistle.
+- TODO: Add instruction to (right-click on the player and select "Save Audio as..." to export audio)
+- TODO: The backup job that is recommneded is just the database--if you want the _data_, you also need to grab the snippets directory. And if you are just connected to the webapp, you may just want to "download all", instead of clicking into each to right-click-and-save-as individually.
+- TODO: In music-detection mode, have the ability to drop everything _except_ unknown and music
+- TODO: If it helps classification, we can apply some mutual exclusion filters. For example, if thunder has been detected, it should stick very heavily, even if the system thinks it heard a plane flyover (they so have a lot of similarity), because the two events are pretty much mutually exclusive — **PARTIALLY ADDRESSED in v14**: Thunder Path B threshold relaxation (rumble_min_db 95→40, rumble_centroid_max 1300→1500) now catches enough consecutive rumble blocks to activate holdover, which naturally suppresses flyover during active thunder. True explicit mutual exclusion (post-processing reclassification of flyover→thunder when both appear) remains a potential future enhancement for journal cleanup.
 
 ### Architecture
 
@@ -577,7 +599,7 @@ Add to crontab (`crontab -e`):
 
 ### Security
 
-- **Auth token transmitted in cleartext** — Bearer token sent over HTTP (no TLS). On a home LAN this is low-risk, but anyone sniffing the network can capture it. Consider documenting TLS proxy setup for security-conscious deployments.
+- **Auth token now encrypted in transit** — Bearer token transmitted over TLS (self-signed certificate generated during install). While a self-signed cert doesn't verify identity, it does encrypt traffic — sniffing the LAN no longer exposes the token in cleartext.
 - **`/api/state` and `/api/health` have no auth** — These endpoints bypass `must_auth()`. Low-risk read-only data on LAN, but noted for awareness.
 
 ### Install / deploy

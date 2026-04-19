@@ -37,6 +37,194 @@ from noise_warden.dsp import (
 )
 
 # ---------------------------------------------------------------------------
+# Snippet audio processing (shared with engine.py)
+# ---------------------------------------------------------------------------
+
+
+def denoise_snippet(wav_path, percentile=10, alpha=1.0, beta=0.02,
+                    fft_size=1024, hop_size=256):
+    """Remove ambient background hiss from a WAV snippet using per-snippet
+    minimum-statistics noise estimation.
+
+    Rather than requiring a separate noise profile capture, this function
+    estimates the noise floor *from the snippet itself* by treating the
+    quietest spectral bins (by percentile) as the ambient noise signature.
+    This works because most snippets contain a mix of noise events and
+    brief quiet gaps — the low-percentile magnitudes across all frames
+    approximate the stationary noise floor.
+
+    Algorithm (spectral subtraction with minimum-statistics estimation):
+      1. STFT the signal into overlapping windowed frames
+      2. Per-frequency-bin, take the Nth percentile of magnitudes across
+         all frames as the noise floor estimate (Martin 1994 simplified)
+      3. Subtract alpha * noise_floor from each frame's magnitude,
+         clamping to beta * original (spectral floor prevents musical noise)
+      4. Reconstruct via inverse STFT with overlap-add
+
+    Args:
+        wav_path:    path to the WAV file (modified in place)
+        percentile:  percentile for noise floor estimation (lower = more
+                     conservative; 10 catches steady hiss without eating transients)
+        alpha:       oversubtraction factor (1.0 = subtract exactly the
+                     estimated noise; >1.0 = more aggressive denoising)
+        beta:        spectral floor as fraction of original magnitude
+                     (prevents "musical noise" artifacts from zero-magnitude bins)
+        fft_size:    FFT window size in samples (1024 ≈ 46ms at 22050 Hz)
+        hop_size:    hop between frames (256 = 75% overlap for smooth reconstruction)
+
+    Returns:
+        dict with keys {action, noise_floor_db, snr_improvement_db}
+        or None if the file was skipped (too short or I/O error).
+    """
+    try:
+        data, sr = sf.read(wav_path, dtype="float32")
+
+        # Mono only — collapse if stereo
+        if len(data.shape) > 1:
+            data = data[:, 0]
+
+        # Need at least one full FFT frame to do anything useful
+        if len(data) < fft_size:
+            return None
+
+        # ── Forward STFT ──────────────────────────────────────────────
+        window = np.hanning(fft_size).astype(np.float32)
+        n_frames = 1 + (len(data) - fft_size) // hop_size
+        # Pre-allocate complex STFT matrix
+        stft = np.zeros((n_frames, fft_size // 2 + 1), dtype=np.complex64)
+
+        for i in range(n_frames):
+            start = i * hop_size
+            frame = data[start:start + fft_size] * window
+            stft[i] = np.fft.rfft(frame)
+
+        magnitudes = np.abs(stft)
+        phases = np.angle(stft)
+
+        # ── Noise floor estimation (minimum statistics) ───────────────
+        # Per-bin percentile across all frames. Stationary hiss will have
+        # consistent energy in every frame; transient signals (speech,
+        # music, bangs) will only appear in some frames, pushing their
+        # percentile above the noise floor.
+        noise_floor = np.percentile(magnitudes, percentile, axis=0)
+
+        # Diagnostic: average noise floor in dB (for logging)
+        mean_noise_mag = float(np.mean(noise_floor))
+        if mean_noise_mag > 1e-10:
+            noise_floor_db = 20.0 * np.log10(mean_noise_mag)
+        else:
+            noise_floor_db = -100.0
+
+        # Measure pre-denoise RMS for SNR comparison
+        pre_rms = float(np.sqrt(np.mean(data ** 2)))
+
+        # ── Spectral subtraction ──────────────────────────────────────
+        # Subtract the noise floor from each frame's magnitude. The beta
+        # spectral floor prevents complete zeroing of bins, which causes
+        # annoying "musical noise" (tinkly artifacts from phase-only bins).
+        cleaned_mag = magnitudes - alpha * noise_floor[np.newaxis, :]
+        floor = beta * magnitudes
+        cleaned_mag = np.maximum(cleaned_mag, floor)
+
+        # ── Inverse STFT (overlap-add) ────────────────────────────────
+        cleaned_stft = cleaned_mag * np.exp(1j * phases)
+        output_len = len(data)
+        output = np.zeros(output_len, dtype=np.float32)
+        window_sum = np.zeros(output_len, dtype=np.float32)
+
+        for i in range(n_frames):
+            start = i * hop_size
+            frame = np.fft.irfft(cleaned_stft[i]).astype(np.float32)
+            # irfft may return fft_size or fft_size+1 samples; truncate
+            frame = frame[:fft_size]
+            end = min(start + fft_size, output_len)
+            actual_len = end - start
+            output[start:end] += frame[:actual_len] * window[:actual_len]
+            window_sum[start:end] += window[:actual_len] ** 2
+
+        # Normalize by window overlap (avoid division by zero in
+        # regions with insufficient overlap at the very end)
+        nonzero = window_sum > 1e-8
+        output[nonzero] /= window_sum[nonzero]
+
+        # Clamp to valid audio range
+        output = np.clip(output, -1.0, 1.0)
+
+        # Measure post-denoise RMS for SNR improvement estimate
+        post_rms = float(np.sqrt(np.mean(output ** 2)))
+        if pre_rms > 1e-10 and post_rms > 1e-10:
+            snr_improvement = 20.0 * np.log10(post_rms / pre_rms)
+        else:
+            snr_improvement = 0.0
+
+        sf.write(wav_path, output, sr, subtype="PCM_16")
+
+        return {
+            "action": "denoised",
+            "noise_floor_db": round(noise_floor_db, 1),
+            "snr_improvement_db": round(snr_improvement, 1),
+        }
+    except (OSError, RuntimeError) as exc:
+        print(f"[reclassify] Snippet denoising failed for {wav_path}: {exc}")
+        return None
+
+
+def normalize_snippet(wav_path, target_peak_dbfs=-6.0):
+    """Normalize a WAV snippet's peak amplitude to a target dBFS level.
+
+    USB microphones typically produce very low digital levels (-30 to
+    -50 dBFS for sounds that are loud in real life). Normalizing to a
+    target peak (default -6 dBFS, standard broadcast headroom) makes
+    audio immediately audible on consumer playback devices.
+
+    Only boosts — never attenuates. If the recording is already louder
+    than the target, it is left untouched.
+
+    Args:
+        wav_path: path to the WAV file (modified in place)
+        target_peak_dbfs: desired peak level in dBFS (default -6.0)
+
+    Returns:
+        dict with keys {action, gain_db, old_peak_dbfs, new_peak_dbfs}
+        or None if the file was skipped (already loud enough or silent).
+    """
+    try:
+        data, sr = sf.read(wav_path, dtype="float32")
+        peak = float(np.max(np.abs(data)))
+
+        if peak < 1e-10:
+            # Essentially silent — skip to avoid extreme amplification
+            return None
+
+        current_peak_dbfs = 20.0 * np.log10(peak)
+        gain_db = target_peak_dbfs - current_peak_dbfs
+
+        # Only boost, never attenuate — protects high-quality recordings
+        # (freesound, etc.) from being reduced.
+        if gain_db <= 0:
+            return None
+
+        gain_linear = 10.0 ** (gain_db / 20.0)
+        normalized = data * gain_linear
+
+        # Clamp to [-1, 1] as a safety net (shouldn't be needed since
+        # we target below 0 dBFS, but protects against edge cases)
+        normalized = np.clip(normalized, -1.0, 1.0)
+
+        sf.write(wav_path, normalized, sr, subtype="PCM_16")
+        return {
+            "action": "normalized",
+            "gain_db": round(gain_db, 1),
+            "old_peak_dbfs": round(current_peak_dbfs, 1),
+            "new_peak_dbfs": round(target_peak_dbfs, 1),
+        }
+    except (OSError, RuntimeError) as exc:
+        # Non-fatal — the un-normalized snippet is still usable.
+        print(f"[reclassify] Snippet normalization failed for {wav_path}: {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Core analysis
 # ---------------------------------------------------------------------------
 
@@ -99,8 +287,14 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg):
             raw_filt, prev_filt, prev_filt_run, holdover_gap, detection_cfg,
         )
 
-        # Replicate engine._classify_sound logic
-        if mscore >= min_music and bconf >= min_beat:
+        # Replicate engine._classify_sound logic (with engine_noise detection)
+        if feats.get("midband_ratio", 0) > 0.50:
+            classify = "engine_noise"
+        elif (feats.get("lowband_ratio", 0) > 0.10 and
+              feats.get("envelope_cv", 0.5) < 0.10 and
+              feats.get("harmonic_ratio", 0.5) < 0.40):
+            classify = "engine_noise"
+        elif mscore >= min_music and bconf >= min_beat:
             classify = "music"
         elif mscore >= min_music:
             classify = "music_like"
@@ -147,7 +341,9 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg):
             "block": i,
             "dba": round(db_now, 1),
             "centroid_hz": round(feats["centroid_hz"]),
+            "envelope_cv": round(feats.get("envelope_cv", 0.0), 3),
             "flatness": round(feats["flatness"], 3),
+            "harmonic_ratio": round(feats.get("harmonic_ratio", 0.0), 3),
             "lowband": round(feats["lowband_ratio"], 3),
             "midband": round(feats["midband_ratio"], 3),
             "highband": round(feats["highband_ratio"], 3),
@@ -188,7 +384,12 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg):
 # These should not win the dominant-classification contest — a 60-second
 # recording with 50 seconds of white noise and 10 seconds of thunder
 # should report "thunder", not "unknown".
-_IGNORABLE_CLASSES = {"unknown", "none"}
+# Classifications that shouldn't compete in the dominant contest.
+# "unknown" and "none" are ambient noise / no-match. "engine_noise" is the
+# fallback catch-all for mechanical sounds that slipped past specific filters
+# (flyover, mower, diesel) — when a specific filter *does* match, it should
+# win rather than splitting the vote with the generic supercategory.
+_IGNORABLE_CLASSES = {"engine_noise", "none", "unknown"}
 
 
 def _compute_dominant(journal, duration):
@@ -305,11 +506,18 @@ def print_summary(result, old_class=None, old_journal=None):
 
 
 def reclassify_incident(storage, incident_id, detection_cfg, audio_cfg,
-                        verbose=False, update=False):
+                        verbose=False, update=False, normalize=False,
+                        denoise=False, target_peak_dbfs=-6.0,
+                        denoise_percentile=10, denoise_alpha=1.0,
+                        denoise_beta=0.02):
     """Re-analyze a single incident from the database.
 
     Looks up the incident, reads its snippet WAV, runs the DSP pipeline,
     prints results, and optionally updates the DB with the new classification.
+    With denoise=True, applies spectral denoising AFTER analysis but BEFORE
+    normalization (so DSP sees the original signal, and gain boost amplifies
+    clean audio). With normalize=True, normalizes the snippet WAV peak
+    amplitude after denoising.
 
     Returns the analysis result dict, or None if the incident has no snippet.
     """
@@ -349,23 +557,66 @@ def reclassify_incident(storage, incident_id, detection_cfg, audio_cfg,
             )
         print(f"  ★ DB updated: classification={result['dominant']}")
 
+    # Denoise snippet AFTER analysis but BEFORE normalization — DSP needs
+    # the original signal, and normalize should boost clean audio, not hiss.
+    if denoise:
+        denoise_result = denoise_snippet(
+            wav_path,
+            percentile=denoise_percentile,
+            alpha=denoise_alpha,
+            beta=denoise_beta,
+        )
+        if denoise_result:
+            print(f"  🔇 Denoised: noise floor {denoise_result['noise_floor_db']} dBFS, "
+                  f"SNR change {denoise_result['snr_improvement_db']:+.1f} dB")
+        result["denoised"] = denoise_result
+
+    # Normalize snippet AFTER analysis — DSP needs the original signal levels
+    if normalize:
+        norm_result = normalize_snippet(wav_path, target_peak_dbfs)
+        if norm_result:
+            print(f"  ♪ Normalized: {norm_result['old_peak_dbfs']} → "
+                  f"{norm_result['new_peak_dbfs']} dBFS "
+                  f"(+{norm_result['gain_db']} dB)")
+        result["normalized"] = norm_result
+
     return result
 
 
-def reclassify_all(storage, detection_cfg, audio_cfg, verbose=False, update=False):
+def reclassify_all(storage, detection_cfg, audio_cfg, verbose=False, update=False,
+                   normalize=False, denoise=False, target_peak_dbfs=-6.0,
+                   denoise_percentile=10, denoise_alpha=1.0,
+                   denoise_beta=0.02):
     """Batch-reclassify all incidents that have snippet files.
 
-    Prints a summary table of changed classifications at the end.
+    Compares both dominant classification AND journal timeline against stored
+    values. An incident is considered "changed" if either differs — journal-only
+    changes (e.g. engine_noise blocks appearing, filter backdating shifts) are
+    just as meaningful as a classification flip and should be persisted.
+
+    With denoise=True, applies spectral denoising to each snippet AFTER DSP
+    analysis but BEFORE normalization. With normalize=True, normalizes each
+    snippet WAV's peak amplitude after denoising.
+
+    Prints a summary table of all changes at the end.
+
+    Returns:
+        dict with keys: total, processed, skipped, changed (list of
+        {id, old, new, change_type} dicts), normalized (int), and applied (bool).
+        change_type is "class+journal", "class", or "journal".
     """
     with storage.conn() as c:
         rows = c.execute(
-            "SELECT id, classification, snippet_path FROM incidents "
+            "SELECT id, classification, class_journal, snippet_path "
+            "FROM incidents "
             "WHERE deleted=0 AND snippet_path IS NOT NULL "
             "ORDER BY id"
         ).fetchall()
 
     total = len(rows)
     changed = []
+    denoised_count = 0
+    normalized_count = 0
     skipped = 0
     processed = 0
 
@@ -375,6 +626,7 @@ def reclassify_all(storage, detection_cfg, audio_cfg, verbose=False, update=Fals
     for row in rows:
         iid = row["id"]
         old_class = row["classification"]
+        old_journal_raw = row["class_journal"]
         wav_path = row["snippet_path"]
 
         if not wav_path or not os.path.exists(wav_path):
@@ -384,17 +636,38 @@ def reclassify_all(storage, detection_cfg, audio_cfg, verbose=False, update=Fals
         result = analyze_clip(wav_path, detection_cfg, audio_cfg)
         processed += 1
 
-        if result["dominant"] != old_class:
-            changed.append((iid, old_class, result["dominant"]))
+        # Compare classification
+        class_changed = result["dominant"] != old_class
+
+        # Compare journal — normalize new journal entries to lists (analyze_clip
+        # returns tuples, but JSON round-trips them as lists)
+        new_journal = [list(entry) for entry in result["journal"]]
+        try:
+            old_journal = json.loads(old_journal_raw) if old_journal_raw else []
+        except (json.JSONDecodeError, TypeError):
+            old_journal = []
+        journal_changed = old_journal != new_journal
+
+        if class_changed and journal_changed:
+            change_type = "class+journal"
+        elif class_changed:
+            change_type = "class"
+        elif journal_changed:
+            change_type = "journal"
+        else:
+            change_type = None
+
+        if change_type:
+            changed.append((iid, old_class, result["dominant"], change_type))
 
             if verbose:
-                print(f"=== Incident {iid} ===")
+                print(f"=== Incident {iid} ({change_type}) ===")
                 print_block_table(result["blocks"])
-                print_summary(result, old_class)
+                print_summary(result, old_class, old_journal_raw)
                 print()
 
-        if update:
-            journal_json = json.dumps(result["journal"])
+        if update and change_type:
+            journal_json = json.dumps(new_journal)
             last_block = result["blocks"][-1] if result["blocks"] else {}
             with storage.conn() as c:
                 c.execute(
@@ -406,6 +679,23 @@ def reclassify_all(storage, detection_cfg, audio_cfg, verbose=False, update=Fals
                      iid)
                 )
 
+        # Denoise snippet AFTER analysis but BEFORE normalization
+        if denoise:
+            denoise_result = denoise_snippet(
+                wav_path,
+                percentile=denoise_percentile,
+                alpha=denoise_alpha,
+                beta=denoise_beta,
+            )
+            if denoise_result:
+                denoised_count += 1
+
+        # Normalize snippet AFTER analysis — DSP needs the original signal
+        if normalize:
+            norm_result = normalize_snippet(wav_path, target_peak_dbfs)
+            if norm_result:
+                normalized_count += 1
+
         # Progress logging every 25 incidents
         if processed % 25 == 0:
             print(f"  Processed {processed}/{total} ({len(changed)} changed so far)...")
@@ -416,19 +706,45 @@ def reclassify_all(storage, detection_cfg, audio_cfg, verbose=False, update=Fals
     print(f"  Processed: {processed}")
     print(f"  Skipped (missing file): {skipped}")
     print(f"  Changed: {len(changed)}")
+    if denoised_count:
+        print(f"  Denoised: {denoised_count}")
+    if normalized_count:
+        print(f"  Normalized: {normalized_count}")
 
     if changed:
+        # Tally by change type for the summary header
+        class_count = sum(1 for _, _, _, ct in changed if "class" in ct)
+        journal_only = sum(1 for _, _, _, ct in changed if ct == "journal")
+        if journal_only:
+            print(f"    ({class_count} classification, {journal_only} journal-only)")
+
         print()
-        print(f"  {'ID':>5}  {'Old':>25}  →  New")
-        print(f"  {'—'*5}  {'—'*25}     {'—'*25}")
-        for iid, old, new in changed:
+        print(f"  {'ID':>5}  {'Old':>25}  →  {'New':<25}  Type")
+        print(f"  {'—'*5}  {'—'*25}     {'—'*25}  {'—'*14}")
+        for iid, old, new, change_type in changed:
             marker = "★" if update else " "
-            print(f"  {iid:5d}  {(old or '?'):>25}  →  {new} {marker}")
+            old_display = old or "?"
+            # For journal-only changes, show the classification as unchanged
+            if change_type == "journal":
+                print(f"  {iid:5d}  {old_display:>25}       {'(unchanged)':<25}  {change_type} {marker}")
+            else:
+                print(f"  {iid:5d}  {old_display:>25}  →  {new:<25}  {change_type} {marker}")
 
     if update:
         print(f"\n  ★ = updated in DB")
     else:
         print(f"\n  (dry run — use --update to write changes)")
+
+    return {
+        "total": total,
+        "processed": processed,
+        "skipped": skipped,
+        "changed": [{"id": iid, "old": old, "new": new, "change_type": ct}
+                     for iid, old, new, ct in changed],
+        "denoised": denoised_count,
+        "normalized": normalized_count,
+        "applied": update,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +788,18 @@ def main():
         "--all", action="store_true", dest="batch_all",
         help="Reclassify all incidents that have snippet files.",
     )
+    parser.add_argument(
+        "--normalize", action="store_true",
+        help="Normalize snippet WAV peak amplitude after analysis. "
+             "Only boosts quiet recordings; never attenuates loud ones. "
+             "Uses snippet_normalize_peak_dbfs from config (default -6 dBFS).",
+    )
+    parser.add_argument(
+        "--denoise", action="store_true",
+        help="Apply spectral denoising to remove ambient hiss before normalization. "
+             "Uses minimum-statistics noise estimation (no manual noise profile needed). "
+             "Reads denoise_percentile / denoise_alpha / denoise_beta from config.",
+    )
     args = parser.parse_args()
 
     # Resolve config path
@@ -491,6 +819,10 @@ def main():
     print(f"[reclassify] Config: {config_path}")
     detection_cfg = cfg["detection"]
     audio_cfg = cfg["audio"]
+    target_peak_dbfs = audio_cfg.get("snippet_normalize_peak_dbfs", -6.0)
+    denoise_percentile = float(audio_cfg.get("denoise_percentile", 10))
+    denoise_alpha = float(audio_cfg.get("denoise_alpha", 1.0))
+    denoise_beta = float(audio_cfg.get("denoise_beta", 0.02))
 
     # Standalone WAV file analysis (no DB needed)
     if args.target and not args.target.isdigit() and not args.batch_all:
@@ -524,11 +856,21 @@ def main():
 
     if args.batch_all:
         reclassify_all(storage, detection_cfg, audio_cfg,
-                        verbose=args.verbose, update=args.update)
+                        verbose=args.verbose, update=args.update,
+                        normalize=args.normalize, denoise=args.denoise,
+                        target_peak_dbfs=target_peak_dbfs,
+                        denoise_percentile=denoise_percentile,
+                        denoise_alpha=denoise_alpha,
+                        denoise_beta=denoise_beta)
     elif args.target and args.target.isdigit():
         incident_id = int(args.target)
         reclassify_incident(storage, incident_id, detection_cfg, audio_cfg,
-                            verbose=args.verbose, update=args.update)
+                            verbose=args.verbose, update=args.update,
+                            normalize=args.normalize, denoise=args.denoise,
+                            target_peak_dbfs=target_peak_dbfs,
+                            denoise_percentile=denoise_percentile,
+                            denoise_alpha=denoise_alpha,
+                            denoise_beta=denoise_beta)
     else:
         print("[reclassify] ERROR: Specify an incident ID, a WAV file path, or --all.")
         parser.print_help()

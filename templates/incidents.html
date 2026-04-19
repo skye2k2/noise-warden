@@ -4,19 +4,19 @@
   <h2>Incidents</h2>
   <table>
     <tr class="header">
-      <th>Start <span class="small" id="tz-offset-label"></span></th><th>End</th><th>Start dB</th><th>Peak</th><th>Avg</th><th>Duration</th>
+      <th>Start <span class="small" id="tz-offset-label"></span></th><th>Length</th><th>Peak</th><th>Avg</th>
+      <th title="Peak dB above the active ordinance threshold. &#10;&#10;Borderline = at or below threshold + margin &#10;+15–24 dB = notable (amber) &#10;+25–29 dB = moderate (orange) &#10;+30–39 dB = severe (red) &#10;+40+ dB = extreme (deep red)">Excess</th>
       <th title="Music-like score (0–1): How closely the spectral profile resembles music. &#10;&#10;0.00–0.30 = environmental (wind, HVAC, traffic) &#10;0.30–0.50 = mechanical (mower, diesel, fan) &#10;0.50–0.62 = ambiguous (could be tonal noise or distant music) &#10;0.62–0.80 = likely music (bass through walls, muffled speakers) &#10;0.80–1.00 = almost certainly music (clear rhythm + bass)">Music</th>
       <th title="Beat confidence (0–1): Rhythmic periodicity of the amplitude envelope. &#10;&#10;0.00–0.40 = no detectable rhythm (nature, steady drones) &#10;0.40–0.55 = weak periodicity (engine idle, irregular traffic) &#10;0.55–0.70 = moderate rhythm (could be music or repetitive machinery) &#10;0.70–0.85 = strong beat (likely music with a clear tempo) &#10;0.85–1.00 = very strong beat (dance/electronic music, heavy bass)">Beat</th>
-      <th title="music · music_like · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · amplified_bass · conversation · drive_by · forced_test">Class</th><th>Snippet</th><th>Notes</th><th>Delete</th>
+      <th title="music · music_like · engine_noise · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · amplified_bass · conversation · drive_by · forced_test">Class</th><th>Snippet</th><th>Notes</th>
     </tr>
     {% for r in rows %}
     <tr>
       <td class="incident-ts" data-ts="{{ r.start_ts }}">{{ r.start_ts }}</td>
-      <td class="incident-ts" data-ts="{{ r.end_ts or '' }}">{{ r.end_ts or "" }}</td>
-      <td>{{ "%.1f"|format(r.start_db) }}</td>
+      <td>{% if r.duration_sec is not none %}{% if r.duration_sec >= 3600 %}{{ "%.1f"|format(r.duration_sec / 3600) }}h{% elif r.duration_sec >= 60 %}{{ "%.1f"|format(r.duration_sec / 60) }}m{% else %}{{ r.duration_sec|int }}s{% endif %}{% endif %}</td>
       <td>{{ r.peak_db }}</td>
       <td>{{ r.avg_db }}</td>
-      <td>{% if r.duration_sec is not none %}{% if r.duration_sec >= 3600 %}{{ "%.1f"|format(r.duration_sec / 3600) }}h{% elif r.duration_sec >= 60 %}{{ "%.1f"|format(r.duration_sec / 60) }}m{% else %}{{ r.duration_sec|int }}s{% endif %}{% endif %}</td>
+      <td>{% if r.peak_db and r.threshold_db %}{% set ex = r.peak_db - r.threshold_db %}<span class="excess-cell" data-excess="{{ "%.1f"|format(ex) }}">{{ "+" if ex >= 0 }}{{ "%.1f"|format(ex) }}dB</span>{% endif %}</td>
       <td title="{% if r.music_like_score >= 0.80 %}Almost certainly music{% elif r.music_like_score >= 0.62 %}Likely music{% elif r.music_like_score >= 0.50 %}Ambiguous{% elif r.music_like_score >= 0.30 %}Mechanical{% else %}Environmental{% endif %}">{{ "%.2f"|format(r.music_like_score) }}</td>
       <td title="{% if r.beat_confidence >= 0.85 %}Very strong beat{% elif r.beat_confidence >= 0.70 %}Strong beat{% elif r.beat_confidence >= 0.55 %}Moderate rhythm{% elif r.beat_confidence >= 0.40 %}Weak periodicity{% else %}No rhythm{% endif %}">{{ "%.2f"|format(r.beat_confidence) }}</td>
       <td>{{ r.classification }}</td>
@@ -29,11 +29,7 @@
           <input type="submit" value="Save Notes">
         </form>
       </td>
-      <td>
-        <form method="post" action="/incidents/{{ r.id }}/delete" onsubmit="return confirm('Delete incident?')">
-          <button  class="destructive">Delete</button>
-        </form>
-      </td>
+
     </tr>
     {% endfor %}
   </table>
@@ -54,6 +50,13 @@
       <button>Re-seed from Classification Data</button>
     </form>
   </p>
+  {% endif %}
+  {% if rows %}
+  <p>
+    <button id="reclass-all-btn" onclick="reclassifyAll()">Reclassify All with Current Config</button>
+    <span id="reclass-all-status"></span>
+  </p>
+  <div id="reclass-all-results" style="display:none"></div>
   {% endif %}
 </div>
 
@@ -89,6 +92,95 @@ function clearAllWithCaches(form) {
 </script>
 
 <script>
+/**
+ * Reclassify all incidents via the DSP pipeline with current config.
+ * First does a dry run to show what would change, then offers to apply.
+ */
+function reclassifyAll() {
+  var btn = document.getElementById('reclass-all-btn');
+  var status = document.getElementById('reclass-all-status');
+  var resultsDiv = document.getElementById('reclass-all-results');
+
+  btn.disabled = true;
+  btn.textContent = 'Analyzing all incidents\u2026';
+  status.textContent = '';
+  resultsDiv.style.display = 'none';
+  resultsDiv.innerHTML = '';
+
+  fetch('/incidents/reclassify-all', { method: 'POST' })
+    .then(function (resp) {
+      if (!resp.ok) { throw new Error('Reclassify failed (' + resp.status + ')'); }
+      return resp.json();
+    })
+    .then(function (data) {
+      btn.textContent = 'Reclassify All with Current Config';
+      btn.disabled = false;
+
+      var changed = data.changed || [];
+      var summary = 'Processed ' + data.processed + ' incident(s), '
+        + data.skipped + ' skipped (no file). ';
+
+      if (changed.length === 0) {
+        status.textContent = summary + 'No changes detected.';
+        return;
+      }
+
+      // Build a results table showing what would change
+      status.textContent = summary + changed.length + ' would change:';
+      resultsDiv.style.display = 'block';
+
+      var html = '<table><thead><tr>'
+        + '<th>ID</th><th>Old</th><th>\u2192</th><th>New</th>'
+        + '</tr></thead><tbody>';
+      changed.forEach(function (c) {
+        html += '<tr><td>' + c.id + '</td><td>' + (c.old || '?')
+          + '</td><td>\u2192</td><td><strong>' + c['new'] + '</strong></td></tr>';
+      });
+      html += '</tbody></table>';
+      html += '<p><button id="apply-reclass-btn" onclick="applyReclassifyAll()">'
+        + 'Apply ' + changed.length + ' change(s) to database</button></p>';
+      resultsDiv.innerHTML = html;
+    })
+    .catch(function (err) {
+      btn.textContent = 'Reclassify All with Current Config';
+      btn.disabled = false;
+      status.textContent = 'Error: ' + err.message;
+    });
+}
+
+/**
+ * Apply the reclassification changes to the database, then reload.
+ */
+function applyReclassifyAll() {
+  var applyBtn = document.getElementById('apply-reclass-btn');
+  var status = document.getElementById('reclass-all-status');
+
+  if (!confirm('Update all changed classifications in the database?')) {
+    return;
+  }
+
+  applyBtn.disabled = true;
+  applyBtn.textContent = 'Applying\u2026';
+
+  fetch('/incidents/reclassify-all?apply=true', { method: 'POST' })
+    .then(function (resp) {
+      if (!resp.ok) { throw new Error('Apply failed (' + resp.status + ')'); }
+      return resp.json();
+    })
+    .then(function (data) {
+      var changed = data.changed || [];
+      status.textContent = 'Applied ' + changed.length + ' change(s). Reloading\u2026';
+      setTimeout(function () { location.reload(); }, 1000);
+    })
+    .catch(function (err) {
+      applyBtn.disabled = false;
+      applyBtn.textContent = 'Apply changes to database';
+      status.textContent = 'Error: ' + err.message;
+    });
+}
+</script>
+
+<script>
 /* Format incident timestamps: strip the offset suffix (shown once in the heading)
    and display just the date + time. Detect offset from first row for the heading label. */
 (function () {
@@ -113,10 +205,36 @@ function clearAllWithCaches(form) {
     try {
       var d = new Date(raw);
       td.textContent = d.toLocaleDateString([], { month:'short', day:'numeric' })
-        + ' ' + d.toLocaleTimeString([], { hour:'numeric', minute:'2-digit', second:'2-digit' });
+        + ' ' + d.toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
     } catch (e) {
       /* Fallback: just strip the offset */
       td.textContent = raw.replace(/[+-]\d{2}:\d{2}$/, '');
+    }
+  });
+})();
+</script>
+
+<script>
+/* Severity color mapping — matches dashboard and popup excess badge tiers.
+   Returns {background, color} or null if below threshold / no data. */
+function dbSeverityStyle(excessDb) {
+  if (excessDb == null || isNaN(excessDb) || excessDb <= 0) { return null; }
+  if (excessDb >= 40) { return { background: '#c0392b', color: '#fff' }; }
+  if (excessDb >= 30) { return { background: '#e74c3c', color: '#fff' }; }
+  if (excessDb >= 25) { return { background: '#e67e22', color: '#fff' }; }
+  if (excessDb >= 15) { return { background: '#f39c12', color: '#fff' }; }
+  return { background: '#f39c12', color: '#fff' };
+}
+
+/* Apply severity colors to excess column cells on initial render */
+(function () {
+  document.querySelectorAll('.excess-cell').forEach(function (el) {
+    var s = dbSeverityStyle(parseFloat(el.getAttribute('data-excess')));
+    if (s) {
+      el.style.background = s.background;
+      el.style.color = s.color;
+      el.style.borderRadius = '4px';
+      el.style.padding = '2px 6px';
     }
   });
 })();

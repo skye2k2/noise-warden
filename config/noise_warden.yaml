@@ -7,18 +7,25 @@ app:
   auth_token: ""  # optional bearer token; blank disables auth (LAN only)
 
 audio:
-  sample_rate: 22050                  # 22050 (wideband), 44100 (CD quality), or 48000 (studio). Lower = smaller WAVs. If your USB mic rejects this rate, the app falls back to the device default automatically
-  block_seconds: 1.0                  # Seconds per audio capture block. 1.0 is standard; smaller = more I/O overhead
-  input_device: null                  # null = default audio device
+  sample_rate: 22050                  # 22050 (wideband), 44100 (CD quality), or 48000 (studio). Lower = smaller WAVs. If your USB mic rejects this rate, the app falls back to the device default automatically.
+  block_seconds: 1.0                  # Seconds per audio capture block. 1.0 is standard; smaller = more I/O overhead.
+  input_device: null                  # null = default audio device.
   input_channels: 1
   # reference_device: null            # Secondary mic device for dual-mic reference subtraction (see plugins)
   recording_enabled: true
-  snippet_pre_seconds: 2
-  snippet_post_seconds: 8
   chunk_flush_seconds: 30
+  snippet_pre_seconds: 2              # Seconds of audio to prepend BEFORE the incident trigger. Written from a rolling buffer of recent blocks. Capped at 64 blocks (64s at block_seconds=1.0). Appears as a negative-timestamp "lead-in" journal entry. NOT counted toward incident duration.
+  snippet_post_seconds: 3             # Seconds of sub-threshold audio to keep AFTER the last above-threshold block during tail trimming. Provides natural-sounding recording endings instead of hard cuts. Capped at song_gap_merge_sec (the maximum tail that can exist). NOT counted toward min_incident_seconds, but IS included in the stored incident duration.
+  min_incident_seconds: 3             # Minimum active duration (time above threshold) before an incident is kept. Shorter incidents are auto-dismissed as "too_short" and quarantined. Neither snippet_pre_seconds (lead-in) nor snippet_post_seconds (tail padding) count toward this threshold--only the time the sound actually exceeded the detection threshold.
   max_incident_record_hours: 6        # Maximum hours to recording as a single incident, even if it keeps exceeding the threshold. Prevents runaway disk usage from a sustained noise source.
-  retention_days: 30                  # IF auto_purge_enabled, how many days to keep snippets and incidents before auto-deletion
-  auto_purge_enabled: false           # Set to true to automatically delete snippets and incidents older than retention_days
+  snippet_normalize: true             # Normalize snippet peak amplitude after recording. USB mics produce -30 to -50 dBFS for loud sounds; normalizing to -6 dBFS makes recordings audible on consumer devices without cranking volume. DSP measurements use the raw signal and are unaffected.
+  snippet_normalize_peak_dbfs: -6.0   # Target peak level for normalization (standard broadcast headroom). Only boosts, never attenuates — recordings already above the target are left alone.
+  snippet_denoise: true               # Apply self-adaptive spectral denoising to remove ambient hiss ("seashore whoosh") from recorded snippets. Uses minimum-statistics noise estimation per snippet — no manual noise profile capture required. Runs AFTER DSP analysis (classification uses the raw signal) and BEFORE normalization (so gain boost amplifies clean audio, not amplified hiss). Safe to enable globally; very short snippets (< 46ms) are skipped automatically.
+  denoise_percentile: 10              # Percentile for per-bin noise floor estimation (0–100). Lower = more conservative (removes less). The Nth percentile of each frequency bin's magnitude across all STFT frames is treated as stationary noise. 10 catches steady hiss while preserving transient events (speech, music, bangs). Raise to 15–20 for noisier environments; lower to 5 for minimal denoising.
+  denoise_alpha: 1.0                  # Oversubtraction factor. 1.0 = subtract exactly the estimated noise floor. Values > 1.0 subtract more aggressively (cleaner but risks removing quiet signal content). Values < 1.0 subtract less (preserves more signal but leaves some hiss). Range 0.5–2.0 is practical; 1.0 is a safe default.
+  denoise_beta: 0.04                  # Spectral floor as a fraction of original magnitude (0.0–1.0). Prevents complete zeroing of frequency bins, which causes "musical noise" — annoying tinkly/watery artifacts from phase-only reconstruction. 0.02 (2%) is conservative; raise to 0.05 if you hear artifacts. Lower values = cleaner but riskier.
+  retention_days: 30                  # IF auto_purge_enabled, how many days to keep snippets and incidents before auto-deletion.
+  auto_purge_enabled: false           # Set to true to automatically delete snippets and incidents older than retention_days.
 
 detection:
   zone: residential_agricultural
@@ -26,12 +33,13 @@ detection:
   armed: true                         # Set to false by Pause button; persisted across watch-mode reloads
   # Borderline margin: incidents within this many dB above the threshold are tagged
   # as borderline and hidden by default on the timeline (still recorded for the full log).
-  borderline_margin_db: 5.0           # -X dB overhead to allow for calibration imperfections and natural volume fluctuations.
-  noise_floor_db: 50.0                 # Ambient gate — signals below this dBA skip DSP analysis entirely
-  calibration_offset_db: 88.0
+  borderline_margin_db: 10.0          # -X dB overhead to allow for calibration imperfections and natural volume fluctuations. Set lower, like 5db, if you have a typically consistent environment.
+  record_borderline_events: true      # When false, incidents whose peak dB is within borderline_margin_db of the threshold are auto-dismissed during finalization (classified as 'borderline', excluded, snippet quarantined to autodismissed/). Useful for noisy environments where marginal events clutter the log. When true (default), borderline incidents are recorded normally and only hidden in the timeline UI.
+  noise_floor_db: 50.0                 # Ambient gate — signals below this dBA skip DSP analysis entirely.
+  calibration_offset_db: 100          # Calibration offset to convert raw amplitude to dBA SPL. Calculated by recording a known sound source (e.g., 1 kHz tone at 94 dB SPL) and adjusting this offset until the measured dBA matches the known source level. This accounts for microphone sensitivity and gain settings.
   # Day/night thresholds use the Pi's system clock. Ensure `timedatectl set-timezone`
   # matches your local timezone.
-  expected_timezone: America/Denver   # For startup validation only — not used for time math
+  expected_timezone: America/Denver   # For startup validation only — not used for time math.
   night_start_hour: 22
   night_end_hour: 7
   # When in music-focused mode, we use a combination of calculations to determine music-like characteristics.
@@ -59,10 +67,10 @@ detection:
   thunder_flatness_min: 0.45           # Path A: minimum spectral flatness — thunder is broadband rumble
   # Thunder Path B: sustained rumble from mellow/distant storms. Very low
   # centroid, extremely concentrated energy (low flatness), dominant midband.
-  thunder_rumble_centroid_max: 1300   # Max centroid Hz — rumble is low-frequency
+  thunder_rumble_centroid_max: 1500   # Max centroid Hz — rumble tail drifts up to ~1450 before dissipating
   thunder_rumble_flatness_max: 0.15    # Max flatness — thunder concentrates energy (opposite of Path A)
   thunder_rumble_midband_min: 0.40    # Min midband ratio — rumble body sits in 180–1200 Hz
-  thunder_rumble_min_db: 95.0         # Min dBA — rejects quiet ambient droning
+  thunder_rumble_min_db: 40.0         # Min dBA — spectral criteria are the real guards; this just rejects silence
   thunder_rumble_min_history: 6       # Min blocks of history before Path B activates
   # Rain targeting: steady broadband noise with near-zero amplitude variation.
   # Real outdoor rain at 100+ dBA: flatness 0.27–0.38, env_std < 0.50,
@@ -79,6 +87,25 @@ detection:
   # steady spectral profile. Real rain mscore maxes at 0.593; bass music scores
   # 0.70+. Blocks scoring above this threshold are rejected by the rain filter.
   rain_max_music_score: 0.70
+  # Wind targeting: broadband aero turbulence across the microphone. Even with
+  # a deadcat windscreen, building features (roof edges, eaves, vents) cause
+  # wind whistle that pushes centroid into the 3300–5800 Hz range. Wind is
+  # spectrally similar to rain but separated by higher lowband (air pressure
+  # fluctuations) and higher centroid (whistle from obstructions).
+  # Checked after amplified_bass, before rain in filter priority.
+  # Key separator from rain: lowband_min — wind ≥ 0.12 vs rain 0.08–0.14.
+  # NOTE: thresholds calibrated from moderate wind with roof-edge whistle.
+  # Stronger winds or different mic placement may need adjustment.
+  wind_flatness_min: 0.30              # Broadband aero noise — real wind measured 0.32–0.55
+  wind_centroid_min_hz: 2500          # Wind sits higher than mower/diesel — real wind 3313+
+  wind_centroid_max_hz: 8000          # Wind whistle from roof edges — real wind up to 5858
+  wind_lowband_min: 0.12              # Air pressure fluctuations — separates from rain (max 0.14)
+  wind_lowband_max: 0.26              # Tight ceiling — real wind maxes at 0.255; plane lowband 0.28+ escapes
+  wind_highband_min: 0.30             # mid-to-high energy — real wind 0.40–0.60
+  wind_highband_max: 0.65             # ceiling — real wind maxes at 0.595; rejects birdsong (0.65+)
+  wind_env_std_max: 4.0               # Wind is relatively steady once established (real: 0–2.5)
+  wind_min_history: 6                 # Blocks before wind filter activates
+  wind_max_music_score: 0.70          # Reject bass-heavy music that overlaps wind's flatness range
   # Birdsong targeting: four detection paths for different bird call patterns.
   # Path A (sustained): high highband + moderate flatness + low env_std.
   # Path B (bursty): extreme highband peak + high env_std + loud chirps.
@@ -99,7 +126,7 @@ detection:
   # Path D — multi-species chorus detection (temporal analysis)
   birdsong_chorus_highband_std_min: 0.10  # Min std dev of highband over window. Chorus: 0.05–0.16; mower-gas max: 0.106
   birdsong_chorus_lowband_max: 0.12       # Window-wide lowband ceiling. Chorus max: 0.133; mower-gas min window max: 0.123
-  birdsong_chorus_min_history: 12          # Minimum feature history blocks before Path D activates
+  birdsong_chorus_min_history: 12         # Minimum feature history blocks before Path D activates
   # Amplified bass targeting: bass-heavy music through walls — the neighborhood
   # thump filter. When a neighbor runs amplified music with boosted bass through
   # a garage or exterior wall, the low-frequency energy dominates. The result is
@@ -111,7 +138,7 @@ detection:
   # Checked after birdsong, before rain/mower in filter priority.
   # Safety: rain blocked by lowband (max 0.137 < 0.16), mower by lowband+mscore,
   # diesel blocked by flatness (median 0.151 < 0.20). Zero false positives on all clips.
-  amplified_bass_min_music_score: 0.45  # Through-wall ≥ 0.60; open-window median 0.50. Captures both scenarios
+  amplified_bass_min_music_score: 0.45 # Through-wall ≥ 0.60; open-window median 0.50. Captures both scenarios
   amplified_bass_lowband_min: 0.16     # Through-wall 0.36+; open-window median 0.19. Rain max 0.137 (margin 0.023)
   amplified_bass_centroid_max_hz: 4000 # Through-wall 1833–3301; open-window extends to 4678, bulk below 4000
   amplified_bass_env_std_max: 3.0      # Real bass music: 0.68–2.05. Steady thump is remarkably consistent
@@ -156,6 +183,29 @@ detection:
   diesel_midband_min: 0.20            # Real car: 0.22–0.35. Engine energy sits in mid frequencies
   diesel_env_std_max: 3.0             # Real car: ~2.0 stable. Tight to limit thunder rumble false-positives
   diesel_min_history: 8               # Need 8+ seconds for sustained pattern
+  # Flyover targeting: aerial vehicle engine noise (planes, helicopters) and
+  # transient vehicle engine sounds that don't match the more specific diesel
+  # or mower profiles. Runs late in the filter chain (after mower and diesel)
+  # to catch remaining engine-like sounds falling between those specific profiles.
+  # Real propeller plane flyover: centroid 2508–10631, flatness 0.22–0.47,
+  # lowband 0.16–0.47, midband 0.19–0.42, env_std 0–6.16, bconf 0–0.69.
+  # Real vehicle acceleration: centroid 1412–5283, flatness 0.11–0.47,
+  # midband 0.33–0.73 (dominant), env_std 0–7.87, bconf 0–0.17.
+  # Key separator from music: beat confidence. Engine sounds have low bconf
+  # (propeller noise is broadband, changing RPMs destroy periodicity);
+  # music has consistent rhythm (bconf > 0.38). Diesel has high bconf from
+  # firing cycle, but is caught by its own filter earlier in the chain.
+  flyover_flatness_min: 0.15           # Above pure-tone diesel (≤ 0.20), below broadband rain
+  flyover_flatness_max: 0.55           # Below rain/mower broadband ceiling
+  flyover_centroid_min_hz: 1400       # Engine fundamentals — real plane 2508+
+  flyover_centroid_max_hz: 12000      # Doppler-shifted flyovers at distance — real plane up to 10631
+  flyover_midband_min: 0.15           # Engine energy indicator — real plane median 0.31
+  flyover_lowband_min: 0.10           # Engine rumble — real plane 0.16+; separates from mower (0.02–0.06)
+  flyover_lowband_max: 0.50           # Not pure bass thump — real plane max 0.47
+  flyover_highband_max: 0.60          # Separates from escaped mower blocks (highband 0.56–0.82)
+  flyover_env_std_max: 8.0            # Allows approach/departure amplitude arc — real plane median 2.7
+  flyover_min_history: 4              # Short — flyovers are transient (user reports max ~45 seconds)
+  flyover_max_beat_confidence: 0.50    # Reject rhythmic sounds (likely music, not engine)
   # Conversation targeting: mid-frequency speech with syllable-level amplitude modulation.
   # Broadest catch — checked last in filter priority order. Not yet battle-tested.
   conversation_centroid_min_hz: 500
