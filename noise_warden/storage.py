@@ -133,13 +133,60 @@ class Storage:
             c.execute("UPDATE incidents SET notes=? WHERE id=?", (notes, incident_id))
 
     def soft_delete_incident(self, incident_id: int):
+        """Soft-delete an incident and remove its snippet file from disk.
+
+        The snippet WAV is the primary disk consumer — leaving it behind after
+        deletion creates orphaned files that confuse reclassify --all and waste
+        SD card space on the Pi. The snippet_path column is NULLed to prevent
+        stale references."""
         with self.conn() as c:
-            c.execute("UPDATE incidents SET deleted=1 WHERE id=?", (incident_id,))
+            row = c.execute(
+                "SELECT snippet_path FROM incidents WHERE id=?", (incident_id,)
+            ).fetchone()
+            if row and row["snippet_path"]:
+                path = row["snippet_path"]
+                # Remove the snippet file (and check autodismissed/ too)
+                for candidate in [path, os.path.join(os.path.dirname(path), "autodismissed", os.path.basename(path))]:
+                    if os.path.exists(candidate):
+                        try:
+                            os.remove(candidate)
+                        except OSError:
+                            pass
+            c.execute(
+                "UPDATE incidents SET deleted=1, snippet_path=NULL WHERE id=?",
+                (incident_id,),
+            )
 
     def soft_delete_all_incidents(self):
         """Soft-delete all non-deleted incidents."""
         with self.conn() as c:
             c.execute("UPDATE incidents SET deleted=1 WHERE deleted=0")
+
+    def purge_orphaned_incidents(self):
+        """NULL out snippet_path for incidents whose WAV file no longer exists.
+
+        This prevents reclassify --all from reporting hundreds of "skipped
+        (no file)" entries after manual snippet cleanup on the Pi. Only
+        touches non-deleted rows — deleted rows are already invisible to
+        normal queries. Returns count of orphaned rows cleaned up."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT id, snippet_path FROM incidents "
+                "WHERE deleted=0 AND snippet_path IS NOT NULL"
+            ).fetchall()
+
+        orphaned = 0
+        for row in rows:
+            path = row["snippet_path"]
+            if not os.path.exists(path):
+                with self.conn() as c:
+                    c.execute(
+                        "UPDATE incidents SET snippet_path=NULL WHERE id=?",
+                        (row["id"],),
+                    )
+                orphaned += 1
+
+        return orphaned
 
     def hard_clear_all_incidents(self, snippets_dir=None):
         """Delete ALL incident rows (including soft-deleted), reset the ID counter

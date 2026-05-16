@@ -1,6 +1,11 @@
 [Unit]
 Description=Noise Warden
 After=network.target sound.target
+# Rate-limit restarts: max 5 attempts in 120 seconds, then give up.
+# MUST be in [Unit], not [Service] — systemd 252 (Bookworm) ignores these
+# directives in [Service] and applies no rate limit at all.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -20,9 +25,12 @@ TimeoutStopSec=15
 Restart=always
 # Back off to avoid tight crash loops when config is broken or a dependency is missing
 RestartSec=10
-# Rate-limit restarts: max 5 attempts in 120 seconds, then give up
-StartLimitIntervalSec=120
-StartLimitBurst=5
+# Memory limits: prevent runaway growth from reaching OOM-kill territory.
+# MemoryHigh is the soft limit (triggers reclaim pressure); MemoryMax is the
+# hard kill. Normal RSS is ~90-120 MB; these give ample headroom while
+# preventing the 7+ GB leak that caused the v14 outage.
+MemoryHigh=512M
+MemoryMax=1024M
 
 [Install]
 WantedBy=multi-user.target

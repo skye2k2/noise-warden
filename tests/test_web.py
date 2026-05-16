@@ -7,6 +7,7 @@ and using a TestClient that skips the lifespan (no real engine thread).
 """
 import os
 import sys
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -562,7 +563,7 @@ class TestTimeline:
     def test_timeline_embeds_incident_json(self, client, storage):
         """The timeline page must embed all incident data as JSON for client-side rendering."""
         storage.create_incident({
-            "start_ts": "2026-04-01T22:00:00Z", "start_db": 72, "peak_db": 72, "avg_db": 72,
+            "start_ts": datetime.now(timezone.utc).isoformat(), "start_db": 72, "peak_db": 72, "avg_db": 72,
             "threshold_db": 55, "music_like_score": 0.5, "beat_confidence": 0.3,
             "classification": "noise", "mode": "record_only",
         })
@@ -583,7 +584,7 @@ class TestTimeline:
         wav = tmp_path / "test.wav"
         wav.write_bytes(b"RIFF" + b"\x00" * 40)
         storage.create_incident({
-            "start_ts": "2026-04-01T22:00:00Z", "start_db": 70, "peak_db": 70, "avg_db": 70,
+            "start_ts": datetime.now(timezone.utc).isoformat(), "start_db": 70, "peak_db": 70, "avg_db": 70,
             "threshold_db": 55, "music_like_score": 0.5, "beat_confidence": 0.3,
             "classification": "noise", "mode": "record_only", "snippet_path": str(wav),
         })

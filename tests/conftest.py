@@ -9,6 +9,7 @@ This pytest_configure hook is the key trick — it writes a temp YAML config and
 """
 import os
 import tempfile
+from datetime import datetime, timezone
 
 import pytest
 import yaml
@@ -220,9 +221,12 @@ def tmp_state():
 
 @pytest.fixture
 def sample_incident():
-    """Return a dict suitable for Storage.create_incident()."""
+    """Return a dict suitable for Storage.create_incident().
+
+    Uses a dynamic timestamp (current time) to prevent test rot — hardcoded
+    dates age out of retention/query windows and cause spurious failures."""
     return {
-        "start_ts": "2026-04-01T12:00:00+00:00",
+        "start_ts": datetime.now(timezone.utc).isoformat(),
         "start_db": 72.5,
         "peak_db": 72.5,
         "avg_db": 72.5,

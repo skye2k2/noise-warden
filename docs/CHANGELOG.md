@@ -12,7 +12,7 @@ To help ensure that we don't corrupt our analysis engine, these are the source s
 - cracking thunder: https://freesound.org/people/Erdie/sounds/23221/
 
 > [!WARNING]
-> WARNING: DO NOT USE YOUTUBE RECORDINGS--THEY TEND TO EXHIBIT THE EXACT _OPPOSITE_ OF REAL-LIFE FULL_SPECTRUM RECORDINGS.
+> WARNING: DO NOT USE YOUTUBE RECORDINGS--THEY TEND TO EXHIBIT THE EXACT _OPPOSITE_ OF REAL-LIFE FULL-SPECTRUM RECORDINGS.
 
 Past Bad Ideas:
 
@@ -21,7 +21,42 @@ Past Bad Ideas:
 
 Additionally, real-world recordings are saved in `tests/classification_data/` as version-controlled WAV files — empirical sources of truth decoupled from the incident database. These are replayed through the DSP pipeline during regression tests to prevent threshold changes from silently breaking known-good calibrations, and can seed a clean database for full reclassification after engine or filter changes without needing to manually re-record each sound type.
 
-## v14 - 2026-04-13 — "Noise Taxonomy Expansion"
+## v15 - 2026-05-15 — "We're Wasting Our Time! Edition"
+
+Post-mortem hardening from a 9-day OOM-kill outage (Apr 21–29), reclassify journal parity for engine-captured snippets, holdover breaker logic rework, storage cleanup for orphaned snippets, and discovery of a fundamental sample-rate mismatch between test clips (44100 Hz) and Pi recordings (22050 Hz) that had been silently skewing all filter threshold calibrations. An FFT-based `resample_audio()` utility was built but deferred pending a dedicated recalibration session — 9 of 15 regression clips change classification when normalized to 22050 Hz. Time-based test rot fixed with dynamic timestamps. Pi install script now ensures adequate swap. 571 tests passing, 0 failures.
+
+<details>
+
+### Reclassify parity / classification fidelity
+
+- **Lead-in / lead-out journal parity** — `analyze_clip()` now accepts `engine_captured=True` to mark preroll blocks as "lead-in" and post-trigger tail blocks as "lead-out" instead of DSP-classifying them as "unknown". Previously, reclassifying an engine-captured snippet would produce a different journal than the original detection: the preroll (typically 2 seconds of sub-threshold audio written from the ring buffer) was classified as "unknown" rather than "lead-in", and the post-trigger tail was similarly misclassified. Now both `reclassify_incident()` and `reclassify_all()` pass `engine_captured=True`, while standalone WAV analysis (regression tests, freesound clips) defaults to `False` for full end-to-end classification. Lead-in timestamps use negative values (e.g. `-2`) matching the engine's convention. "lead-in" and "lead-out" are added to the ignorable set in both `_compute_dominant()` and the engine's finalization, so they never influence the dominant classification. 7 new tests
+- **Holdover priority breaker improvements** — the `holdover_priority_breakers` mechanism now allows listed breaker filters to break through ANY non-breaker holdover, regardless of filter chain position. Previously, a breaker could only interrupt a *lower-priority* holdover (higher chain index), which prevented flyover (index 9) from breaking wind (index 4) holdover even when flyover's own min_history checks were satisfied. The new rule: if both the breaker and the holdover filter are in the breakers list, chain priority determines the winner; if only the incoming filter is a breaker, it wins unconditionally. This lets flyover break wind/conversation holdovers while preserving thunder's priority over flyover. Config comment updated to suggest adding `flyover` for environments with frequent aircraft traffic. 2 new tests (1 replaced)
+
+### Storage / cleanup
+
+- **Soft-delete now removes snippet files** — `soft_delete_incident()` previously only set `deleted=1` in the database, leaving the WAV file on disk. Now it also deletes the snippet (checking both the primary path and `autodismissed/` quarantine) and NULLs the `snippet_path` column. Prevents orphaned files from accumulating and wasting SD card space on the Pi. 3 new tests
+- **Purge orphaned incidents** — new `storage.purge_orphaned_incidents()` method NULLs `snippet_path` for non-deleted rows whose WAV file no longer exists on disk. Exposed via `python -m noise_warden.reclassify --purge-orphans` CLI flag. Addresses the issue where manual snippet deletion on the Pi left hundreds of stale DB references that `reclassify --all` reported as "skipped (no file)". Can be combined with `--all` for a clean reclassification run. 4 new tests
+
+### Documentation
+
+- **Pi file permissions troubleshooting** — added README section explaining EACCES errors when SSH users try to manage snippet files owned by the `noisewarden` system user, with `usermod -aG` and `chmod g+w` fixes, plus a note about using `--purge-orphans` after manual cleanup
+
+### Deployment stability (post-mortem from Apr 21-29 OOM-kill outage)
+
+- **systemd service hardening** — `StartLimitIntervalSec` and `StartLimitBurst` moved from `[Service]` to `[Unit]` where systemd 252 (Bookworm) actually reads them. Without this fix, the Pi had no restart rate-limiting — a crash loop would restart indefinitely at 10-second intervals. Added `MemoryHigh=512M` (soft limit, triggers kernel reclaim pressure) and `MemoryMax=1024M` (hard kill) to prevent runaway memory growth from reaching OOM-kill territory. Normal RSS is ~90-120 MB; the Apr 2026 outage reached 7.6 GB before the kernel intervened.
+- **Engine thread crash guard** — the engine's daemon thread is now wrapped in a try/except that catches unhandled exceptions, logs the crash, sets `mode="crashed"` on the state (so the dashboard shows the problem), then SIGTERMs the process so systemd can restart cleanly. Previously, a daemon-thread crash would leave the web server running indefinitely with stale state and no monitoring.
+- **Periodic RSS monitoring** — the engine now checks its own memory usage during the daily cleanup cycle. RSS is exposed to the dashboard state as `process_rss_mb`. At 350 MB, a warning is logged and shown in the UI. At 450 MB, the process self-terminates for a systemd restart — well below the 512 MB hard limit, avoiding OOM-kill journal noise and giving the process time to finalize cleanly.
+
+### Test fixes and sample-rate discovery
+
+- **Time-based test failures** — 3 tests (`test_timeline_embeds_incident_json`, `test_timeline_has_snippet_flag`, `test_keeps_recent_snippets`) used hardcoded April 2026 timestamps that aged past the 30-day retention/query windows. Fixed by using `datetime.now(timezone.utc)` in fixtures (`conftest.py::sample_incident`) and directly in `test_web.py`. These tests will no longer rot over time.
+- **Thunder-and-light-rain classification regression** — the holdover breaker change (breaker beats any non-breaker) interacted with `flyover` being listed as a breaker in the local config. At the test clips' native 44100 Hz sample rate, storm-rain ambient blocks have centroids 1919–2834 Hz that pass the flyover centroid check (min 1400). Previously, amplified_bass holdover (priority 3) suppressed these flyover matches (priority 9); with flyover as a breaker, it punched through unconditionally. Fixed by removing `flyover` from `holdover_priority_breakers` in the local config to match the deployed default config (`thunder` only). Flyover as a breaker should not be re-enabled until sample-rate normalization and regression recalibration are complete (see NEXT.md §5).
+- **Sample-rate mismatch discovered** — all 15 regression test WAVs are recorded at 44100 Hz, but the Pi captures at 22050 Hz. Spectral features (centroid, band ratios) are computed using the file's native sample rate, so threshold values tuned on test clips don't precisely match what the Pi encounters. This was the root cause of the flyover false positives. An FFT-based `resample_audio()` utility was added to `dsp.py` for future normalization, but enabling it in `analyze_clip` requires recalibrating all 15 regression clips at the canonical 22050 Hz rate (9 of 15 changed classification when resampled — too disruptive to apply without a dedicated calibration session).
+- **Swap sizing for Pi** — `scripts/install_pi.sh` now checks and resizes the swap file to 1024 MB if below that threshold, preventing pip install OOM failures on low-memory Pi boards.
+
+</details>
+
+## v14 - 2026-04-19 — "Noise Taxonomy Expansion"
 
 Two new exclusion filters (wind, flyover), engine-sound false positive fixes, and several quality-of-life improvements to incident recording and lifecycle management. 534 tests passing, 0 warnings.
 
@@ -100,15 +135,10 @@ Two new exclusion filters (wind, flyover), engine-sound false positive fixes, an
 ### DSP pipeline improvements
 
 - **Envelope variance penalty in `music_like_score()`** — mechanical drones (engines, mowers, compressors) maintain near-constant amplitude within a block (`envelope_cv < 0.10`), while music has dynamic amplitude modulation from rhythmic content (`envelope_cv 0.15–0.80`). When meaningful bass is present (`lowband > 0.15`) but the envelope is flat, the score is reduced by up to 20%. This catches the major false-positive pathway: steady mechanical rumble with moderate bass fooling the formula
-
 - **Harmonic series detection** — new `_compute_harmonic_ratio()` helper and `harmonic_ratio` field in `spectrum_features()`. Detects harmonic peaks at integer multiples of a fundamental in the 30–180 Hz band. Music bass (kick drum, bass guitar, synth bass) shows clear harmonic series; engine rumble is broadband. When `harmonic_ratio > 0.50`, `music_like_score()` receives a small bonus (up to +0.08), helping borderline music blocks cross the threshold
-
 - **`engine_noise` supercategory** — new classification returned by `_classify_sound()` (and mirrored in `reclassify.py`) when no exclusion filter matches but the spectral profile is clearly mechanical: either `midband > 0.50` (dominant engine-band energy), or steady bass without harmonics (`lowband > 0.10`, `envelope_cv < 0.10`, `harmonic_ratio < 0.40`). Added to `_IGNORABLE_CLASSES` in dominant calculation so it doesn't compete with specific filter matches (a 60-second recording with 50 seconds of engine_noise and 10 seconds of thunder should report "thunder", not "engine_noise"). Dashboard and incidents page tooltips updated
-
 - **Thunder Path B threshold relaxation** — `rumble_min_db` lowered from 95.0 to 40.0 dBA, `rumble_centroid_max` widened from 1300 to 1500 Hz. The 95 dBA floor was overly conservative — real thunder recordings at moderate distance or through windows peak at 60–80 dBA, far below the old threshold. The spectral criteria (centroid ≤ 1500, flatness ≤ 0.15, midband ≥ 0.40) are already highly discriminating on their own; very few non-thunder sounds have all three characteristics (mower flatness ≥ 0.25, engine flatness ≥ 0.25, rain is broadband). The wider centroid (1500 vs 1300) captures the rumble's decaying tail where centroid drifts up to ~1450 Hz — this extra headroom lets holdover activate (5 consecutive blocks), implementing de facto mutual exclusion with flyover (the two are physically exclusive events). Fixes thunder-cracks and thunder-and-light-rain regression test failures
-
 - **`mower-gas.wav` regression test marked pending** — pre-existing issue (not caused by v14 changes): block 34 (centroid 3920) has dBA 65.2, below `mower_min_db` of 70.0, so zero blocks match mower. Documented fix paths in test note: (a) lower `mower_min_db`, (b) raise `mower_centroid_max` to catch higher-dB blocks, or (c) both. Option (b) preferred. Added `xfail` handling for "pending" regression clips
-
 - 539 tests passing, 0 failures (1 xfailed pending, 1 xpassed pending)
 
 ### Reclassify --all journal awareness
@@ -118,16 +148,27 @@ Two new exclusion filters (wind, flyover), engine-sound false positive fixes, an
 ### Audio recording & playback
 
 - **Snippet normalization** (opt-in, `audio.snippet_normalize: true`) — USB microphones produce -30 to -50 dBFS for sounds that are 65+ dBA in real life (because `calibration_offset_db` of 100–115 maps the mic's full-scale digital signal to 100–115 dBA SPL). The resulting WAV files are nearly inaudible on consumer playback devices without cranking volume to maximum. When enabled, `_normalize_snippet()` runs after tail-trimming in `_finalize_incident()`: reads the WAV, computes peak, and applies a linear gain boost to reach the target peak (default -6 dBFS, standard broadcast headroom). Only boosts, never attenuates — recordings already at or above the target are left alone. All DSP measurements (dBA, classification, beat confidence, music score) are computed from the raw signal BEFORE normalization and are unaffected. New config keys: `snippet_normalize` (bool) and `snippet_normalize_peak_dbfs` (float)
-
 - **Playback volume boost** — user-adjustable 1x–5x gain selector in the incident detail popup, next to the `<audio>` controls. Implemented via WebAudio `MediaElementSource` → `GainNode` → `destination` chain (the native `<audio controls>` still handle play/pause/seek; the GainNode amplifies before speakers). Selection persists across popup opens via `sessionStorage`. Works alongside or independently of snippet normalization — use both for maximum audibility of quiet live recordings
-
 - **Batch snippet normalization via reclassify** — `--normalize` CLI flag added to `reclassify`. When passed alongside `--all`, normalizes every snippet WAV's peak amplitude after DSP analysis (so classification sees the original signal levels). Also works for single-incident reclassify (`reclassify 63 --normalize`). Uses `snippet_normalize_peak_dbfs` from config (default -6 dBFS). The `normalize_snippet()` function was extracted from `engine._normalize_snippet()` into `reclassify.py` as a standalone module-level function, and engine.py now imports it — eliminating the duplicate implementation. Return dict includes `normalized` count in batch mode; single-incident mode adds a `normalized` key to the result dict. 6 new tests (3 for `normalize_snippet`, 2 for reclassify-incident integration, 1 for nonexistent file handling)
-
 - **Self-adaptive spectral denoising** (opt-in, `audio.snippet_denoise: true`) — removes ambient background hiss ("seashore whoosh") from USB microphone recordings using per-snippet minimum-statistics noise estimation (Martin 1994 simplified). No manual noise profile capture needed. Algorithm: STFT the signal into overlapping windowed frames, estimate the noise floor as the Nth percentile (default 10th) of magnitudes per frequency bin across all frames, subtract with oversubtraction factor α and spectral floor β to prevent musical-noise artifacts, then inverse STFT with overlap-add. Runs in the pipeline after DSP analysis and tail trimming, BEFORE normalization — so classification uses the raw signal and gain boost amplifies clean audio, not amplified hiss. New config keys (all in `audio` section): `snippet_denoise` (bool), `denoise_percentile` (int, 0–100), `denoise_alpha` (float, oversubtraction), `denoise_beta` (float, spectral floor). Both `engine._finalize_incident()` and `reclassify` support it — batch via `--denoise` flag. 7 new tests (5 for `denoise_snippet`, 2 for reclassify-incident integration)
 
 ### Incident management
 
 - **Borderline auto-dismiss** (opt-in, `detection.record_borderline_events: false`) — incidents whose peak dB is within `borderline_margin_db` of the threshold are now auto-dismissed during finalization when this option is disabled. The incident is reclassified as 'borderline', marked excluded, and the snippet is quarantined to `autodismissed/` (same pattern as drive-by and too_short dismissals). Previously, borderline incidents were always recorded and only hidden in the timeline UI via a checkbox. This option lets the engine skip them entirely, keeping the incident log focused on clear violations. Default is `true` (record everything, as before). 3 new tests
+
+### Reclassify parity / classification fidelity
+
+- **Lead-in / lead-out journal parity** — `analyze_clip()` now accepts `engine_captured=True` to mark preroll blocks as "lead-in" and post-trigger tail blocks as "lead-out" instead of DSP-classifying them as "unknown". Previously, reclassifying an engine-captured snippet would produce a different journal than the original detection: the preroll (typically 2 seconds of sub-threshold audio written from the ring buffer) was classified as "unknown" rather than "lead-in", and the post-trigger tail was similarly misclassified. Now both `reclassify_incident()` and `reclassify_all()` pass `engine_captured=True`, while standalone WAV analysis (regression tests, freesound clips) defaults to `False` for full end-to-end classification. Lead-in timestamps use negative values (e.g. `-2`) matching the engine's convention. "lead-in" and "lead-out" are added to the ignorable set in both `_compute_dominant()` and the engine's finalization, so they never influence the dominant classification. 7 new tests
+- **Holdover priority breaker improvements** — the `holdover_priority_breakers` mechanism now allows listed breaker filters to break through ANY non-breaker holdover, regardless of filter chain position. Previously, a breaker could only interrupt a *lower-priority* holdover (higher chain index), which prevented flyover (index 9) from breaking wind (index 4) holdover even when flyover's own min_history checks were satisfied. The new rule: if both the breaker and the holdover filter are in the breakers list, chain priority determines the winner; if only the incoming filter is a breaker, it wins unconditionally. This lets flyover break wind/conversation holdovers while preserving thunder's priority over flyover. Config comment updated to suggest adding `flyover` for environments with frequent aircraft traffic. 2 new tests (1 replaced)
+
+### Storage / cleanup
+
+- **Soft-delete now removes snippet files** — `soft_delete_incident()` previously only set `deleted=1` in the database, leaving the WAV file on disk. Now it also deletes the snippet (checking both the primary path and `autodismissed/` quarantine) and NULLs the `snippet_path` column. Prevents orphaned files from accumulating and wasting SD card space on the Pi. 3 new tests
+- **Purge orphaned incidents** — new `storage.purge_orphaned_incidents()` method NULLs `snippet_path` for non-deleted rows whose WAV file no longer exists on disk. Exposed via `python -m noise_warden.reclassify --purge-orphans` CLI flag. Addresses the issue where manual snippet deletion on the Pi left hundreds of stale DB references that `reclassify --all` reported as "skipped (no file)". Can be combined with `--all` for a clean reclassification run. 4 new tests
+
+### Documentation
+
+- **Pi file permissions troubleshooting** — added README section explaining EACCES errors when SSH users try to manage snippet files owned by the `noisewarden` system user, with `usermod -aG` and `chmod g+w` fixes, plus a note about using `--purge-orphans` after manual cleanup
 
 </details>
 

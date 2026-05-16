@@ -53,7 +53,7 @@ detection:
   # stop/restart gaps from fragmenting into unknown/impulse journal entries.
   holdover_min_run: 5                 # Minimum consecutive blocks to establish a filter
   holdover_max_gap: 12                # Maximum unmatched blocks before holdover expires
-  holdover_priority_breakers: thunder # Comma-separated filters that can break lower-priority holdovers
+  holdover_priority_breakers: thunder # Comma-separated filters that can break active holdovers. Flyover can be added here to prevent wind from superseding flyover detections (e.g. "thunder, flyover").
   # Thunder targeting: two detection paths for very different storm signatures.
   # Path A (sharp cracks): single-block 18+ dB spike with dominant bass (lowband > 0.55)
   # and broadband energy (flatness > 0.45). Path B (sustained rumble): low centroid
@@ -197,7 +197,7 @@ detection:
   # firing cycle, but is caught by its own filter earlier in the chain.
   flyover_flatness_min: 0.15           # Above pure-tone diesel (≤ 0.20), below broadband rain
   flyover_flatness_max: 0.55           # Below rain/mower broadband ceiling
-  flyover_centroid_min_hz: 1400       # Engine fundamentals — real plane 2508+
+  flyover_centroid_min_hz: 1400       # Real plane 2508+, vehicle accel 2300+; raised from 1400 to exclude storm-rain ambient (1400–1831)
   flyover_centroid_max_hz: 12000      # Doppler-shifted flyovers at distance — real plane up to 10631
   flyover_midband_min: 0.15           # Engine energy indicator — real plane median 0.31
   flyover_lowband_min: 0.10           # Engine rumble — real plane 0.16+; separates from mower (0.02–0.06)

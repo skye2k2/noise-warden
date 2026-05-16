@@ -67,6 +67,62 @@ class TestSoftDelete:
         rows = tmp_storage.list_incidents()
         assert all(r["id"] != iid for r in rows)
 
+    def test_soft_delete_removes_snippet_file(self, tmp_storage, tmp_path, sample_incident):
+        """Soft-deleting an incident should remove its snippet WAV from disk
+        and NULL out snippet_path in the DB (prevents orphaned files)."""
+        snippets_dir = str(tmp_path / "snippets")
+        os.makedirs(snippets_dir)
+        snippet_file = os.path.join(snippets_dir, "incident_1.wav")
+        with open(snippet_file, "wb") as f:
+            f.write(b"RIFF" + b"\x00" * 40)
+
+        row = dict(sample_incident)
+        row["snippet_path"] = snippet_file
+        iid = tmp_storage.create_incident(row)
+        tmp_storage.finalize_incident(iid, "2026-04-01T12:05:00+00:00", 30, 75.0, 72.0, snippet_file)
+
+        tmp_storage.soft_delete_incident(iid)
+
+        # File should be removed from disk
+        assert not os.path.exists(snippet_file)
+
+        # snippet_path should be NULLed in DB (even though row is soft-deleted,
+        # check via raw query to bypass the deleted=0 filter)
+        import sqlite3
+        c = sqlite3.connect(str(tmp_path / "test.db"))
+        c.row_factory = sqlite3.Row
+        row = c.execute("SELECT snippet_path, deleted FROM incidents WHERE id=?", (iid,)).fetchone()
+        c.close()
+        assert row["deleted"] == 1
+        assert row["snippet_path"] is None
+
+    def test_soft_delete_removes_autodismissed_snippet(self, tmp_storage, tmp_path, sample_incident):
+        """Soft-delete should find and remove snippet from autodismissed/ too."""
+        snippets_dir = str(tmp_path / "snippets")
+        quarantine = os.path.join(snippets_dir, "autodismissed")
+        os.makedirs(quarantine)
+        # The snippet_path points to the original location, but the actual
+        # file was moved to autodismissed/ by the engine
+        orig_path = os.path.join(snippets_dir, "incident_1.wav")
+        quarantined_path = os.path.join(quarantine, "incident_1.wav")
+        with open(quarantined_path, "wb") as f:
+            f.write(b"RIFF" + b"\x00" * 40)
+
+        row = dict(sample_incident)
+        row["snippet_path"] = orig_path
+        iid = tmp_storage.create_incident(row)
+        tmp_storage.finalize_incident(iid, "2026-04-01T12:05:00+00:00", 30, 75.0, 72.0, orig_path)
+
+        tmp_storage.soft_delete_incident(iid)
+
+        assert not os.path.exists(quarantined_path)
+
+    def test_soft_delete_without_snippet_is_safe(self, tmp_storage, sample_incident):
+        """Soft-deleting an incident with no snippet_path should not error."""
+        iid = tmp_storage.create_incident(sample_incident)
+        tmp_storage.soft_delete_incident(iid)
+        assert tmp_storage.get_incident(iid) is None
+
     def test_soft_delete_all(self, tmp_storage, sample_incident):
         for _ in range(5):
             tmp_storage.create_incident(sample_incident)
@@ -378,6 +434,64 @@ class TestAutodismissedCleanup:
         assert removed == 1
         assert not os.path.exists(old_file)
         assert os.path.exists(new_file)
+
+
+# ---------------------------------------------------------------------------
+# Purge orphaned incidents
+# ---------------------------------------------------------------------------
+
+class TestPurgeOrphans:
+
+    def test_nulls_snippet_path_for_missing_files(self, tmp_storage, sample_incident):
+        """Rows referencing a nonexistent WAV should have snippet_path NULLed."""
+        row = dict(sample_incident)
+        row["snippet_path"] = "/nonexistent/path/to/snippet.wav"
+        iid = tmp_storage.create_incident(row)
+        tmp_storage.finalize_incident(iid, "2026-04-01T12:05:00+00:00", 30, 75.0, 72.0,
+                                      "/nonexistent/path/to/snippet.wav")
+
+        count = tmp_storage.purge_orphaned_incidents()
+        assert count == 1
+
+        inc = tmp_storage.get_incident(iid)
+        assert inc["snippet_path"] is None
+
+    def test_leaves_existing_files_alone(self, tmp_storage, tmp_path, sample_incident):
+        """Rows referencing an existing WAV should not be touched."""
+        snippet_file = str(tmp_path / "existing.wav")
+        with open(snippet_file, "wb") as f:
+            f.write(b"RIFF" + b"\x00" * 40)
+
+        row = dict(sample_incident)
+        row["snippet_path"] = snippet_file
+        iid = tmp_storage.create_incident(row)
+        tmp_storage.finalize_incident(iid, "2026-04-01T12:05:00+00:00", 30, 75.0, 72.0,
+                                      snippet_file)
+
+        count = tmp_storage.purge_orphaned_incidents()
+        assert count == 0
+
+        inc = tmp_storage.get_incident(iid)
+        assert inc["snippet_path"] == snippet_file
+
+    def test_skips_null_snippet_path(self, tmp_storage, sample_incident):
+        """Rows with NULL snippet_path should not be counted as orphaned."""
+        tmp_storage.create_incident(sample_incident)
+
+        count = tmp_storage.purge_orphaned_incidents()
+        assert count == 0
+
+    def test_skips_deleted_rows(self, tmp_storage, sample_incident):
+        """Soft-deleted rows should be ignored even if their files are missing."""
+        row = dict(sample_incident)
+        row["snippet_path"] = "/nonexistent/path/to/snippet.wav"
+        iid = tmp_storage.create_incident(row)
+        tmp_storage.finalize_incident(iid, "2026-04-01T12:05:00+00:00", 30, 75.0, 72.0,
+                                      "/nonexistent/path/to/snippet.wav")
+        tmp_storage.soft_delete_incident(iid)
+
+        count = tmp_storage.purge_orphaned_incidents()
+        assert count == 0
 
 
 # ---------------------------------------------------------------------------

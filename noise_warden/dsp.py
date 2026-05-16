@@ -51,6 +51,56 @@ def dba_estimate(dbfs: float, calibration_offset_db: float) -> float:
     """
     return dbfs + calibration_offset_db
 
+def resample_audio(data, orig_sr, target_sr):
+    """Resample audio to a target sample rate using FFT (sinc interpolation).
+
+    Normalizes audio to a canonical sample rate before spectral feature
+    extraction, ensuring that centroid, flatness, and band-ratio thresholds
+    remain consistent regardless of the source file's native rate.
+
+    This is the same algorithm as scipy.signal.resample (Fourier method):
+    FFT → truncate or zero-pad frequency domain → IFFT. For integer-ratio
+    conversions (e.g. 44100→22050, a 2:1 downsample), this is mathematically
+    exact. For arbitrary ratios, quality is still excellent for classification
+    features — we're not targeting audiophile playback.
+
+    Downsampling naturally anti-aliases by discarding frequency bins above
+    the new Nyquist. No separate low-pass filter is needed.
+
+    Args:
+        data: 1-D numpy float32 array of audio samples.
+        orig_sr: source sample rate in Hz.
+        target_sr: desired sample rate in Hz.
+
+    Returns:
+        Resampled 1-D numpy array. Returns the original array unchanged
+        if orig_sr == target_sr.
+    """
+    if orig_sr == target_sr:
+        return data
+
+    target_len = int(round(len(data) * target_sr / orig_sr))
+    freq = np.fft.rfft(data)
+    target_freq_len = target_len // 2 + 1
+
+    if target_freq_len <= len(freq):
+        # Downsampling: truncate high-frequency bins above new Nyquist
+        new_freq = freq[:target_freq_len]
+    else:
+        # Upsampling: zero-pad (adds silent high-frequency bins)
+        new_freq = np.zeros(target_freq_len, dtype=freq.dtype)
+        new_freq[:len(freq)] = freq
+
+    result = np.fft.irfft(new_freq, n=target_len)
+
+    # Scale amplitude to compensate for the change in FFT length.
+    # Without this, downsampled signals would be quieter and upsampled
+    # signals louder, skewing dB calculations.
+    result *= target_len / len(data)
+
+    return result.astype(np.float32)
+
+
 def _compute_harmonic_ratio(low_mag, low_freqs):
     """Compute fraction of low-band energy concentrated at harmonic peaks.
 
@@ -84,7 +134,6 @@ def _compute_harmonic_ratio(low_mag, low_freqs):
         harmonic += fundamental
 
     return min(1.0, harmonic_energy / (total_energy + 1e-12))
-
 
 def spectrum_features(arr: np.ndarray, sr: int):
     """Extract spectral features from a single audio block.
@@ -214,7 +263,6 @@ def _inter_block_beat_confidence(db_history):
         best = max(best, corr)
     return max(0.0, min(1.0, best))
 
-
 def intra_block_beat_confidence(block, sr):
     """Detect rhythmic beat patterns within a single audio block.
 
@@ -288,7 +336,6 @@ def intra_block_beat_confidence(block, sr):
         best = max(best, corr)
 
     return max(0.0, min(1.0, best))
-
 
 def beat_confidence(block, sr, db_history):
     """Beat confidence from intra-block rhythm analysis.
@@ -478,7 +525,6 @@ def looks_like_thunder(features, db_now, db_prev, delta_threshold,
 
     return False
 
-
 def looks_like_amplified_bass(features, recent_db, min_music_score=0.45,
                               lowband_min=0.16, centroid_max=4000.0,
                               env_std_max=3.0, min_history=6, window=12,
@@ -571,7 +617,6 @@ def looks_like_amplified_bass(features, recent_db, min_music_score=0.45,
         features["centroid_hz"] <= centroid_max and
         env_std <= env_std_max
     )
-
 
 def looks_like_rain(features, recent_db, flatness_threshold, variance_db,
                     min_history=6, window=12, lowband_min=0.07,
@@ -702,7 +747,6 @@ def looks_like_wind(features, recent_db, flatness_min=0.30,
         highband_min <= features["highband_ratio"] <= highband_max and
         env_std <= env_std_max
     )
-
 
 def looks_like_mower(features, recent_db, flatness_threshold, cmin, cmax,
                      env_std_max=4.5, min_history=6, window=12, min_db=70.0,
@@ -1068,8 +1112,11 @@ def looks_like_flyover(features, recent_db, flatness_min=0.15,
         recent_db: last N dB readings
         flatness_min: minimum spectral flatness (default 0.15 — above pure-tone diesel)
         flatness_max: maximum spectral flatness (default 0.55 — below broadband rain)
-        centroid_min: minimum centroid Hz (default 1400 — engine fundamentals;
-            raised from 1200 to avoid stealing conversation blocks at centroid ≤1200)
+        centroid_min: minimum centroid Hz (default 1400 — real plane min 2508
+            at 22050 Hz. Threshold is sample-rate dependent; analyze_clip
+            resamples source audio to the config sample rate before feature
+            extraction, ensuring this value works consistently regardless
+            of the source file's native rate)
         centroid_max: maximum centroid Hz (default 12000 — Doppler-shifted flyovers)
         midband_min: minimum midband_ratio (default 0.15 — engine energy indicator)
         lowband_min: minimum lowband_ratio (default 0.10 — some engine bass;
@@ -1107,7 +1154,6 @@ def looks_like_flyover(features, recent_db, flatness_min=0.15,
         features["highband_ratio"] <= highband_max and
         env_std <= env_std_max
     )
-
 
 def looks_like_conversation(features, recent_db, centroid_min=500.0,
                             centroid_max=2500.0, lowband_max=0.35,
@@ -1391,7 +1437,6 @@ def _check_conversation(features, db_history, db_now, prev_db, det, feature_hist
         db_now=db_now,
     )
 
-
 # Priority-ordered filter chain. More specific patterns first, broadest last.
 # Thunder before impulse (thunder IS an impulse, but more descriptive).
 # Birdsong before weedwhacker (birdsong is more specific high-freq pattern).
@@ -1424,7 +1469,6 @@ FILTER_CHAIN = [
 # during a mower holdover, thunder wins because it's more specific and its own
 # internal checks (Path B min_history, etc.) are already satisfied.
 FILTER_PRIORITY = {name: idx for idx, (name, _) in enumerate(FILTER_CHAIN)}
-
 
 def identify_filter(features, db_history, db_now, prev_db, detection_cfg,
                     feature_history=None, beat_confidence=None):
@@ -1461,7 +1505,6 @@ def identify_filter(features, db_history, db_now, prev_db, detection_cfg,
             return name
 
     return None
-
 
 def apply_filter_holdover(raw_filter, prev_filter, prev_run, gap, detection_cfg):
     """Apply holdover logic to a raw filter result from identify_filter().
@@ -1509,11 +1552,15 @@ def apply_filter_holdover(raw_filter, prev_filter, prev_run, gap, detection_cfg)
     # Case 2: holdover is active — persist through gaps and transient blips
     # (e.g., a brief impulse during a sustained mower run).
     # HOWEVER, filters listed in holdover_priority_breakers can break through
-    # a lower-priority holdover. These are filters with strong internal
-    # consistency guarantees (e.g., thunder Path B requires min_history blocks
-    # of sustained matching) that should not be suppressed by a less-specific
-    # holdover. The check also requires higher priority (earlier in
-    # FILTER_CHAIN) to prevent, say, conversation from overriding mower.
+    # an active holdover. These are filters with strong internal consistency
+    # guarantees (e.g., thunder Path B requires min_history blocks of sustained
+    # matching, flyover requires 4+ blocks) that should not be suppressed by
+    # an unrelated holdover. The breaker's own internal checks serve as the
+    # quality gate. Two constraints apply:
+    #   1. If the current holdover filter is ALSO a breaker AND higher-priority,
+    #      it wins — this prevents flyover from breaking thunder's holdover
+    #      while still allowing flyover to break wind's holdover.
+    #   2. A breaker never "breaks" its own holdover (same filter = extend run).
     if holdover_active:
         if raw_filter is not None:
             breakers_str = detection_cfg.get(
@@ -1522,10 +1569,17 @@ def apply_filter_holdover(raw_filter, prev_filter, prev_run, gap, detection_cfg)
             breakers = {
                 b.strip() for b in str(breakers_str).split(",") if b.strip()
             }
-            if raw_filter in breakers:
-                raw_pri = FILTER_PRIORITY.get(raw_filter, len(FILTER_CHAIN))
-                prev_pri = FILTER_PRIORITY.get(prev_filter, len(FILTER_CHAIN))
-                if raw_pri < prev_pri:
+            if raw_filter in breakers and raw_filter != prev_filter:
+                # If the holdover filter is also a breaker, only let the
+                # higher-priority (lower index) breaker win.
+                if prev_filter in breakers:
+                    raw_pri = FILTER_PRIORITY.get(raw_filter, len(FILTER_CHAIN))
+                    prev_pri = FILTER_PRIORITY.get(prev_filter, len(FILTER_CHAIN))
+                    if raw_pri < prev_pri:
+                        return (raw_filter, raw_filter, 1, 0)
+                else:
+                    # Holdover filter is NOT a breaker — the incoming breaker
+                    # wins regardless of priority (flyover breaks wind, etc.)
                     return (raw_filter, raw_filter, 1, 0)
 
         return (prev_filter, prev_filter, prev_run, gap + 1)
@@ -1536,7 +1590,6 @@ def apply_filter_holdover(raw_filter, prev_filter, prev_run, gap, detection_cfg)
 
     # Case 4: nothing matches, no holdover
     return (None, None, 0, 0)
-
 
 # Default detection latency (min_history) for each filter. Path A thunder and
 # impulse are instant detectors (0), but thunder Path B requires min_history
@@ -1562,7 +1615,6 @@ _FILTER_LATENCY_CONFIG_KEYS = {
     "thunder": "thunder_rumble_min_history",
     "wind": "wind_min_history",
 }
-
 
 def get_filter_detection_latency(filter_name, detection_cfg):
     """Return the detection latency (in blocks) for a given filter.

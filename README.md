@@ -219,6 +219,22 @@ Key invariants:
 
 **TLS certificate warning won't go away / pages not caching on phone** — the self-signed TLS certificate must be accepted in the browser for the Service Worker (and thus offline caching) to function. On iOS Safari, you may need to go to Settings → General → About → Certificate Trust Settings and enable the certificate. On Android Chrome, tapping "Advanced" → "Proceed" on the warning page is sufficient. If you regenerate the certificate (delete `/opt/noise-warden/tls/` and re-run `install_pi.sh`), you'll need to accept the new cert on all devices again.
 
+**EACCES permission denied when deleting snippets via SSH** — files under `/opt/noise-warden/shared/` are owned by the `noisewarden` system user. Your SSH user can't modify them by default. Fix: add your SSH user to the `noisewarden` group, then log out and back in for the group change to take effect:
+
+```bash
+sudo usermod -aG noisewarden $(whoami)
+# Log out and SSH back in, then verify:
+groups  # should list "noisewarden"
+```
+
+If the directory permissions are still too restrictive (owner-only), update them to allow group write access:
+
+```bash
+sudo chmod -R g+w /opt/noise-warden/shared/snippets/
+```
+
+Alternatively, use the web UI to delete incidents — it runs as the `noisewarden` user and has full access. To clean up stale database references after manually deleting snippet files, run `python -m noise_warden.reclassify --purge-orphans`.
+
 </details>
 
 ### Iterative Upgrade (the actual workflow)
@@ -477,6 +493,12 @@ python -m noise_warden.reclassify --all --normalize
 # Combine: reclassify + denoise + normalize + write changes back
 python -m noise_warden.reclassify --all --update --denoise --normalize
 
+# Clean up stale DB references after manually deleting snippet files
+python -m noise_warden.reclassify --purge-orphans
+
+# Purge orphans then reclassify all remaining snippets
+python -m noise_warden.reclassify --purge-orphans --all
+
 # Use a specific config file (defaults to local config if present)
 python -m noise_warden.reclassify 63 -c config/noise_warden.yaml
 ```
@@ -535,6 +557,218 @@ pytest tests/ -v -s
 
 </details>
 
+## Troubleshooting Triage
+
+<details>
+
+When the web interface becomes unreachable, SSH into the Pi and run these commands in order. Each section builds on the previous — start at the top and stop when you find the problem.
+
+### T.1 — Is the Pi alive and reachable?
+
+```bash
+# From another machine on the network:
+ping 192.168.13.5                    # Replace with your Pi's IP
+ssh username@192.168.13.5           # If ping fails, power-cycle the Pi
+
+# If SSH works but web doesn't, the service is likely down — continue below
+```
+
+### T.2 — Is the noise-warden service running?
+
+```bash
+sudo systemctl status noise-warden
+# Look for: Active: active (running) vs. failed/inactive/dead
+
+# If "failed" — check why it failed:
+sudo systemctl show noise-warden -p ActiveState,SubState,Result,ExecMainStatus,NRestarts
+# Result=signal + ExecMainStatus=9 → OOM killed
+# Result=exit-code → application crash (check logs)
+# NRestarts shows how many times systemd has restarted it this boot
+
+# If the service hit its restart limit ("start request repeated too quickly"):
+sudo systemctl reset-failed noise-warden
+sudo systemctl start noise-warden
+```
+
+### T.3 — Check the service logs
+
+```bash
+# Recent logs (last 100 lines):
+sudo journalctl -u noise-warden --no-pager -n 100
+
+# Logs since last boot:
+sudo journalctl -u noise-warden -b 0 --no-pager | tail -60
+
+# Logs from a specific time window:
+sudo journalctl -u noise-warden --since "2026-04-25 20:00" --until "2026-04-30" --no-pager
+
+# Follow live logs:
+sudo journalctl -u noise-warden -f
+
+# All error-level messages from the current boot:
+sudo journalctl -b 0 -p err --no-pager | tail -40
+```
+
+### T.4 — Check for OOM kills
+
+```bash
+# Kernel OOM events (current boot):
+sudo dmesg | grep -i "oom\|killed process\|out of memory"
+
+# Historical OOM events across boots:
+sudo journalctl -k --no-pager --grep "oom_kill\|Out of memory\|Killed process" | tail -20
+
+# Check current memory pressure:
+free -h
+cat /proc/meminfo | head -10
+
+# Check the noise-warden process specifically:
+ps aux | grep uvicorn
+# Look at RSS column — normal is ~90-120 MB. If it's 500+ MB, there's a leak.
+
+# Detailed process memory breakdown:
+ps -p $(pgrep -f "uvicorn.*noise_warden") -o pid,rss,vsz,etime,pcpu,pmem
+```
+
+### T.5 — Check boot history (was there a crash/reboot?)
+
+```bash
+# List all boots — gaps in timestamps reveal unplanned shutdowns:
+sudo journalctl --list-boots --no-pager
+
+# Check the previous boot's final messages:
+sudo journalctl -b -1 --no-pager | tail -30
+
+# System uptime:
+uptime
+
+# Last shutdown/reboot events:
+last reboot | head -5
+last shutdown | head -5
+```
+
+### T.6 — Check thermal status
+
+```bash
+# Current CPU temperature:
+vcgencmd measure_temp
+# Normal: 50-70°C. Throttling starts at 75°C.
+
+# Has the Pi throttled (current or historical)?
+vcgencmd get_throttled
+# 0x0  = no throttling ever
+# 0x1  = currently under-voltage
+# 0x2  = currently ARM frequency capped
+# 0x4  = currently throttled
+# 0x8  = soft temperature limit active
+# Bits 16-19 are the same flags but indicate "has occurred since boot"
+# e.g. 0x50000 = throttling has occurred since boot but not currently active
+
+# Kernel thermal trip points:
+for t in /sys/class/thermal/thermal_zone0/trip_point_*_temp; do
+  idx=$(echo $t | grep -oP 'trip_point_\K\d+')
+  echo "Trip $idx: $(cat $t)m°C ($(cat /sys/class/thermal/thermal_zone0/trip_point_${idx}_type))"
+done
+
+# Current CPU frequency (should be 1500000 or 2400000 on Pi 5):
+cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq
+```
+
+### T.7 — Check network connectivity
+
+```bash
+# Interface status:
+ip addr show | grep -E "inet |state"
+# wlan0 should show state UP with an IP address
+# eth0 state DOWN/NO-CARRIER means no cable
+
+# WiFi signal strength:
+iw wlan0 link
+# Look for "signal:" — below -70 dBm is weak, below -80 dBm is unreliable
+
+# WiFi power saving (should be off for reliability):
+iw wlan0 get power_save
+
+# NetworkManager status and recent events:
+nmcli general status
+nmcli connection show --active
+
+# Recent WiFi disconnection events:
+sudo journalctl -b 0 --no-pager --grep "wlan0.*link timed out\|association\|disconnect" | tail -10
+```
+
+### T.8 — Check disk space and database health
+
+```bash
+# Filesystem usage:
+df -h /
+
+# Swap status:
+swapon --show
+
+# Snippet directory size:
+du -sh /opt/noise-warden/shared/snippets/
+
+# Database size and integrity:
+ls -lh /opt/noise-warden/shared/noise_warden.db
+sqlite3 /opt/noise-warden/shared/noise_warden.db "PRAGMA integrity_check;"
+sqlite3 /opt/noise-warden/shared/noise_warden.db "SELECT COUNT(*) FROM incidents;"
+sqlite3 /opt/noise-warden/shared/noise_warden.db "SELECT COUNT(*) FROM incidents WHERE end_ts IS NULL;"
+# ^ Non-zero means stale incidents from a crash (engine repairs these on startup)
+```
+
+### T.9 — Check systemd resource limits and service configuration
+
+```bash
+# Memory and restart limits applied to the service:
+systemctl show noise-warden -p MemoryMax,MemoryHigh,MemoryCurrent,RestartUSec,NRestarts,StartLimitIntervalUSec,StartLimitBurst,OOMPolicy
+
+# Full service status with recent log excerpt:
+systemctl status noise-warden -l --no-pager
+
+# Is the service enabled to start on boot?
+systemctl is-enabled noise-warden
+```
+
+### T.10 — Emergency recovery commands
+
+```bash
+# If the service is in "failed" state and won't start:
+sudo systemctl reset-failed noise-warden
+sudo systemctl start noise-warden
+
+# If the service starts but immediately crashes (check logs first!):
+# Validate the config file:
+python3 -c "import yaml; yaml.safe_load(open('/opt/noise-warden/current/config/noise_warden.yaml'))"
+
+# If the symlink is broken:
+ls -la /opt/noise-warden/current
+# Fix with: sudo ln -sfn /opt/noise-warden/noise-warden-v14 /opt/noise-warden/current
+
+# If audio device is missing/changed:
+python3 -c "import sounddevice; print(sounddevice.query_devices())"
+
+# Manual start (bypasses systemd, useful for debugging):
+cd /opt/noise-warden/current
+sudo -u noisewarden /opt/noise-warden/venv/bin/uvicorn noise_warden.main:app \
+  --host 0.0.0.0 --port 8787 \
+  --ssl-certfile /opt/noise-warden/tls/cert.pem \
+  --ssl-keyfile /opt/noise-warden/tls/key.pem
+
+# If nothing works — check the TLS certificate:
+openssl x509 -in /opt/noise-warden/tls/cert.pem -noout -dates
+# Self-signed certs can expire; browsers reject expired certs silently
+```
+
+### T.11 — Quick health check one-liner
+
+```bash
+# Paste this for a full snapshot of system and service health:
+echo "=== SERVICE ===" && sudo systemctl status noise-warden --no-pager -l | head -15 && echo "=== MEMORY ===" && free -h && echo "=== PROCESS ===" && ps -p $(pgrep -f "uvicorn.*noise_warden" || echo 1) -o pid,rss,vsz,etime,pcpu,pmem 2>/dev/null || echo "NOT RUNNING" && echo "=== TEMP ===" && vcgencmd measure_temp && echo "=== THROTTLE ===" && vcgencmd get_throttled && echo "=== DISK ===" && df -h / | tail -1 && echo "=== NETWORK ===" && iw wlan0 link 2>/dev/null | grep -E "signal|SSID" && echo "=== UPTIME ===" && uptime
+```
+
+</details>
+
 ## Notes on legal / practical reality
 
 - My local noise ordinance says measurements should align to ANSI Type 1/2 instruments, but this is **not** one. The code mirrors the *logic* (A-weighted, slow/fast behavior, day/night thresholds) but is _not_ certification-grade.
@@ -576,6 +810,7 @@ Add to crontab (`crontab -e`):
 - TODO: The yaml configuration has some odd sorting and grouping, like which things are put under `audio` versus `detection`. I might change `audio` to `recording`, and move things like `noise_floor_db` and `calibration_offset_db` into it.
 - TODO: Make sure that the system will function the same with 48kHz sampling and recording.
 - TODO: Under windy conditions, that portion of the attic has a few locations that creak/rattle. Shim/reattach/glue/foam insulate as best as possible.
+- TODO: It also feels that the reclassifying did not _actually_ reclassify the data...denoise, normalize, re-journal. Because manually clicking re-analyze still had changes it would apply, despite the batch job having run. Pick one from the second page that I did not already click through to manually reclassify on, download it, and compare to the original download from 2026-04-19.
 - TODO: Add instruction to (right-click on the player and select "Save Audio as..." to export audio)
 - TODO: The backup job that is recommneded is just the database--if you want the _data_, you also need to grab the snippets directory. And if you are just connected to the webapp, you may just want to "download all", instead of clicking into each to right-click-and-save-as individually.
 - TODO: In music-detection mode, have the ability to drop everything _except_ unknown and music

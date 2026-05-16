@@ -602,3 +602,96 @@ class TestReclassifyIncidentDenoise:
         # File should be unchanged
         new_data, _ = sf.read(wav_path, dtype="float32")
         assert np.array_equal(orig_data, new_data)
+
+
+# ---------------------------------------------------------------------------
+# Lead-in / lead-out parity with engine
+# ---------------------------------------------------------------------------
+
+class TestAnalyzeClipLeadInOut:
+    """Verify that engine_captured=True marks preroll and post-trigger blocks."""
+
+    def test_engine_captured_adds_lead_in(self, tmp_path):
+        """With engine_captured=True and snippet_pre_seconds=2, the first 2
+        blocks should be classified as 'lead-in', not run through the DSP."""
+        wav_path = str(tmp_path / "test.wav")
+        # 10 blocks total: 2 lead-in + 5 body + 3 lead-out
+        _write_wav(wav_path, _make_noise(10))
+
+        audio_cfg = {**_minimal_audio_cfg(), "snippet_pre_seconds": 2, "snippet_post_seconds": 3}
+        result = analyze_clip(wav_path, _minimal_detection_cfg(), audio_cfg, engine_captured=True)
+
+        # First two blocks should be lead-in
+        assert result["blocks"][0]["classification"] == "lead-in"
+        assert result["blocks"][1]["classification"] == "lead-in"
+        # Body blocks should NOT be lead-in
+        assert result["blocks"][2]["classification"] != "lead-in"
+
+    def test_engine_captured_adds_lead_out(self, tmp_path):
+        """With engine_captured=True and snippet_post_seconds=3, the last 3
+        blocks should be classified as 'lead-out'."""
+        wav_path = str(tmp_path / "test.wav")
+        _write_wav(wav_path, _make_noise(10))
+
+        audio_cfg = {**_minimal_audio_cfg(), "snippet_pre_seconds": 2, "snippet_post_seconds": 3}
+        result = analyze_clip(wav_path, _minimal_detection_cfg(), audio_cfg, engine_captured=True)
+
+        # Last 3 blocks are lead-out
+        assert result["blocks"][-1]["classification"] == "lead-out"
+        assert result["blocks"][-2]["classification"] == "lead-out"
+        assert result["blocks"][-3]["classification"] == "lead-out"
+        # Body block before lead-out should NOT be lead-out
+        assert result["blocks"][-4]["classification"] != "lead-out"
+
+    def test_engine_captured_journal_has_negative_lead_in(self, tmp_path):
+        """Lead-in journal entry should use a negative timestamp (like the
+        engine's convention) so journals compare correctly."""
+        wav_path = str(tmp_path / "test.wav")
+        _write_wav(wav_path, _make_noise(10))
+
+        audio_cfg = {**_minimal_audio_cfg(), "snippet_pre_seconds": 2, "snippet_post_seconds": 3}
+        result = analyze_clip(wav_path, _minimal_detection_cfg(), audio_cfg, engine_captured=True)
+
+        # First journal entry should be lead-in with a negative timestamp
+        assert result["journal"][0][1] == "lead-in"
+        assert result["journal"][0][0] < 0
+
+    def test_default_no_lead_in_lead_out(self, tmp_path):
+        """Without engine_captured=True, no blocks should be lead-in/lead-out
+        even when snippet_pre/post_seconds are configured."""
+        wav_path = str(tmp_path / "test.wav")
+        _write_wav(wav_path, _make_noise(10))
+
+        audio_cfg = {**_minimal_audio_cfg(), "snippet_pre_seconds": 2, "snippet_post_seconds": 3}
+        result = analyze_clip(wav_path, _minimal_detection_cfg(), audio_cfg)
+
+        for block in result["blocks"]:
+            assert block["classification"] not in ("lead-in", "lead-out")
+
+    def test_lead_in_excluded_from_dominant(self):
+        """lead-in and lead-out are structural bookends — they should be
+        completely invisible to the dominant classification. A journal with
+        only mower plus bookends should return plain 'mower', not 'mower+'."""
+        journal = [(-5, "lead-in"), (0, "mower"), (50, "lead-out")]
+        result = _compute_dominant(journal, 55)
+        assert result == "mower"
+
+    def test_lead_in_lead_out_clamped_when_too_large(self, tmp_path):
+        """If pre+post >= clip length, both revert to 0 (full DSP analysis)."""
+        wav_path = str(tmp_path / "test.wav")
+        # Only 3 blocks, but pre+post want 5
+        _write_wav(wav_path, _make_noise(3))
+
+        audio_cfg = {**_minimal_audio_cfg(), "snippet_pre_seconds": 2, "snippet_post_seconds": 3}
+        result = analyze_clip(wav_path, _minimal_detection_cfg(), audio_cfg, engine_captured=True)
+
+        # Should have no lead-in/lead-out since they'd consume the whole clip
+        for block in result["blocks"]:
+            assert block["classification"] not in ("lead-in", "lead-out")
+
+    def test_unknown_still_produces_plus_suffix(self):
+        """Unknown blocks (genuinely ambiguous audio) should still trigger the
+        '+' suffix — only structural bookends are invisible."""
+        journal = [(0, "unknown"), (5, "mower")]
+        result = _compute_dominant(journal, 60)
+        assert result == "mower+"

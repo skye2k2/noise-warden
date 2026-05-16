@@ -2240,16 +2240,31 @@ class TestFilterHoldover:
         assert pr == 10  # unchanged
         assert g == 4    # incremented (transient treated as gap)
 
-    def test_lower_priority_does_not_break_holdover(self):
-        """A lower-priority filter should never break holdover, even if it's
-        in the breakers list. Conversation (priority 7) during mower
-        (priority 5) holdover should be suppressed."""
-        cfg = {**self.DET, "holdover_priority_breakers": "thunder,conversation"}
+    def test_breaker_breaks_regardless_of_priority(self):
+        """A breaker filter breaks holdover of non-breaker filters, even
+        higher-priority ones. Flyover (priority 9) during wind (priority 4)
+        holdover should break through because flyover's internal min_history
+        checks are the quality gate, and wind is not a breaker itself."""
+        cfg = {**self.DET, "holdover_priority_breakers": "thunder,flyover"}
         effective, pf, pr, g = apply_filter_holdover(
-            "conversation", "mower", 10, 3, cfg,
+            "flyover", "wind", 10, 3, cfg,
         )
-        assert effective == "mower"
-        assert pf == "mower"
+        assert effective == "flyover"
+        assert pf == "flyover"
+        assert pr == 1
+        assert g == 0
+
+    def test_breaker_cannot_break_higher_priority_breaker(self):
+        """When BOTH filters are breakers, chain priority wins — a lower-
+        priority breaker cannot break a higher-priority breaker's holdover.
+        Flyover (priority 9, breaker) during thunder (priority 0, breaker)
+        holdover should be suppressed."""
+        cfg = {**self.DET, "holdover_priority_breakers": "thunder,flyover"}
+        effective, pf, pr, g = apply_filter_holdover(
+            "flyover", "thunder", 10, 3, cfg,
+        )
+        assert effective == "thunder"
+        assert pf == "thunder"
         assert pr == 10
         assert g == 4
 

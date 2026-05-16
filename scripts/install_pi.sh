@@ -80,6 +80,29 @@ pip install --upgrade pip
 pip install -r "$CURRENT/requirements.txt"
 echo "  Dependencies installed."
 
+# --- Ensure adequate swap space ---
+# 200 MB default swap on Pi OS is too small for 8 GB RAM — memory pressure
+# escalates from "fine" to OOM-kill with almost no buffer. 1 GB is enough to
+# absorb transient spikes without meaningful SD card wear at noise-warden's
+# write volume.
+MIN_SWAP_MB=1024
+SWAP_FILE="/var/swap"
+CURRENT_SWAP_MB=0
+if [ -f "$SWAP_FILE" ]; then
+    CURRENT_SWAP_MB=$(( $(stat -f%z "$SWAP_FILE" 2>/dev/null || stat -c%s "$SWAP_FILE" 2>/dev/null || echo 0) / 1024 / 1024 ))
+fi
+if [ "$CURRENT_SWAP_MB" -lt "$MIN_SWAP_MB" ]; then
+    echo "Swap is ${CURRENT_SWAP_MB} MB (need ${MIN_SWAP_MB} MB). Resizing ..."
+    sudo swapoff "$SWAP_FILE" 2>/dev/null || true
+    sudo dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$MIN_SWAP_MB" status=progress
+    sudo chmod 600 "$SWAP_FILE"
+    sudo mkswap "$SWAP_FILE"
+    sudo swapon "$SWAP_FILE"
+    echo "  Swap resized to ${MIN_SWAP_MB} MB."
+else
+    echo "Swap is already ${CURRENT_SWAP_MB} MB (>= ${MIN_SWAP_MB} MB) — skipping."
+fi
+
 # --- Create system user ---
 sudo useradd -r -s /usr/sbin/nologin noisewarden 2>/dev/null || true
 # Audio group is required for microphone access; warn loudly if it fails

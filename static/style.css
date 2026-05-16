@@ -153,6 +153,10 @@ tr:focus-within {
 background-color: var(--table-focus);
 }
 
+td.incident-ts {
+  min-width: 3rem;
+}
+
 /* ---- Form elements ---- */
 button, input[type=submit] {
   padding: 8px 12px;

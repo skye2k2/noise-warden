@@ -168,7 +168,7 @@ def reclassify_incident_api(request: Request, incident_id: int, apply: bool = Fa
     if not wav_path or not os.path.exists(wav_path):
         raise HTTPException(404, "No audio snippet available for this incident")
 
-    result = analyze_clip(wav_path, cfg["detection"], cfg["audio"])
+    result = analyze_clip(wav_path, cfg["detection"], cfg["audio"], engine_captured=True)
 
     old_class = inc.get("classification") or "unknown"
     new_class = result["dominant"]

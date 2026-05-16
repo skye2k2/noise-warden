@@ -32,6 +32,7 @@ from noise_warden.dsp import (
     get_filter_detection_latency,
     identify_filter,
     music_like_score,
+    resample_audio,
     rms_dbfs,
     spectrum_features,
 )
@@ -229,8 +230,21 @@ def normalize_snippet(wav_path, target_peak_dbfs=-6.0):
 # ---------------------------------------------------------------------------
 
 
-def analyze_clip(wav_path, detection_cfg, audio_cfg):
+def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
     """Run the full DSP pipeline block-by-block on a WAV file.
+
+    When engine_captured=True, mirrors the engine's live classification as
+    closely as possible, including lead-in / lead-out markers for preroll
+    and post-trigger tail blocks. The engine's WAV includes
+    snippet_pre_seconds of audio BEFORE the trigger and snippet_post_seconds
+    AFTER the last above-threshold block. Those bookend blocks are not part
+    of the incident proper — they appear in the journal as "lead-in" /
+    "lead-out" rather than being classified through the DSP pipeline (which
+    would label them "unknown" and skew the dominant-classification calc).
+
+    When engine_captured=False (default), the entire WAV is DSP-classified
+    end-to-end — appropriate for standalone recordings, test clips, and
+    source audio not captured by the engine.
 
     Returns a dict with:
       blocks       — list of per-block result dicts (dba, features, filter, classification)
@@ -249,9 +263,35 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg):
     if len(data.shape) > 1:
         data = data[:, 0]
 
+    # NOTE: If the file's native sample rate differs from the config's
+    # audio.sample_rate, spectral features (centroid, band ratios) will
+    # vary. The resample_audio() utility in dsp.py can normalize this,
+    # but all filter thresholds and regression test expectations would
+    # need recalibration at the canonical rate first. See NEXT.md §5.
+
     block_seconds = float(audio_cfg.get("block_seconds", 1.0))
     block_size = int(sr * block_seconds)
     n_blocks = len(data) // block_size
+
+    # Determine lead-in / lead-out boundaries to match the engine's behavior.
+    # Only applied for engine-captured snippets — standalone recordings (test
+    # clips, freesound downloads, etc.) should be classified end-to-end.
+    if engine_captured:
+        pre_sec = float(audio_cfg.get("snippet_pre_seconds", 0))
+        post_sec = float(audio_cfg.get("snippet_post_seconds", 0))
+        lead_in_blocks = max(0, round(pre_sec / block_seconds))
+        lead_out_blocks = max(0, round(post_sec / block_seconds))
+
+        # Clamp: lead-in + lead-out can't consume the entire clip
+        if lead_in_blocks + lead_out_blocks >= n_blocks:
+            lead_in_blocks = 0
+            lead_out_blocks = 0
+    else:
+        lead_in_blocks = 0
+        lead_out_blocks = 0
+
+    # The lead-out starts at (n_blocks - lead_out_blocks).
+    lead_out_start = n_blocks - lead_out_blocks
 
     db_history = []
     blocks = []
@@ -277,31 +317,46 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg):
         bconf = beat_confidence(block, sr, db_history)
         mscore = music_like_score(feats)
 
-        prev = db_history[-2] if len(db_history) > 1 else db_now
-        raw_filt = identify_filter(feats, db_history, db_now, prev, detection_cfg,
-                                   feature_history=feature_history,
-                                   beat_confidence=bconf)
-
-        # Apply holdover (same as engine._identify_filter)
-        filt, prev_filt, prev_filt_run, holdover_gap = apply_filter_holdover(
-            raw_filt, prev_filt, prev_filt_run, holdover_gap, detection_cfg,
-        )
-
-        # Replicate engine._classify_sound logic (with engine_noise detection)
-        if feats.get("midband_ratio", 0) > 0.50:
-            classify = "engine_noise"
-        elif (feats.get("lowband_ratio", 0) > 0.10 and
-              feats.get("envelope_cv", 0.5) < 0.10 and
-              feats.get("harmonic_ratio", 0.5) < 0.40):
-            classify = "engine_noise"
-        elif mscore >= min_music and bconf >= min_beat:
-            classify = "music"
-        elif mscore >= min_music:
-            classify = "music_like"
+        # Lead-in blocks: mark as "lead-in" without running the filter chain.
+        # The engine labels these with a negative timestamp; reclassify uses
+        # a positive block index but the same label so journals compare equal
+        # after the negative→positive conversion below.
+        if i < lead_in_blocks:
+            final = "lead-in"
+            filt = None
+        # Lead-out blocks: mark as "lead-out" — these are the post-trigger
+        # tail that the engine preserves for recording context but never
+        # classifies in the journal.
+        elif i >= lead_out_start:
+            final = "lead-out"
+            filt = None
         else:
-            classify = "unknown"
+            # Normal DSP classification for the incident body
+            prev = db_history[-2] if len(db_history) > 1 else db_now
+            raw_filt = identify_filter(feats, db_history, db_now, prev, detection_cfg,
+                                       feature_history=feature_history,
+                                       beat_confidence=bconf)
 
-        final = filt if filt else classify
+            # Apply holdover (same as engine._identify_filter)
+            filt, prev_filt, prev_filt_run, holdover_gap = apply_filter_holdover(
+                raw_filt, prev_filt, prev_filt_run, holdover_gap, detection_cfg,
+            )
+
+            # Replicate engine._classify_sound logic (with engine_noise detection)
+            if feats.get("midband_ratio", 0) > 0.50:
+                classify = "engine_noise"
+            elif (feats.get("lowband_ratio", 0) > 0.10 and
+                  feats.get("envelope_cv", 0.5) < 0.10 and
+                  feats.get("harmonic_ratio", 0.5) < 0.40):
+                classify = "engine_noise"
+            elif mscore >= min_music and bconf >= min_beat:
+                classify = "music"
+            elif mscore >= min_music:
+                classify = "music_like"
+            else:
+                classify = "unknown"
+
+            final = filt if filt else classify
 
         # Build journal (transitions only, like engine._update_class_journal).
         # When a filter first identifies a sound, backdate the entry by the
@@ -354,9 +409,21 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg):
             "classification": final,
         })
 
+    # Convert reclassify journal timestamps to match the engine's convention:
+    # the engine uses a negative timestamp for lead-in (round(-preroll_sec))
+    # and elapsed seconds from start_ts for everything else. To produce
+    # comparable journals, shift block indices so lead-in blocks are negative
+    # and the first incident-body block is 0.
+    if lead_in_blocks > 0 and journal:
+        shifted = []
+        for sec, cls in journal:
+            shifted.append((sec - lead_in_blocks, cls))
+        journal = shifted
+
     # Compute dominant classification (replicates engine._finalize_incident journal logic)
-    duration = n_blocks  # Each block is ~1 second
-    dominant = _compute_dominant(journal, duration)
+    # Duration is only the incident body — excludes lead-in and lead-out.
+    body_blocks = n_blocks - lead_in_blocks - lead_out_blocks
+    dominant = _compute_dominant(journal, body_blocks)
 
     # Exponentially-weighted average dB (matches engine)
     if db_history:
@@ -389,7 +456,9 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg):
 # fallback catch-all for mechanical sounds that slipped past specific filters
 # (flyover, mower, diesel) — when a specific filter *does* match, it should
 # win rather than splitting the vote with the generic supercategory.
-_IGNORABLE_CLASSES = {"engine_noise", "none", "unknown"}
+# "lead-in" and "lead-out" are bookend context (preroll / post-trigger tail)
+# that were never part of the incident proper.
+_IGNORABLE_CLASSES = {"engine_noise", "lead-in", "lead-out", "none", "unknown"}
 
 
 def _compute_dominant(journal, duration):
@@ -402,16 +471,24 @@ def _compute_dominant(journal, duration):
         present but only one real source was identified.
       - If 2+ meaningful classes, returns the longest-running one with
         " (multiple)" appended.
-    Background noise ("unknown", "none") is excluded from the duration
-    contest and the suffix decision. Falls back to "unknown" only when
-    every journal entry is ignorable.
+    Background noise ("unknown", "none") and structural bookends ("lead-in",
+    "lead-out") are excluded from the duration contest and the suffix
+    decision. A journal of [lead-in, mower, lead-out] returns plain "mower"
+    — the bookends are invisible. A journal of [unknown, mower] returns
+    "mower+" because the unknown blocks represent genuinely ambiguous audio.
+    Falls back to "unknown" only when every journal entry is ignorable.
     """
     if not journal:
         return "unknown"
 
     unique_classes = set(entry[1] for entry in journal)
 
-    if len(unique_classes) > 1 and len(journal) > 1:
+    # Structural bookends: completely invisible to classification logic.
+    # They don't add "+" and don't count as multiple sources.
+    _BOOKENDS = {"lead-in", "lead-out"}
+    non_bookend_classes = unique_classes - _BOOKENDS
+
+    if len(non_bookend_classes) > 1 and len(journal) > 1:
         durations = {}
         for idx in range(len(journal)):
             cls = journal[idx][1]
@@ -431,11 +508,16 @@ def _compute_dominant(journal, duration):
             dominant = max(durations, key=durations.get)
 
         # "+" suffix when only one real source was identified alongside
-        # ignorable blocks; "(multiple)" when 2+ distinct real sources.
+        # ignorable ambient blocks (unknown, engine_noise); "(multiple)"
+        # when 2+ distinct real sources.
         if len(meaningful) <= 1:
             return f"{dominant}+"
         return f"{dominant} (multiple)"
 
+    # Single source (possibly with ignorable bookends) — return it directly.
+    meaningful_classes = unique_classes - _IGNORABLE_CLASSES
+    if meaningful_classes:
+        return next(iter(meaningful_classes))
     return journal[0][1]
 
 
@@ -536,7 +618,7 @@ def reclassify_incident(storage, incident_id, detection_cfg, audio_cfg,
     print(f"  Stored classification: {inc.get('classification', '?')}")
     print()
 
-    result = analyze_clip(wav_path, detection_cfg, audio_cfg)
+    result = analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=True)
 
     if verbose:
         print_block_table(result["blocks"])
@@ -633,7 +715,7 @@ def reclassify_all(storage, detection_cfg, audio_cfg, verbose=False, update=Fals
             skipped += 1
             continue
 
-        result = analyze_clip(wav_path, detection_cfg, audio_cfg)
+        result = analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=True)
         processed += 1
 
         # Compare classification
@@ -800,6 +882,12 @@ def main():
              "Uses minimum-statistics noise estimation (no manual noise profile needed). "
              "Reads denoise_percentile / denoise_alpha / denoise_beta from config.",
     )
+    parser.add_argument(
+        "--purge-orphans", action="store_true", dest="purge_orphans",
+        help="NULL out snippet_path for DB rows whose WAV file no longer exists "
+             "on disk. Run this after manually deleting snippet files to clean up "
+             "stale references. Can be combined with --all.",
+    )
     args = parser.parse_args()
 
     # Resolve config path
@@ -854,6 +942,10 @@ def main():
     storage = Storage(db_path)
     print(f"[reclassify] Database: {db_path}")
 
+    if args.purge_orphans:
+        count = storage.purge_orphaned_incidents()
+        print(f"[reclassify] Purged {count} orphaned snippet reference(s)")
+
     if args.batch_all:
         reclassify_all(storage, detection_cfg, audio_cfg,
                         verbose=args.verbose, update=args.update,
@@ -872,9 +964,10 @@ def main():
                             denoise_alpha=denoise_alpha,
                             denoise_beta=denoise_beta)
     else:
-        print("[reclassify] ERROR: Specify an incident ID, a WAV file path, or --all.")
-        parser.print_help()
-        sys.exit(1)
+        if not args.purge_orphans:
+            print("[reclassify] ERROR: Specify an incident ID, a WAV file path, or --all.")
+            parser.print_help()
+            sys.exit(1)
 
 
 if __name__ == "__main__":

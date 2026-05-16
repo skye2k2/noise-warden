@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, shutil, threading, time, tempfile
+import json, os, signal, shutil, threading, time, tempfile
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import sounddevice as sd
@@ -156,6 +156,38 @@ class Engine:
         except OSError as exc:
             print(f"[engine] Disk quota check failed: {exc}")
 
+    def _check_memory_usage(self):
+        """Check process RSS and expose it to the dashboard. If RSS exceeds
+        the warning threshold, log it. If it exceeds the critical threshold,
+        self-terminate so systemd can restart with a clean slate. Normal RSS
+        is ~90-120 MB; the MemoryMax=1024M systemd limit is the hard backstop,
+        but catching runaway growth early avoids OOM-kill journal noise."""
+        try:
+            import resource
+            # On Linux, ru_maxrss is in KB; on macOS it's in bytes
+            raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            rss_mb = raw / 1024 if os.name != "nt" else raw / (1024 * 1024)
+            # macOS reports bytes, Linux reports KB
+            import sys
+            if sys.platform == "darwin":
+                rss_mb = raw / (1024 * 1024)
+            else:
+                rss_mb = raw / 1024
+
+            self.state.set(process_rss_mb=round(rss_mb, 1))
+
+            if rss_mb > 700:
+                print(f"[engine] CRITICAL: RSS {rss_mb:.0f} MB — self-restarting to prevent OOM kill")
+                self.state.set(last_error=f"Memory critical: {rss_mb:.0f} MB — restarting")
+                time.sleep(2)
+                os.kill(os.getpid(), signal.SIGTERM)
+            elif rss_mb > 500:
+                print(f"[engine] WARNING: RSS is {rss_mb:.0f} MB — possible memory leak")
+                self.state.set(last_error=f"High memory: {rss_mb:.0f} MB")
+        except Exception as exc:
+            # resource module not available on all platforms — not fatal
+            print(f"[engine] Memory check unavailable: {exc}")
+
     def start(self):
         if self.thread and self.thread.is_alive():
             return
@@ -164,7 +196,28 @@ class Engine:
         armed = bool(self.cfg["detection"].get("armed", True))
         recording = bool(self.cfg["audio"].get("recording_enabled", True))
         self.state.set(armed=armed, recording_enabled=recording)
-        self.thread = threading.Thread(target=self.run, daemon=True)
+
+        def _run_with_crash_guard():
+            """Wrapper that catches unhandled exceptions from the engine loop.
+            If the loop exits unexpectedly, we set an error state so the
+            dashboard shows the problem, then SIGTERM the process so systemd
+            can restart cleanly. Without this, a daemon-thread crash would
+            leave the web server running with stale state and no monitoring."""
+            try:
+                self.run()
+            except Exception as exc:
+                print(f"[engine] FATAL: engine thread crashed: {exc}")
+                self.state.set(
+                    last_error=f"Engine crashed: {exc}",
+                    mode="crashed",
+                    running=False,
+                )
+                # Brief delay so an in-flight dashboard poll can serve the
+                # crash state before the process exits
+                time.sleep(3)
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        self.thread = threading.Thread(target=_run_with_crash_guard, daemon=True)
         self.thread.start()
 
     def stop(self):
@@ -640,36 +693,45 @@ class Engine:
         updated_class = None
 
         if len(unique_classes) > 1 and len(journal) > 1:
-            # Calculate duration each classification held based on journal transitions
-            durations = {}
-            for idx in range(len(journal)):
-                cls = journal[idx][1]
-                start_sec = journal[idx][0]
-                # End is the next entry's start, or incident duration for the last entry
-                if idx + 1 < len(journal):
-                    end_sec = journal[idx + 1][0]
+            # Structural bookends: completely invisible to classification logic.
+            # They don't add "+" and don't count as multiple sources.
+            bookends = {"lead-in", "lead-out"}
+            ignorable = {"engine_noise", "lead-in", "lead-out", "none", "unknown"}
+            non_bookend_classes = unique_classes - bookends
+
+            if len(non_bookend_classes) > 1:
+                # Genuinely multiple non-bookend classes — compute durations
+                durations = {}
+                for idx in range(len(journal)):
+                    cls = journal[idx][1]
+                    start_sec = journal[idx][0]
+                    if idx + 1 < len(journal):
+                        end_sec = journal[idx + 1][0]
+                    else:
+                        end_sec = dur
+                    durations[cls] = durations.get(cls, 0) + (end_sec - start_sec)
+
+                meaningful = {k: v for k, v in durations.items() if k not in ignorable}
+                if meaningful:
+                    dominant = max(meaningful, key=meaningful.get)
                 else:
-                    end_sec = dur
-                durations[cls] = durations.get(cls, 0) + (end_sec - start_sec)
+                    dominant = max(durations, key=durations.get)
 
-            # Exclude background noise and generic engine catch-all from the
-            # dominant-classification contest. A recording with 50s of
-            # engine_noise and 10s of flyover should report "flyover", not
-            # "engine_noise". Falls back to all entries if every classification
-            # is ignorable.
-            ignorable = {"engine_noise", "none", "unknown"}
-            meaningful = {k: v for k, v in durations.items() if k not in ignorable}
-            if meaningful:
-                dominant = max(meaningful, key=meaningful.get)
+                if len(meaningful) <= 1:
+                    updated_class = f"{dominant}+"
+                else:
+                    updated_class = f"{dominant} (multiple)"
+            elif len(non_bookend_classes) == 1:
+                # One real source alongside only bookends — no suffix
+                meaningful_classes = non_bookend_classes - ignorable
+                if meaningful_classes:
+                    updated_class = next(iter(meaningful_classes))
+                else:
+                    updated_class = next(iter(non_bookend_classes))
             else:
-                dominant = max(durations, key=durations.get)
+                # All bookends (shouldn't happen in practice) — fall through
+                pass
 
-            # "+" suffix when only one real source was identified alongside
-            # ignorable blocks; "(multiple)" when 2+ distinct real sources.
-            if len(meaningful) <= 1:
-                updated_class = f"{dominant}+"
-            else:
-                updated_class = f"{dominant} (multiple)"
         elif len(unique_classes) == 1 and journal:
             # Single source — update classification to the journal's value in case
             # the initial classification was set before the filter had enough history
@@ -1099,6 +1161,7 @@ class Engine:
                         except Exception as e:
                             print(f"[engine] Periodic cleanup error: {e}")
                     self._check_disk_quota()
+                    self._check_memory_usage()
                     # Periodic device validation — catch slow drift or silent mic swap
                     ok, msg = self.capture.validate_device()
                     if not ok:
