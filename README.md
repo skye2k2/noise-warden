@@ -342,16 +342,22 @@ You don't need a Pi to test the code — most laptops have a built-in microphone
       playlist_dir: ./local_data/playlist
     ```
 
-5. Point the app at your local config:
-    ```bash
-    export NOISE_WARDEN_CONFIG=config/noise_warden_local.yaml
+    The app automatically finds this file — no environment variable needed. The config resolution order is: `NOISE_WARDEN_CONFIG` env var → `/opt/noise-warden/current/config/noise_warden.yaml` → `config/noise_warden_local.yaml`.
+
+    To test the CPU temperature and throttle status pills on your local dashboard, enable the testing overrides:
+    ```yaml
+    testing_overrides:
+      enabled: true
+      cpu_temp_c: 85       # Fake temperature — will show red pill at ≥80
+      cpu_status: 0x50005   # Fake throttle bitmask — shows CPU Status pill
     ```
+    Config is loaded once at startup — in local dev, the `--reload-include` flag below auto-restarts uvicorn when YAML files change.
 
 #### Running the app
 
 ```bash
 # From the repo root, with the venv active:
-uvicorn noise_warden.main:app --host 127.0.0.1 --port 8787 --reload
+uvicorn noise_warden.main:app --host 127.0.0.1 --port 8787 --reload --reload-include '*.yaml'
 ```
 
 Open [http://127.0.0.1:8787/](http://127.0.0.1:8787/) in your browser. The `--reload` flag auto-restarts on code changes.
@@ -802,7 +808,7 @@ Add to crontab (`crontab -e`):
 
 ### Speculative / future use cases
 
-- TODO: What if someone wants to use this for identifying overall dog nuisance? Dog barks have a particular noise pattern, and could even be categorized with some spectrographic analysis into "dog1", "dog2", for individual incidents and later tagged with names/locations, etc. Would this just completely break _my_ use case?
+- TODO: What if someone wants to use this for identifying overall dog nuisance? Dog barks have a particular noise pattern, and could even be categorized with some spectrographic analysis into "dog1", "dog2", for individual incidents and later tagged with names/locations, etc. I even have a recording of the neighbor dog, now. Would this just completely break _my_ use case?
 - TODO: We could also potentially provide clean recordings of birds (robin, seagull, dove, quail, crow, sparrow-finch-things, roosters) to either identify and record or definitively _exclude_, based on spectral matching. Then potentially other things, like car alarms, lawn mowers, and weedwhackers.
 - TODO: Consider alternate usage scenario as a cheap sleep snoring monitor--enabled for _nighttime_ only, coupled with a deep sleep monitor, some correlations could be determined. And easier than having a recorder run _all_ night, and then needing to scrub eight hours of recording for potential data.
 - TODO: Consider minority impulse and unknown entries to not be technically part of the (multiple) stipulation.

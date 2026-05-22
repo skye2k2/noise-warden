@@ -4,16 +4,42 @@ import yaml
 from dataclasses import dataclass
 from typing import Any, Dict
 
-DEFAULT_CONFIG_PATH = "/opt/noise-warden/current/config/noise_warden.yaml"
+_OPT_CONFIG_PATH = "/opt/noise-warden/current/config/noise_warden.yaml"
+
+# When running locally (no NOISE_WARDEN_CONFIG env var and /opt path absent),
+# fall back to config/noise_warden_local.yaml relative to the project root so
+# `uvicorn noise_warden.web:app` works without any extra setup.
+_LOCAL_CONFIG_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "config", "noise_warden_local.yaml"
+)
+
+def _default_config_path() -> str:
+    """Resolve the config path: env var → /opt deploy path → local dev fallback."""
+    env = os.environ.get("NOISE_WARDEN_CONFIG")
+    if env:
+        return env
+    if os.path.exists(_OPT_CONFIG_PATH):
+        return _OPT_CONFIG_PATH
+    return _LOCAL_CONFIG_PATH
 
 class ConfigError(Exception):
     pass
 
 def load_yaml(path: str | None = None) -> Dict[str, Any]:
     if path is None:
-        path = os.environ.get("NOISE_WARDEN_CONFIG", DEFAULT_CONFIG_PATH)
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+        path = _default_config_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        raise ConfigError(
+            f"Config file not found: {path}\n\n"
+            "For local development, create a local config override:\n"
+            "  cp config/noise_warden.yaml config/noise_warden_local.yaml\n"
+            "  # Edit app.shared_dir to ./local_data, etc.\n"
+            "Or point directly to any config file:\n"
+            "  export NOISE_WARDEN_CONFIG=/path/to/noise_warden.yaml"
+        ) from None
     if not isinstance(data, dict):
         raise ConfigError("Top-level YAML must be a mapping")
     validate_config(data)

@@ -338,22 +338,72 @@ class Storage:
                 pass
         return removed
 
-    def repair_stale_incidents(self):
+    def repair_stale_incidents(self, snippets_dir=None):
         """Finalize any incidents left without an end_ts (abandoned after a crash).
-        Marks them with a sentinel end_ts and notes indicating they were crash-repaired."""
+
+        If snippets_dir is provided, scans for orphaned temp WAV files matching
+        the pattern `incident_{id}_*.wav` and re-attaches them to snippet_path so
+        the recording is not lost — the engine writes to this temp name before
+        renaming on normal finalization. Without this, crash-repaired incidents
+        always show as audio-less even when a partial recording exists."""
         with self.conn() as c:
             rows = c.execute(
                 "SELECT id, start_ts, start_db FROM incidents WHERE end_ts IS NULL AND deleted=0"
             ).fetchall()
             repaired = 0
             for r in rows:
-                # Use the start_ts as a fallback end_ts — we can't know the real end
+                # Attempt to locate an orphaned temp WAV before we mark duration=0
+                found_path = None
+                if snippets_dir:
+                    # The engine names temp files incident_{id}_<timestamp>.wav
+                    candidates = glob.glob(
+                        os.path.join(snippets_dir, f"incident_{r['id']}_*.wav")
+                    )
+                    if candidates:
+                        # If multiple (shouldn't happen), prefer the largest — most complete
+                        found_path = max(candidates, key=os.path.getsize)
+
+                # Use start_ts as fallback end_ts — we cannot know the real end time
                 c.execute(
-                    "UPDATE incidents SET end_ts=?, duration_sec=0, notes=COALESCE(notes,'') || ? WHERE id=?",
-                    (r["start_ts"], " [crash-repaired: incident was active when engine stopped unexpectedly]", r["id"])
+                    "UPDATE incidents SET end_ts=?, duration_sec=0, snippet_path=COALESCE(?, snippet_path), "
+                    "notes=COALESCE(notes,'') || ? WHERE id=?",
+                    (
+                        r["start_ts"],
+                        found_path,
+                        " [crash-repaired: incident was active when engine stopped unexpectedly]",
+                        r["id"],
+                    )
                 )
                 repaired += 1
             return repaired
+
+    def delete_crash_repaired_incidents(self):
+        """Hard-delete all incidents that were marked crash-repaired at startup.
+
+        These are definitively garbage rows — duration_sec=0, no meaningful
+        audio data, and their notes contain the crash-repair sentinel. If a
+        partial WAV was re-attached by repair_stale_incidents(), it is also
+        removed from disk. Returns the count of rows deleted."""
+        SENTINEL = "[crash-repaired:"
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT id, snippet_path FROM incidents WHERE notes LIKE ? AND deleted=0",
+                (f"%{SENTINEL}%",),
+            ).fetchall()
+
+        deleted = 0
+        for row in rows:
+            # Remove the snippet file if one was re-attached by crash repair
+            if row["snippet_path"] and os.path.exists(row["snippet_path"]):
+                try:
+                    os.remove(row["snippet_path"])
+                except OSError:
+                    pass
+            with self.conn() as c:
+                c.execute("DELETE FROM incidents WHERE id=?", (row["id"],))
+            deleted += 1
+
+        return deleted
 
     def vacuum(self):
         """Reclaim disk space from soft-deleted rows and fragmentation.

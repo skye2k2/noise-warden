@@ -7,8 +7,15 @@
     <span class="pill" id="pill-mic">Mic OK: {{ state.mic_ok }}</span>
     <span class="pill" id="pill-threshold">Threshold: {{ state.current_threshold_db }}</span>
     <span class="pill" id="pill-db">Current dB: {{ state.current_db }}</span>
-    <span class="pill" id="pill-mode" {% if state.mode == 'incident_active' %}style="background:#27ae60;color:#fff"{% endif %}>Mode: {{ state.mode }}</span>
-    <span class="pill" id="pill-disk" style="{% if state.disk_warning %}background:#e74c3c;color:#fff{% endif %}">Disk: {{ state.disk_warning or ('%.0f MB free' | format(state.disk_free_mb|default(0, true))) }}</span>
+    <span class="pill{% if state.mode == 'incident_active' %} pill--active{% endif %}" id="pill-mode">Mode: {{ state.mode }}</span>
+    <hr />
+    <span class="pill{% if state.disk_warning %} pill--danger{% endif %}" id="pill-disk">Disk: {{ state.disk_warning or ('%.0f MB free' | format(state.disk_free_mb|default(0, true))) }}</span>
+    {% if state.cpu_temp_c is not none %}
+    <span class="pill{% if state.cpu_temp_c >= 80 %} pill--danger{% elif state.cpu_temp_c >= 75 %} pill--warn{% endif %}" id="pill-temp">CPU Temp: {{ state.cpu_temp_c }}°C</span>
+    {% endif %}
+    {% if state.cpu_status %}
+    <span class="pill pill--danger" id="pill-throttle">CPU Status: {{ state.cpu_status }}</span>
+    {% endif %}
   </p>
   <p class="small">Status updates every 5 seconds from in-memory state (no database reads).</p>
 
@@ -22,6 +29,9 @@
     {% endif %}
     {% if state.forced_test %}
     <p class="warning-banner warning-info" id="warn-force-test">ℹ A test incident is <strong>active</strong> — force-end it when finished testing.</p>
+    {% endif %}
+    {% if state.network_warning %}
+    <p class="warning-banner" id="warn-network">⚠ Network: <strong>{{ state.network_warning }}</strong> — dashboard may be unreachable from outside.</p>
     {% endif %}
   </div>
 
@@ -163,6 +173,7 @@ function dbSeverityStyle(excessDb) {
   };
 
   const diskPill = document.getElementById('pill-disk');
+  const tempPill = document.getElementById('pill-temp');
 
   async function pollState() {
     try {
@@ -185,13 +196,7 @@ function dbSeverityStyle(excessDb) {
       // Green mode pill when actively recording an incident
       var modePill = pills.mode.el;
       if (modePill) {
-        if (data.mode === 'incident_active') {
-          modePill.style.background = '#27ae60';
-          modePill.style.color = '#fff';
-        } else {
-          modePill.style.background = '';
-          modePill.style.color = '';
-        }
+        modePill.classList.toggle('pill--active', data.mode === 'incident_active');
       }
 
       // Severity color on the current dB pill — reflects how far above threshold
@@ -208,31 +213,66 @@ function dbSeverityStyle(excessDb) {
         }
       }
 
-      // Disk warning gets special treatment: red background when warning is active
+      // Disk warning gets special treatment: red modifier class when warning is active
       if (diskPill) {
         if (data.disk_warning) {
           diskPill.textContent = data.disk_warning;
-          diskPill.style.background = '#e74c3c';
-          diskPill.style.color = '#fff';
+          diskPill.classList.add('pill--danger');
         } else if (data.disk_free_mb != null) {
           diskPill.textContent = 'Disk: ' + Math.round(data.disk_free_mb) + ' MB free';
-          diskPill.style.background = '';
-          diskPill.style.color = '';
+          diskPill.classList.remove('pill--danger');
         }
       }
 
-      // Update warning banners based on live state
+      // CPU temperature pill: show/create dynamically (not present on macOS dev)
+      if (data.cpu_temp_c != null) {
+        var tp = tempPill || document.getElementById('pill-temp');
+        if (!tp) {
+          // First time we have temp data — create the pill after the disk pill
+          tp = document.createElement('span');
+          tp.className = 'pill';
+          tp.id = 'pill-temp';
+          diskPill && diskPill.parentNode && diskPill.parentNode.insertBefore(tp, diskPill.nextSibling);
+        }
+        tp.textContent = 'CPU Temp: ' + data.cpu_temp_c + '\u00b0C';
+        tp.classList.toggle('pill--danger', data.cpu_temp_c >= 80);
+        tp.classList.toggle('pill--warn',   data.cpu_temp_c >= 75 && data.cpu_temp_c < 80);
+      }
+
+      // Throttle status pill: created dynamically like temp pill
+      var throttlePill = document.getElementById('pill-throttle');
+      if (data.cpu_status) {
+        if (!throttlePill) {
+          throttlePill = document.createElement('span');
+          throttlePill.className = 'pill pill--danger';
+          throttlePill.id = 'pill-throttle';
+          // Insert after temp pill if it exists, otherwise after disk pill
+          var after = document.getElementById('pill-temp') || diskPill;
+          if (after && after.parentNode) {
+            after.parentNode.insertBefore(throttlePill, after.nextSibling);
+          }
+        }
+        throttlePill.textContent = 'CPU Status: ' + data.cpu_status;
+        throttlePill.classList.add('pill--danger');
+      } else if (throttlePill) {
+        throttlePill.remove();
+      }
+
+      // Update warning banners from live state
       var banners = document.getElementById('warning-banners');
       if (banners) {
         var html = '';
-        if (data.armed === false) {
-          html += '<p class="warning-banner">⚠ Detection is <strong>paused</strong> — no new incidents will be logged.</p>';
+        if (!data.armed) {
+          html += '<p class="warning-banner" id="warn-paused">\u26a0 Detection is <strong>paused</strong> \u2014 no new incidents will be logged.</p>';
         }
-        if (data.recording_enabled === false) {
-          html += '<p class="warning-banner">⚠ Recording is <strong>disabled</strong> — incidents log dB data only, no audio snippets.</p>';
+        if (!data.recording_enabled) {
+          html += '<p class="warning-banner" id="warn-no-record">\u26a0 Recording is <strong>disabled</strong> \u2014 incidents log dB data only, no audio snippets.</p>';
         }
-        if (data.forced_test) {
-          html += '<p class="warning-banner warning-info">ℹ A test incident is <strong>active</strong> — end it when finished testing.</p>';
+        if (data.active_incident_id) {
+          html += '<p class="warning-banner warning-info">\u2139 A test incident is <strong>active</strong> \u2014 end it when finished testing.</p>';
+        }
+        if (data.network_warning) {
+          html += '<p class="warning-banner">\u26a0 Network: <strong>' + data.network_warning + '</strong> \u2014 dashboard may be unreachable from outside.</p>';
         }
         banners.innerHTML = html;
       }

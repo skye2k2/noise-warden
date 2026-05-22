@@ -90,7 +90,7 @@ class TestLoadYaml:
         assert loaded["detection"]["mode"] == "continuous_music_focus"
 
     def test_nonexistent_file_raises(self):
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(ConfigError, match="Config file not found"):
             load_yaml("/tmp/definitely_does_not_exist_xyz.yaml")
 
     def test_invalid_yaml_content_raises(self, tmp_path):

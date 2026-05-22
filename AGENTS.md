@@ -122,7 +122,7 @@ This project uses a **symlinked versioning layout** for Raspberry Pi deployment:
 - Project runs without Pi hardware (GPIO/relay features gracefully degrade)
 - Use local config override: `config/noise_warden_local.yaml`
 - Create local data directories: `local_data/{snippets,playlist,build}`
-- Run with: `uvicorn noise_warden.main:app --host 127.0.0.1 --port 8787 --reload`
+- Run with: `uvicorn noise_warden.main:app --host 127.0.0.1 --port 8787 --reload --reload-include '*.yaml'`
 - Built-in mic used by default; test by clapping near laptop
 
 ### Key Architecture Components

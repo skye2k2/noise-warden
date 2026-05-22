@@ -8,7 +8,7 @@
       <th title="Peak dB above the active ordinance threshold. &#10;&#10;Borderline = at or below threshold + margin &#10;+15–24 dB = notable (amber) &#10;+25–29 dB = moderate (orange) &#10;+30–39 dB = severe (red) &#10;+40+ dB = extreme (deep red)">Excess</th>
       <th title="Music-like score (0–1): How closely the spectral profile resembles music. &#10;&#10;0.00–0.30 = environmental (wind, HVAC, traffic) &#10;0.30–0.50 = mechanical (mower, diesel, fan) &#10;0.50–0.62 = ambiguous (could be tonal noise or distant music) &#10;0.62–0.80 = likely music (bass through walls, muffled speakers) &#10;0.80–1.00 = almost certainly music (clear rhythm + bass)">Music</th>
       <th title="Beat confidence (0–1): Rhythmic periodicity of the amplitude envelope. &#10;&#10;0.00–0.40 = no detectable rhythm (nature, steady drones) &#10;0.40–0.55 = weak periodicity (engine idle, irregular traffic) &#10;0.55–0.70 = moderate rhythm (could be music or repetitive machinery) &#10;0.70–0.85 = strong beat (likely music with a clear tempo) &#10;0.85–1.00 = very strong beat (dance/electronic music, heavy bass)">Beat</th>
-      <th title="music · music_like · engine_noise · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · amplified_bass · conversation · drive_by · forced_test">Class</th><th>Snippet</th><th>Notes</th>
+      <th title="music · music_like · engine_noise · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · amplified_bass · conversation · drive_by · forced_test">Class</th><th>File</th><th>Notes</th>
     </tr>
     {% for r in rows %}
     <tr>
@@ -20,9 +20,11 @@
       <td title="{% if r.music_like_score >= 0.80 %}Almost certainly music{% elif r.music_like_score >= 0.62 %}Likely music{% elif r.music_like_score >= 0.50 %}Ambiguous{% elif r.music_like_score >= 0.30 %}Mechanical{% else %}Environmental{% endif %}">{{ "%.2f"|format(r.music_like_score) }}</td>
       <td title="{% if r.beat_confidence >= 0.85 %}Very strong beat{% elif r.beat_confidence >= 0.70 %}Strong beat{% elif r.beat_confidence >= 0.55 %}Moderate rhythm{% elif r.beat_confidence >= 0.40 %}Weak periodicity{% else %}No rhythm{% endif %}">{{ "%.2f"|format(r.beat_confidence) }}</td>
       <td>{{ r.classification }}</td>
-      <td>{% if r.snippet_path %}<button class="snippet-play-btn"
-        data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "class_journal": r.class_journal or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
-        title="Play audio snippet">&#9654;</button>{% endif %}</td>
+      <td>
+        {% if r.snippet_path %}<button class="snippet-play-btn"
+          data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "class_journal": r.class_journal or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
+          title="Play audio snippet">&#9654;</button>{% endif %}
+      </td>
       <td>
         <form method="post" action="/incidents/{{ r.id }}/notes">
           <textarea name="notes">{{ r.notes or "" }}</textarea>
@@ -39,6 +41,12 @@
     {% if page < pages %}<a href="/incidents?page={{ page + 1 }}">Next</a>{% endif %}
   </p>
   <p><a href="/export.csv">Export CSV</a></p>
+  <p>
+    <form method="post" action="/incidents/clear-crash-repaired"
+          onsubmit="return confirm('Delete all crash-repaired incidents (entries with no audio that were left open when the engine crashed unexpectedly)?')">
+      <button class="destructive">Clear Crash-Repaired Incidents</button>
+    </form>
+  </p>
   <p>
     <form method="post" action="/incidents/clear" id="clear-form" onsubmit="return clearAllWithCaches(this)">
       <button  class="destructive">Clear All Incidents</button>

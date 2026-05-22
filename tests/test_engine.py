@@ -9,7 +9,7 @@ import os
 import time
 import threading
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import numpy as np
 import pytest
@@ -337,6 +337,150 @@ class TestDiskQuota:
         engine._check_disk_quota()
         snap = tmp_state.snapshot()
         assert snap.get("disk_warning") is None
+
+
+# ---------------------------------------------------------------------------
+# CPU temperature monitoring
+# ---------------------------------------------------------------------------
+
+class TestCpuTemp:
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_cpu_temp_sets_state(self, base_cfg, tmp_storage, tmp_state):
+        """_check_cpu_temp should publish cpu_temp_c to state when sysfs is readable."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        mock_data = "55000\n"  # 55.0°C
+        with patch("builtins.open", mock_open(read_data=mock_data)):
+            engine._check_cpu_temp()
+        snap = tmp_state.snapshot()
+        assert snap.get("cpu_temp_c") == 55.0
+        assert snap.get("cpu_temp_warning") is None
+
+    def test_cpu_temp_warning_on_hot(self, base_cfg, tmp_storage, tmp_state):
+        """Temperatures >= 80°C should set cpu_temp_warning."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        mock_data = "82000\n"  # 82.0°C
+        with patch("builtins.open", mock_open(read_data=mock_data)):
+            engine._check_cpu_temp()
+        snap = tmp_state.snapshot()
+        assert snap.get("cpu_temp_c") == 82.0
+        assert snap.get("cpu_temp_warning") is not None
+        assert "throttling" in snap["cpu_temp_warning"]
+
+    def test_cpu_temp_skips_on_oserror(self, base_cfg, tmp_storage, tmp_state):
+        """If sysfs is unavailable (macOS, container), the method should be a no-op."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        with patch("builtins.open", side_effect=OSError("no such file")):
+            engine._check_cpu_temp()  # Should not raise
+        snap = tmp_state.snapshot()
+        # cpu_temp_c should remain None (not set)
+        assert snap.get("cpu_temp_c") is None
+
+    def test_cpu_temp_uses_override(self, base_cfg, tmp_storage, tmp_state):
+        """When testing_overrides.enabled with cpu_temp_c set, should use that value
+        instead of reading sysfs — allows UI testing on non-Pi hardware."""
+        base_cfg["testing_overrides"] = {"enabled": True, "cpu_temp_c": 72.5, "cpu_status": None}
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        # No patching of builtins.open — override should bypass sysfs entirely
+        engine._check_cpu_temp()
+        snap = tmp_state.snapshot()
+        assert snap.get("cpu_temp_c") == 72.5
+        assert snap.get("cpu_temp_warning") is None
+
+    def test_cpu_temp_override_disabled_still_reads_sysfs(self, base_cfg, tmp_storage, tmp_state):
+        """When testing_overrides.enabled is False, override values are ignored."""
+        base_cfg["testing_overrides"] = {"enabled": False, "cpu_temp_c": 72.5, "cpu_status": None}
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        # sysfs unavailable on macOS — should silently skip (not use override)
+        with patch("builtins.open", side_effect=OSError("no such file")):
+            engine._check_cpu_temp()
+        snap = tmp_state.snapshot()
+        assert snap.get("cpu_temp_c") is None
+
+
+# ---------------------------------------------------------------------------
+# Throttle status monitoring
+# ---------------------------------------------------------------------------
+
+class TestThrottleCheck:
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_throttle_healthy(self, base_cfg, tmp_storage, tmp_state):
+        """vcgencmd returning 0x0 should set cpu_status=None (healthy)."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        mock_result = MagicMock(returncode=0, stdout="throttled=0x0\n")
+        with patch("subprocess.run", return_value=mock_result):
+            engine._check_throttle()
+        snap = tmp_state.snapshot()
+        assert snap.get("cpu_status") is None
+
+    def test_throttle_under_voltage(self, base_cfg, tmp_storage, tmp_state):
+        """vcgencmd returning 0x50005 should report under-voltage + throttled."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        mock_result = MagicMock(returncode=0, stdout="throttled=0x50005\n")
+        with patch("subprocess.run", return_value=mock_result):
+            engine._check_throttle()
+        snap = tmp_state.snapshot()
+        assert snap.get("cpu_status") is not None
+        assert "under-voltage" in snap["cpu_status"]
+        assert "throttled" in snap["cpu_status"]
+
+    def test_throttle_skips_on_oserror(self, base_cfg, tmp_storage, tmp_state):
+        """If vcgencmd is unavailable (macOS, container), should be a no-op."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        with patch("subprocess.run", side_effect=OSError("not found")):
+            engine._check_throttle()  # Should not raise
+        snap = tmp_state.snapshot()
+        assert snap.get("cpu_status") is None
+
+    def test_throttle_uses_override(self, base_cfg, tmp_storage, tmp_state):
+        """When testing_overrides.enabled with cpu_status set, should use that value."""
+        base_cfg["testing_overrides"] = {"enabled": True, "cpu_temp_c": None, "cpu_status": 0x50005}
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        # No patching of subprocess — override should bypass vcgencmd entirely
+        engine._check_throttle()
+        snap = tmp_state.snapshot()
+        assert snap.get("cpu_status") is not None
+        assert "under-voltage" in snap["cpu_status"]
+
+
+# ---------------------------------------------------------------------------
+# Network link monitoring
+# ---------------------------------------------------------------------------
+
+class TestNetworkCheck:
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def test_network_ok_when_up(self, base_cfg, tmp_storage, tmp_state):
+        """_check_network should set network_ok=True when operstate is 'up'."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        with patch("builtins.open", mock_open(read_data="up\n")):
+            engine._check_network()
+        snap = tmp_state.snapshot()
+        assert snap.get("network_ok") is True
+        assert snap.get("network_warning") is None
+
+    def test_network_warning_when_down(self, base_cfg, tmp_storage, tmp_state):
+        """_check_network should set network_warning when operstate is not 'up'."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        with patch("builtins.open", mock_open(read_data="down\n")):
+            engine._check_network()
+        snap = tmp_state.snapshot()
+        assert snap.get("network_ok") is False
+        assert snap.get("network_warning") is not None
+        assert "down" in snap["network_warning"]
 
 
 # ---------------------------------------------------------------------------

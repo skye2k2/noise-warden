@@ -233,6 +233,19 @@ textarea {
   opacity: 0.45;
   font-style: italic;
 }
+/* Pill state modifiers — applied via classList by the poll loop and server render */
+.pill--active {
+  background: #27ae60;
+  color: #fff;
+}
+.pill--warn {
+  background: #e67e22;
+  color: #fff;
+}
+.pill--danger {
+  background: #e74c3c;
+  color: #fff;
+}
 
 audio {
   width: 220px;

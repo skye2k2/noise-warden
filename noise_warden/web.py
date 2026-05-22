@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, io, signal, threading
+import json, os, io, shutil, signal, threading
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse,
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .config import load_yaml, save_yaml_text_validated, ConfigError
+from .config import load_yaml, save_yaml_text_validated, ConfigError, _default_config_path
 from .storage import Storage
 from .state import StateStore
 from .engine import Engine
@@ -65,7 +65,7 @@ def _persist_armed(armed: bool):
     """Write the armed state to the YAML config so it survives watch-mode reloads."""
     import re
     cfg["detection"]["armed"] = armed
-    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    cfg_path = _default_config_path()
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             raw = f.read()
@@ -87,8 +87,17 @@ def _persist_armed(armed: bool):
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
     incidents = storage.list_incidents(limit=20)
+    snap = state.snapshot()
+    # Compute disk usage fresh on every page load so the initial render is
+    # never up to 24 hours stale (the engine only refreshes this daily)
+    snippets_dir = os.path.join(cfg["app"]["shared_dir"], "snippets")
+    try:
+        usage = shutil.disk_usage(snippets_dir)
+        snap["disk_free_mb"] = round(usage.free / (1024 * 1024), 1)
+    except OSError:
+        pass  # Leave state value as-is if the path doesn't exist yet
     return templates.TemplateResponse(request, "dashboard.html", {
-        "state": state.snapshot(),
+        "state": snap,
         "incidents": incidents,
         "ordinance": ORDINANCE,
         "ordinance_json": json.dumps(ORDINANCE),
@@ -120,6 +129,19 @@ def delete_incident(request: Request, incident_id: int):
     must_auth(request)
     storage.soft_delete_incident(incident_id)
     return RedirectResponse(url="/incidents?msg=deleted", status_code=303)
+
+@app.post("/incidents/clear-crash-repaired")
+def clear_crash_repaired(request: Request):
+    """Hard-delete all crash-repaired sentinel incidents.
+
+    These rows are created at startup when the engine finds incidents with no
+    end_ts — they carry duration_sec=0 and the crash-repair note, but no real
+    audio data. This action permanently removes them (and any partially-recovered
+    WAV) so they stop cluttering the incidents view."""
+    must_auth(request)
+    deleted = storage.delete_crash_repaired_incidents()
+    print(f"[web] Hard-deleted {deleted} crash-repaired incident(s)")
+    return RedirectResponse(url=f"/incidents?msg=crash-repaired-cleared-{deleted}", status_code=303)
 
 @app.post("/incidents/clear")
 def clear_all_incidents(request: Request):
@@ -349,7 +371,7 @@ def timeline(request: Request, view: str = "day"):
 
 @app.get("/config", response_class=HTMLResponse)
 def config_page(request: Request):
-    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    cfg_path = _default_config_path()
     with open(cfg_path, "r", encoding="utf-8") as f:
         raw = f.read()
     return templates.TemplateResponse(request, "config.html", {"raw": raw, "message": request.query_params.get("msg")})
@@ -357,7 +379,7 @@ def config_page(request: Request):
 @app.post("/config/save")
 def save_config(request: Request, raw: str = Form(...)):
     must_auth(request)
-    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    cfg_path = _default_config_path()
     try:
         save_yaml_text_validated(cfg_path, raw)
     except ConfigError as e:
@@ -408,7 +430,7 @@ def calibration_apply(request: Request, offset_db: float = Form(...)):
     must_auth(request)
     cfg["detection"]["calibration_offset_db"] = offset_db
 
-    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    cfg_path = _default_config_path()
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             raw = f.read()
@@ -439,7 +461,7 @@ def set_sample_rate(request: Request, sample_rate: int = Form(...)):
 
     cfg["audio"]["sample_rate"] = sample_rate
 
-    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    cfg_path = _default_config_path()
     try:
         import re
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -467,7 +489,7 @@ def set_noise_floor(request: Request, noise_floor_db: float = Form(...)):
 
     cfg["detection"]["noise_floor_db"] = noise_floor_db
 
-    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    cfg_path = _default_config_path()
     try:
         import re
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -556,7 +578,7 @@ def set_detection_mode(request: Request, detection_mode: str = Form(...), redire
         return RedirectResponse(url=f"{redirect}?msg=error:invalid mode {detection_mode}", status_code=303)
     cfg["detection"]["mode"] = detection_mode
 
-    cfg_path = os.environ.get("NOISE_WARDEN_CONFIG", "/opt/noise-warden/current/config/noise_warden.yaml")
+    cfg_path = _default_config_path()
     try:
         import re
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -631,7 +653,7 @@ def restart_service(request: Request):
         '<p>The noise-warden process has been shut down. '
         'Since this is not running under systemd, it will <strong>not</strong> restart automatically.</p>'
         '<p>Restart manually from your terminal:</p>'
-        '<pre>uvicorn noise_warden.main:app --host 127.0.0.1 --port 8787 --reload</pre>'
+        '<pre>uvicorn noise_warden.main:app --host 127.0.0.1 --port 8787 --reload --reload-include \'*.yaml\'</pre>'
         '</div></div></body></html>',
         status_code=200,
     )

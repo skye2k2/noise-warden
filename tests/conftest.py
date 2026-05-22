@@ -199,6 +199,11 @@ def base_cfg(tmp_path):
             "enable_reference_subtraction": False,
             "enable_dual_mic_diff": False,
         },
+        "testing_overrides": {
+            "enabled": False,
+            "cpu_temp_c": None,
+            "cpu_status": None,
+        },
     }
 
 

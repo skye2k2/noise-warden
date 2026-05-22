@@ -245,3 +245,11 @@ home_assistant:
 plugins:
   enable_reference_subtraction: false
   enable_dual_mic_diff: false
+
+# For local development / UI testing on non-Pi hardware where sysfs sensors
+# are unavailable. When enabled, these values are used instead of reading
+# real hardware. Disable (or remove this section) before deploying to the Pi.
+testing_overrides:
+  enabled: false
+  cpu_temp_c: null                    # Fake SoC temperature in °C (e.g. 72.5)
+  cpu_status: null                   # Fake vcgencmd throttle bitmask (e.g. 0 = healthy, 0x50005 = throttled + under-voltage)

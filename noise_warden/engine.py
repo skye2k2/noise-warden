@@ -93,6 +93,8 @@ class Engine:
         self._last_mqtt_publish = 0.0
         self._mqtt_interval = 5.0  # Seconds between MQTT state publishes
         self._disk_warned = False   # Avoids spamming quota warnings every loop
+        self._temp_warned = False   # Avoids spamming CPU temperature warnings
+        self._network_was_ok = None # None = unknown (first check pending)
         # Self-noise suppression: when the system is playing a response through
         # the relay/amp, we must not register our own playback as a noise incident.
         # _response_end_ts tracks when the last response stopped so we can apply
@@ -187,6 +189,126 @@ class Engine:
         except Exception as exc:
             # resource module not available on all platforms — not fatal
             print(f"[engine] Memory check unavailable: {exc}")
+
+    def _check_cpu_temp(self):
+        """Read SoC temperature from the Linux sysfs thermal zone and update state.
+
+        On the Pi 5, thermal_zone0 reflects the SoC junction temperature.
+        Warns at 75°C (Pi begins throttling CPU frequency) and logs critical at
+        80°C (sustained throttling with potential audio block drops).
+
+        When testing_overrides.enabled is true in config, uses the override value
+        instead of reading sysfs — allows full UI testing on macOS."""
+        overrides = self.cfg.get("testing_overrides", {})
+        if overrides.get("enabled") and overrides.get("cpu_temp_c") is not None:
+            temp_c = float(overrides["cpu_temp_c"])
+        else:
+            try:
+                with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                    temp_c = int(f.read().strip()) / 1000.0
+            except (OSError, ValueError):
+                # sysfs thermal zone unavailable (macOS dev, container, non-Pi Linux)
+                return
+
+        self.state.set(cpu_temp_c=round(temp_c, 1))
+
+        if temp_c >= 80:
+            if not self._temp_warned:
+                print(f"[engine] CRITICAL: CPU temperature {temp_c:.0f}°C — sustained throttling likely")
+                self._temp_warned = True
+            self.state.set(cpu_temp_warning=f"CPU {temp_c:.0f}°C — throttling")
+        elif temp_c >= 75:
+            if not self._temp_warned:
+                print(f"[engine] WARNING: CPU temperature {temp_c:.0f}°C — approaching throttle threshold")
+                self._temp_warned = True
+            self.state.set(cpu_temp_warning=f"CPU {temp_c:.0f}°C — near throttle threshold")
+        else:
+            if self._temp_warned:
+                print(f"[engine] CPU temperature recovered: {temp_c:.0f}°C")
+                self._temp_warned = False
+            self.state.set(cpu_temp_warning=None)
+
+    def _check_throttle(self):
+        """Read the Pi's throttle status via vcgencmd and update state.
+
+        The get_throttled bitmask encodes current and historical conditions:
+          Bit 0:  Under-voltage detected (now)
+          Bit 1:  Arm frequency capped (now)
+          Bit 2:  Currently throttled (now)
+          Bit 3:  Soft temperature limit active (now)
+          Bit 16: Under-voltage occurred (since boot)
+          Bit 17: Arm frequency capped occurred (since boot)
+          Bit 18: Throttling occurred (since boot)
+          Bit 19: Soft temperature limit occurred (since boot)
+
+        Only the lower 4 bits (current conditions) trigger a warning. Historical
+        bits are informational only. When testing_overrides.enabled is true, uses
+        the override value instead of calling vcgencmd."""
+        import subprocess
+
+        overrides = self.cfg.get("testing_overrides", {})
+        if overrides.get("enabled") and overrides.get("cpu_status") is not None:
+            throttle_hex = int(overrides["cpu_status"])
+        else:
+            try:
+                result = subprocess.run(
+                    ["vcgencmd", "get_throttled"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode != 0:
+                    return
+                # Output format: "throttled=0x50005"
+                raw = result.stdout.strip()
+                throttle_hex = int(raw.split("=")[1], 16)
+            except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+                # vcgencmd unavailable (macOS, container, non-Broadcom Linux)
+                return
+
+        # Decode the lower 4 bits for current conditions
+        issues = []
+        if throttle_hex & 0x1:
+            issues.append("under-voltage")
+        if throttle_hex & 0x2:
+            issues.append("freq-capped")
+        if throttle_hex & 0x4:
+            issues.append("throttled")
+        if throttle_hex & 0x8:
+            issues.append("soft-temp-limit")
+
+        if issues:
+            warning = ", ".join(issues)
+            self.state.set(cpu_status=f"0x{throttle_hex:X}: {warning}")
+        else:
+            self.state.set(cpu_status=None)
+
+    def _check_network(self):
+        """Check the WiFi/network link state via sysfs operstate.
+
+        Reads /sys/class/net/{iface}/operstate where iface is configured via
+        app.network_interface (defaults to 'wlan0'). Logs transitions so that
+        a WiFi drop is recorded in the journal even when the web interface is
+        unreachable (i.e., the event is captured on-device). Silently skips on
+        macOS and any platform without the sysfs net directory."""
+        iface = self.cfg["app"].get("network_interface", "wlan0")
+        try:
+            with open(f"/sys/class/net/{iface}/operstate") as f:
+                operstate = f.read().strip()
+            is_up = (operstate == "up")
+            self.state.set(network_ok=is_up)
+
+            if is_up:
+                if self._network_was_ok is False:
+                    print(f"[engine] Network link restored: {iface} is up")
+                self.state.set(network_warning=None)
+                self._network_was_ok = True
+            else:
+                if self._network_was_ok is not False:
+                    print(f"[engine] Network link down: {iface} operstate={operstate!r}")
+                self.state.set(network_warning=f"{iface} link {operstate}")
+                self._network_was_ok = False
+        except (OSError, ValueError):
+            # sysfs net directory unavailable (macOS, container)
+            pass
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -954,9 +1076,12 @@ class Engine:
             else:
                 print(f"[engine] Timezone validated: {system_tz}")
 
-        # Repair any incidents left open by a previous crash
+        # Repair any incidents left open by a previous crash.
+        # snippets_dir must be defined first so repair_stale_incidents() can
+        # attempt to re-attach orphaned temp WAV files before marking them.
+        snippets_dir = os.path.join(self.cfg["app"]["shared_dir"], "snippets")
         try:
-            repaired = self.storage.repair_stale_incidents()
+            repaired = self.storage.repair_stale_incidents(snippets_dir)
             if repaired:
                 print(f"[engine] Startup repaired {repaired} stale incident(s) from previous crash")
         except Exception as e:
@@ -964,7 +1089,6 @@ class Engine:
 
         # Run snippet cleanup at engine startup (only if auto-purge is explicitly enabled)
         retention_days = int(self.cfg["audio"].get("retention_days", 30))
-        snippets_dir = os.path.join(self.cfg["app"]["shared_dir"], "snippets")
         auto_purge = bool(self.cfg["audio"].get("auto_purge_enabled", False))
         if auto_purge:
             try:
@@ -977,6 +1101,9 @@ class Engine:
             print(f"[engine] Auto-purge disabled — skipping snippet cleanup (retention_days={retention_days})")
 
         self._check_disk_quota()
+        self._check_cpu_temp()
+        self._check_throttle()
+        self._check_network()
 
         # Periodic DB vacuum to reclaim space from soft-deleted rows
         try:
@@ -986,11 +1113,28 @@ class Engine:
             print(f"[engine] DB vacuum error: {e}")
 
         last_cleanup = time.time()
-        CLEANUP_INTERVAL = 86400  # Re-run cleanup once per day
-        audio_fail_count = 0      # Consecutive audio I/O failures (for backoff)
+        last_network_check = time.time()
+        last_temp_check = time.time()
+        CLEANUP_INTERVAL = 86400   # Re-run disk/memory checks once per day
+        NETWORK_CHECK_INTERVAL = 60  # Re-check network link every minute
+        TEMP_CHECK_INTERVAL = 30     # Re-check CPU temperature every 30 seconds
+        audio_fail_count = 0       # Consecutive audio I/O failures (for backoff)
 
         while self.running:
             try:
+                now = time.time()
+
+                # Network and temp checks run regardless of armed state —
+                # infrastructure events should be logged even while paused.
+                if now - last_network_check >= NETWORK_CHECK_INTERVAL:
+                    self._check_network()
+                    last_network_check = now
+
+                if now - last_temp_check >= TEMP_CHECK_INTERVAL:
+                    self._check_cpu_temp()
+                    self._check_throttle()
+                    last_temp_check = now
+
                 if not self.state.snapshot()["armed"]:
                     time.sleep(0.25)
                     continue

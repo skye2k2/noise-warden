@@ -9,6 +9,8 @@ class StateStore:
         self._state = {
             "active_incident_id": None,
             "armed": True,
+            "cpu_temp_c": None,
+            "cpu_temp_warning": None,
             "current_db": 0.0,
             "current_threshold_db": 0.0,
             "disk_free_mb": None,
@@ -16,6 +18,9 @@ class StateStore:
             "last_error": None,
             "mic_ok": False,
             "mode": "idle",
+            "network_ok": None,
+            "cpu_status": None,
+            "network_warning": None,
             "recording_enabled": True,
             "responding": False,
             "running": False,
