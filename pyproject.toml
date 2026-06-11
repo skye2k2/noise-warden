@@ -1,6 +1,6 @@
 [project]
 name = "noise-warden"
-version = "0.5.0"
+version = "17"
 description = "Pi-deployable nuisance noise incident logging and management"
 requires-python = ">=3.11"
 dependencies = [

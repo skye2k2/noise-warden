@@ -2,24 +2,51 @@
 {% block content %}
 <div class="card">
   <h2>Incidents</h2>
+
+  <!-- Classification filter toggles for excluded/auto-dismissed incidents -->
+  <details class="filter-panel" {% if active_filters %}open{% endif %}>
+    <summary>Classification Controls (beta)</summary>
+    <form id="filter-form" method="get" action="/incidents">
+      <div class="filter-group">
+        <label><input type="checkbox" id="diag-toggle" onchange="toggleDiagnostics(this.checked)">
+          <strong>Show classifications</strong></label>
+        <span class="small" style="opacity:0.7"> — incidents lead with loudness over threshold; classification is a tentative hint only.</span>
+      </div>
+      <div class="filter-group">
+        <strong>Auto-dismissed:</strong>
+        {% for cls in ["borderline", "drive_by", "too_short"] %}
+        <label><input type="checkbox" name="cls" value="{{ cls }}"
+          {% if cls in active_filters %}checked{% endif %}
+          onchange="applyFilters()"> {{ cls | replace("_", " ") | title }}</label>
+        {% endfor %}
+      </div>
+      <div class="filter-group">
+        <strong>Filter-excluded:</strong>
+        {% for cls in ["amplified_bass", "birdsong", "conversation", "diesel", "impulse", "mower", "rain", "thunder", "weedwhacker"] %}
+        <label><input type="checkbox" name="cls" value="{{ cls }}"
+          {% if cls in active_filters %}checked{% endif %}
+          onchange="applyFilters()"> {{ cls | replace("_", " ") | title }}</label>
+        {% endfor %}
+      </div>
+    </form>
+  </details>
+
   <table>
     <tr class="header">
       <th>Start <span class="small" id="tz-offset-label"></span></th><th>Length</th><th>Peak</th><th>Avg</th>
       <th title="Peak dB above the active ordinance threshold. &#10;&#10;Borderline = at or below threshold + margin &#10;+15–24 dB = notable (amber) &#10;+25–29 dB = moderate (orange) &#10;+30–39 dB = severe (red) &#10;+40+ dB = extreme (deep red)">Excess</th>
       <th title="Music-like score (0–1): How closely the spectral profile resembles music. &#10;&#10;0.00–0.30 = environmental (wind, HVAC, traffic) &#10;0.30–0.50 = mechanical (mower, diesel, fan) &#10;0.50–0.62 = ambiguous (could be tonal noise or distant music) &#10;0.62–0.80 = likely music (bass through walls, muffled speakers) &#10;0.80–1.00 = almost certainly music (clear rhythm + bass)">Music</th>
-      <th title="Beat confidence (0–1): Rhythmic periodicity of the amplitude envelope. &#10;&#10;0.00–0.40 = no detectable rhythm (nature, steady drones) &#10;0.40–0.55 = weak periodicity (engine idle, irregular traffic) &#10;0.55–0.70 = moderate rhythm (could be music or repetitive machinery) &#10;0.70–0.85 = strong beat (likely music with a clear tempo) &#10;0.85–1.00 = very strong beat (dance/electronic music, heavy bass)">Beat</th>
-      <th title="music · music_like · engine_noise · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · amplified_bass · conversation · drive_by · forced_test">Class</th><th>File</th><th>Notes</th>
+      <th title="music_like · engine_noise · unknown · impulse · thunder · rain · birdsong · weedwhacker · mower · diesel · amplified_bass · conversation · drive_by · forced_test" class="diag-col">Class</th><th>File</th><th>Notes</th>
     </tr>
     {% for r in rows %}
-    <tr>
+    <tr{% if r.excluded %} class="excluded-row"{% endif %}>
       <td class="incident-ts" data-ts="{{ r.start_ts }}">{{ r.start_ts }}</td>
       <td>{% if r.duration_sec is not none %}{% if r.duration_sec >= 3600 %}{{ "%.1f"|format(r.duration_sec / 3600) }}h{% elif r.duration_sec >= 60 %}{{ "%.1f"|format(r.duration_sec / 60) }}m{% else %}{{ r.duration_sec|int }}s{% endif %}{% endif %}</td>
       <td>{{ r.peak_db }}</td>
       <td>{{ r.avg_db }}</td>
       <td>{% if r.peak_db and r.threshold_db %}{% set ex = r.peak_db - r.threshold_db %}<span class="excess-cell" data-excess="{{ "%.1f"|format(ex) }}">{{ "+" if ex >= 0 }}{{ "%.1f"|format(ex) }}dB</span>{% endif %}</td>
       <td title="{% if r.music_like_score >= 0.80 %}Almost certainly music{% elif r.music_like_score >= 0.62 %}Likely music{% elif r.music_like_score >= 0.50 %}Ambiguous{% elif r.music_like_score >= 0.30 %}Mechanical{% else %}Environmental{% endif %}">{{ "%.2f"|format(r.music_like_score) }}</td>
-      <td title="{% if r.beat_confidence >= 0.85 %}Very strong beat{% elif r.beat_confidence >= 0.70 %}Strong beat{% elif r.beat_confidence >= 0.55 %}Moderate rhythm{% elif r.beat_confidence >= 0.40 %}Weak periodicity{% else %}No rhythm{% endif %}">{{ "%.2f"|format(r.beat_confidence) }}</td>
-      <td>{{ r.classification }}</td>
+      <td class="diag-col">{{ r.classification }}</td>
       <td>
         {% if r.snippet_path %}<button class="snippet-play-btn"
           data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "class_journal": r.class_journal or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
@@ -36,11 +63,17 @@
     {% endfor %}
   </table>
   <p>
-    {% if page > 1 %}<a href="/incidents?page={{ page - 1 }}">Prev</a>{% endif %}
+    {% if page > 1 %}<a href="/incidents?page={{ page - 1 }}{% if show_param %}&show={{ show_param }}{% endif %}">Prev</a>{% endif %}
     &nbsp; Page {{ page }} of {{ pages }} &nbsp;
-    {% if page < pages %}<a href="/incidents?page={{ page + 1 }}">Next</a>{% endif %}
+    {% if page < pages %}<a href="/incidents?page={{ page + 1 }}{% if show_param %}&show={{ show_param }}{% endif %}">Next</a>{% endif %}
   </p>
   <p><a href="/export.csv">Export CSV</a></p>
+  <p>
+    <form method="post" action="/incidents/clear-autodismissed"
+          onsubmit="return confirm('Delete all auto-dismissed/excluded incidents and their quarantined WAV files? This cannot be undone.')">
+      <button class="destructive">Clear Auto-Dismissed Incidents</button>
+    </form>
+  </p>
   <p>
     <form method="post" action="/incidents/clear-crash-repaired"
           onsubmit="return confirm('Delete all crash-repaired incidents (entries with no audio that were left open when the engine crashed unexpectedly)?')">
@@ -69,6 +102,54 @@
 </div>
 
 {% include '_popup.html' %}
+
+<script>
+/**
+ * Collect checked classification filter checkboxes and navigate to the
+ * filtered URL. Resets to page 1 when filters change.
+ */
+function applyFilters() {
+  var checked = [];
+  document.querySelectorAll('#filter-form input[name="cls"]:checked').forEach(function (cb) {
+    checked.push(cb.value);
+  });
+  var url = '/incidents?page=1';
+  if (checked.length > 0) {
+    url += '&show=' + checked.join(',');
+  }
+  window.location.href = url;
+}
+
+/**
+ * Show/hide the diagnostic Class column. Classification is a tentative hint, not
+ * the basis of an enforcement decision, so the table leads with loudness and
+ * keeps Class hidden until the reviewer opts in. Preference persists in
+ * localStorage so it survives navigation. (The detail popup always shows the
+ * classification — that is the diagnostic view.)
+ */
+function toggleDiagnostics(show) {
+  document.querySelectorAll('.diag-col').forEach(function (el) {
+    el.style.display = show ? '' : 'none';
+  });
+  try {
+    localStorage.setItem('nw-show-diagnostics', show ? '1' : '0');
+  } catch (e) { /* private browsing — non-fatal */ }
+}
+
+// Apply persisted preference on load (default: hidden).
+(function initDiagnostics() {
+  var saved = '0';
+  try {
+    saved = localStorage.getItem('nw-show-diagnostics') || '0';
+  } catch (e) { /* ignore */ }
+  var show = saved === '1';
+  var box = document.getElementById('diag-toggle');
+  if (box) {
+    box.checked = show;
+  }
+  toggleDiagnostics(show);
+})();
+</script>
 
 <script>
 /**

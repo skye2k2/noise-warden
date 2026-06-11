@@ -95,9 +95,21 @@ nav a:hover {
   color: var(--text-nav-active);
 }
 
-/* Push the theme toggle to the right side of the nav */
-#theme-toggle {
+/* Version label + theme toggle group on the right side of the nav.
+   The version takes the auto margin to push the group right; the toggle then
+   sits directly after it with a small fixed gap. */
+.nav-version {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  padding: 0 4px;
+  color: var(--text-nav);
+  opacity: 0.6;
+  white-space: nowrap;
+}
+
+#theme-toggle {
+  margin-left: 4px;
   background: none;
   border: 1px solid var(--text-nav);
   color: var(--text-nav);
@@ -311,6 +323,17 @@ tr.active-rule {
 [data-theme="dark"] #offline-indicator {
   background: #922b21;
 }
+
+/* ---- Classification filter panel ---- */
+.filter-panel { margin-bottom: 1em; }
+.filter-panel summary { cursor: pointer; font-weight: bold; padding: 4px 0; }
+.filter-group { margin: 6px 0; }
+.filter-group label { margin-right: 12px; white-space: nowrap; cursor: pointer; }
+.filter-group input[type="checkbox"] { margin-right: 3px; vertical-align: middle; }
+
+/* Highlight excluded rows in the table so they're visually distinct */
+tr.excluded-row { opacity: 0.7; }
+tr.excluded-row td:first-child::before { content: "\u25CB "; color: var(--muted, #888); }
 
 /* ---- Narrow-screen adjustments ---- */
 @media screen and (max-width: 600px) {

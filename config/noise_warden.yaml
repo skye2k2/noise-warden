@@ -45,8 +45,9 @@ detection:
   # When in music-focused mode, we use a combination of calculations to determine music-like characteristics.
   # Still training.
   song_gap_merge_sec: 12
+  music_focus_gap_merge_sec: 45        # In continuous_music_focus mode only, the gap-merge window (seconds) before an active incident finalizes. Longer than song_gap_merge_sec because music dips below threshold between songs / during quiet passages / when a passing vehicle briefly masks the bass; a longer window keeps one nuisance session as a single incident instead of fragmenting it (and prevents a brief re-rise from being auto-dismissed as a separate drive-by). Other modes use song_gap_merge_sec.
   min_music_like_score: 0.62
-  min_beat_confidence: 0.20
+  engine_midband_veto: 0.40            # If midband_ratio (180-1200 Hz energy) exceeds this, classify as engine_noise rather than music_like. Engine/vehicle/aircraft noise concentrates in the midband; music has a scooped-mid "smiley EQ". Calibrated from 3 months of labeled data: confirmed music midband p75 ~0.22, engine sources routinely >0.40. Lower = more aggressive engine rejection (risks vetoing genuine music); raise toward 0.50 if real music is being misclassified.
   impulse_peak_delta_db: 14.0
   # Filter holdover: once a filter runs for holdover_min_run consecutive blocks,
   # it persists through up to holdover_max_gap unmatched blocks. Prevents mower
@@ -132,9 +133,9 @@ detection:
   # a garage or exterior wall, the low-frequency energy dominates. The result is
   # a steady, bass-heavy signal with a remarkably high music-like score.
   # Through walls (~90 dB): lowband 0.36–0.61, centroid 1833–3301, flatness 0.18–0.33,
-  # mscore 0.69–0.79 (all ≥ 0.60), bconf 0.04–0.86 (median 0.54).
+  # mscore 0.69–0.79 (all ≥ 0.60).
   # Open windows (~90 dB): lowband 0.09–0.44, centroid 2131–4678, flatness 0.21–0.44,
-  # mscore 0.40–0.73 (median 0.50), bconf 0.00–0.66 (truck overlay kills rhythm).
+  # mscore 0.40–0.73 (median 0.50).
   # Checked after birdsong, before rain/mower in filter priority.
   # Safety: rain blocked by lowband (max 0.137 < 0.16), mower by lowband+mscore,
   # diesel blocked by flatness (median 0.151 < 0.20). Zero false positives on all clips.
@@ -143,7 +144,6 @@ detection:
   amplified_bass_centroid_max_hz: 4000 # Through-wall 1833–3301; open-window extends to 4678, bulk below 4000
   amplified_bass_env_std_max: 3.0      # Real bass music: 0.68–2.05. Steady thump is remarkably consistent
   amplified_bass_min_history: 6        # Minimum db_history length before filter activates
-  amplified_bass_min_beat_confidence: 0.0   # Disabled — truck/wind overlays destroy rhythm. Flatness guards diesel instead
   amplified_bass_flatness_min: 0.20    # Diesel guard — diesel flatness median 0.151, bass music min 0.207
   # Mower targeting: sustained mid-frequency mechanical drone (300–4000 Hz centroid).
   # Real gas mower: flatness 0.28–0.48, centroid 800–3450+, highband ≤ 0.664,
@@ -188,13 +188,9 @@ detection:
   # or mower profiles. Runs late in the filter chain (after mower and diesel)
   # to catch remaining engine-like sounds falling between those specific profiles.
   # Real propeller plane flyover: centroid 2508–10631, flatness 0.22–0.47,
-  # lowband 0.16–0.47, midband 0.19–0.42, env_std 0–6.16, bconf 0–0.69.
+  # lowband 0.16–0.47, midband 0.19–0.42, env_std 0–6.16.
   # Real vehicle acceleration: centroid 1412–5283, flatness 0.11–0.47,
-  # midband 0.33–0.73 (dominant), env_std 0–7.87, bconf 0–0.17.
-  # Key separator from music: beat confidence. Engine sounds have low bconf
-  # (propeller noise is broadband, changing RPMs destroy periodicity);
-  # music has consistent rhythm (bconf > 0.38). Diesel has high bconf from
-  # firing cycle, but is caught by its own filter earlier in the chain.
+  # midband 0.33–0.73 (dominant), env_std 0–7.87.
   flyover_flatness_min: 0.15           # Above pure-tone diesel (≤ 0.20), below broadband rain
   flyover_flatness_max: 0.55           # Below rain/mower broadband ceiling
   flyover_centroid_min_hz: 1400       # Real plane 2508+, vehicle accel 2300+; raised from 1400 to exclude storm-rain ambient (1400–1831)
@@ -205,7 +201,6 @@ detection:
   flyover_highband_max: 0.60          # Separates from escaped mower blocks (highband 0.56–0.82)
   flyover_env_std_max: 8.0            # Allows approach/departure amplitude arc — real plane median 2.7
   flyover_min_history: 4              # Short — flyovers are transient (user reports max ~45 seconds)
-  flyover_max_beat_confidence: 0.50    # Reject rhythmic sounds (likely music, not engine)
   # Conversation targeting: mid-frequency speech with syllable-level amplitude modulation.
   # Broadest catch — checked last in filter priority order. Not yet battle-tested.
   conversation_centroid_min_hz: 500

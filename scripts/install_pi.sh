@@ -38,7 +38,16 @@ echo ""
 
 # --- Create base directory structure ---
 sudo mkdir -p "$BASE" "$SHARED" "$SHARED/snippets" "$SHARED/playlist" "$SHARED/build"
-sudo chown -R "$USER:$USER" "$BASE"
+# --- Set ownership for the service user ---
+sudo chown -R noisewarden:noisewarden "$BASE"
+
+# --- Add the installing user to the noisewarden group ---
+# Allows SSH/VS Code file browsing without sudo. Only needed on the Pi —
+# the service creates WAV snippets owned by noisewarden:noisewarden.
+if [ "$USER" != "noisewarden" ]; then
+    sudo usermod -a -G noisewarden "$USER" 2>/dev/null || true
+    echo "  Added $USER to noisewarden group (re-login for effect)."
+fi
 
 # --- Copy project files into /opt (skip .venv, .git, __pycache__, .pytest_cache) ---
 # If the source IS already inside /opt/noise-warden, skip the copy

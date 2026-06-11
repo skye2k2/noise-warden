@@ -215,6 +215,20 @@ Key invariants:
 
 **`paInvalidSampleRate` ALSA errors in journal** — the microphone doesn't support the configured sample rate (default 22050 Hz). Many cheap USB audio dongles only support 44100 or 48000 Hz. The app will automatically fall back to the device's default rate and log a warning, but to fix it permanently, set `sample_rate: 48000` (or `44100`) in your config. Check what your device supports: `arecord -D hw:1,0 --dump-hw-params /dev/null 2>&1 | grep RATE` (adjust `hw:1,0` to your card number from `arecord -l`)
 
+**Permission denied downloading snippets** — snippet WAV files are
+owned by the `noisewarden` service user. If the service's umask is too restrictive
+(systemd default creates files as `600` / owner-only), your SSH user can't read them.
+Do the following:
+
+1. **Set `UMask=0022` in the service file** so new files are world-readable (`644`):
+   > Already set in deploy/noise-warden.service as of v13+.
+    `grep UMask /etc/systemd/system/noise-warden.service`
+2. Fix existing files that were created with restrictive permissions:
+    `sudo chmod -R a+rX /opt/noise-warden/shared/`
+3. Add your SSH user to the noisewarden group (belt-and-suspenders):
+    `sudo usermod -a -G noisewarden $USER`
+4. Log out and back in (or newgrp noisewarden) for the group change to take effect.
+
 **`Error querying device -1` looping in journal** — the service's PortAudio device cache went stale. This typically happens when the PulseAudio/PipeWire audio profile for the USB mic is changed while the service is already running (e.g., switching from "Analog Stereo Duplex" to "Analog Stereo Input" in the OS sound settings). The engine now automatically forces a PortAudio device rescan on each reconnection attempt and uses escalating backoff (2s → 30s) to avoid log spam. In most cases, the service will self-recover within a few attempts once the profile settles. If it doesn't recover after ~10 attempts (the journal will say "10 consecutive audio failures"), use the **Restart Service** button on the dashboard, or from SSH: `sudo systemctl restart noise-warden`. You can verify the current profile with `pactl list cards` and confirm the mic is visible to ALSA with `arecord -l`. For a mic-only device (no speaker output), the `input:analog-stereo` profile is correct.
 
 **TLS certificate warning won't go away / pages not caching on phone** — the self-signed TLS certificate must be accepted in the browser for the Service Worker (and thus offline caching) to function. On iOS Safari, you may need to go to Settings → General → About → Certificate Trust Settings and enable the certificate. On Android Chrome, tapping "Advanced" → "Proceed" on the warning page is sufficient. If you regenerate the certificate (delete `/opt/noise-warden/tls/` and re-run `install_pi.sh`), you'll need to accept the new cert on all devices again.
@@ -362,6 +376,12 @@ uvicorn noise_warden.main:app --host 127.0.0.1 --port 8787 --reload --reload-inc
 
 Open [http://127.0.0.1:8787/](http://127.0.0.1:8787/) in your browser. The `--reload` flag auto-restarts on code changes.
 
+**Stopping the server**: Ctrl-C in the terminal. If the port is still in use after stopping (the WatchFiles reloader can leave an orphaned subprocess), kill it with:
+```bash
+# Find and kill whatever is holding port 8787
+kill $(lsof -ti :8787)
+```
+
 Your laptop's built-in microphone will be used by default (the `input_device: null` config setting picks the system default). You can verify it's capturing audio on the dashboard's live dB readout — clap or talk near the mic to watch it spike.
 
 #### Running the test suite
@@ -438,6 +458,12 @@ Configuration is stored in `config/noise_warden.yaml` and can also be edited via
 > [!TIP]
 > If you, like me, do not have access to high-end recording equipment, you might try calibrating and testing your noise-warden configuration using a handy YouTube or sound site recording. _Extensive_ analysis of exactly this kind of source data has revealed that YouTube submissions and subsequent compression completely washes out the volume of diesel engines, to the point of not being able to ever trigger the detection criteria. You can try if you want, but be warned. However, high-fidelity FLAC recordings by design contain the data we need as part of the digital signal processing engine, provided that the microphone used was not absolute garbage. Many times you can find helpful audiophiles on [freesound.org](freesound.org) whose audio files (pun intended) meet our criteria. You can then download, downsample, decouple, and export to an uncompressed mono WAV at a sample rate of 44.1khz and 16-bit depth using your sound editor of choice.
 
+### A note on classification
+
+This system is **infraction-first**: the trustworthy signal is *loudness over the ordinance threshold, sustained over time*. Sound-source classification (music, flyover, mower, etc.) is a **tentative hint only** — useful for triage, never the basis of an enforcement claim. The Class column on the incidents page is hidden by default behind a "Show diagnostics" toggle for exactly this reason.
+
+Notably, **beat/rhythm detection was tried and removed** — it does not separate music from the dominant false positives, because aircraft, diesels, and helicopters are themselves rhythmic machines. The full reasoning (and why classification with an in-house mid-range mic is fundamentally harder than analyzing studio recordings) is recorded in **[docs/DECISIONS.md](docs/DECISIONS.md)** so it is not "rediscovered" and re-attempted later.
+
 ## Features
 
 - **Intelligent gating, recording, and logging of incidents** — hysteresis-based state machine prevents chatter at threshold boundaries; song-gap merging (default 10 sec) bundles closely-spaced noise events into single incidents. Optional `record_borderline_events: false` auto-dismisses incidents whose peak is within `borderline_margin_db` of the threshold (classified as 'borderline', snippet quarantined), keeping the log focused on clear violations
@@ -502,6 +528,11 @@ python -m noise_warden.reclassify --all --update --denoise --normalize
 # Clean up stale DB references after manually deleting snippet files
 python -m noise_warden.reclassify --purge-orphans
 
+# Restore snippet_path from the WAV files on disk (recovers a database copied
+# to a new machine if snippet references were lost). Files are matched by the
+# incident id embedded in incident_{id}_*.wav filenames.
+python -m noise_warden.reclassify --repair-snippet-paths
+
 # Purge orphans then reclassify all remaining snippets
 python -m noise_warden.reclassify --purge-orphans --all
 
@@ -551,7 +582,7 @@ pytest tests/ -v -s
 |------|--------|
 | `test_audio.py` | AudioCapture blocking/callback modes, pre-roll buffer, queue drain, stream lifecycle |
 | `test_config.py` | YAML loading, validation, required sections, error paths |
-| `test_dsp.py` | RMS/dBFS math, A-weighting, spectrum features, beat confidence, music score, exclusion filters |
+| `test_dsp.py` | RMS/dBFS math, A-weighting, spectrum features, music score, exclusion filters |
 | `test_engine.py` | Lifecycle, incident creation, disarmed skip, error recovery, drive-by detection, drive-by quarantine, disk quota, disk-full recording stop, weighted avg dB, device validation, day/night boundary split, max duration split, self-noise suppression (response start/stop/cooldown) |
 | `test_ordinance.py` | Threshold lookups, day/night boundary edge cases, ordinance data integrity |
 | `test_plugins.py` | ReferenceSubtractor NLMS adaptation/convergence, DualMicDifferential spectral subtraction, single-mic pass-through |
@@ -804,47 +835,9 @@ Add to crontab (`crontab -e`):
 
 ## TODOs & Issues
 
-<details>
-
-### Speculative / future use cases
-
-- TODO: What if someone wants to use this for identifying overall dog nuisance? Dog barks have a particular noise pattern, and could even be categorized with some spectrographic analysis into "dog1", "dog2", for individual incidents and later tagged with names/locations, etc. I even have a recording of the neighbor dog, now. Would this just completely break _my_ use case?
-- TODO: We could also potentially provide clean recordings of birds (robin, seagull, dove, quail, crow, sparrow-finch-things, roosters) to either identify and record or definitively _exclude_, based on spectral matching. Then potentially other things, like car alarms, lawn mowers, and weedwhackers.
-- TODO: Consider alternate usage scenario as a cheap sleep snoring monitor--enabled for _nighttime_ only, coupled with a deep sleep monitor, some correlations could be determined. And easier than having a recorder run _all_ night, and then needing to scrub eight hours of recording for potential data.
-- TODO: Consider minority impulse and unknown entries to not be technically part of the (multiple) stipulation.
-- TODO: Now that we have a number of different classifications, i see them being applied a little too strictly, like in thunder-and-light-rain and thunder-cracks--if we are only going to classify something for a block or three, differently than the sweeping majority, it should not be bolded. Or maybe more, if we implement weighting and backtracking. Because, for example, we _know_ that thunder rumble trail off looks like a diesel, but the odds that someone started their diesel up _right_ as a thunderclap hits is extraordinarily low, so we should clamp.
-- TODO: The yaml configuration has some odd sorting and grouping, like which things are put under `audio` versus `detection`. I might change `audio` to `recording`, and move things like `noise_floor_db` and `calibration_offset_db` into it.
-- TODO: Make sure that the system will function the same with 48kHz sampling and recording.
-- TODO: Under windy conditions, that portion of the attic has a few locations that creak/rattle. Shim/reattach/glue/foam insulate as best as possible.
-- TODO: It also feels that the reclassifying did not _actually_ reclassify the data...denoise, normalize, re-journal. Because manually clicking re-analyze still had changes it would apply, despite the batch job having run. Pick one from the second page that I did not already click through to manually reclassify on, download it, and compare to the original download from 2026-04-19.
-- TODO: Add instruction to (right-click on the player and select "Save Audio as..." to export audio)
-- TODO: The backup job that is recommneded is just the database--if you want the _data_, you also need to grab the snippets directory. And if you are just connected to the webapp, you may just want to "download all", instead of clicking into each to right-click-and-save-as individually.
-- TODO: In music-detection mode, have the ability to drop everything _except_ unknown and music
-- TODO: If it helps classification, we can apply some mutual exclusion filters. For example, if thunder has been detected, it should stick very heavily, even if the system thinks it heard a plane flyover (they so have a lot of similarity), because the two events are pretty much mutually exclusive — **PARTIALLY ADDRESSED in v14**: Thunder Path B threshold relaxation (rumble_min_db 95→40, rumble_centroid_max 1300→1500) now catches enough consecutive rumble blocks to activate holdover, which naturally suppresses flyover during active thunder. True explicit mutual exclusion (post-processing reclassification of flyover→thunder when both appear) remains a potential future enhancement for journal cleanup.
-
-### Architecture
-
-- TODO: **Externalize ordinance thresholds from `ordinance.py` into `noise_warden.yaml`** — Currently, the Pleasant Grove UT thresholds are hardcoded in `ordinance.py` as a Python dict. The thresholds page, config page, and engine all reference this hardcoded data. A proper `ordinance:` section in the YAML would: (a) make thresholds user-editable without touching source code, (b) eliminate magic numbers specific to one city from the codebase, (c) allow the thresholds page to stitch together config + ordinance data for a complete picture, and (d) make evidence logs more credible by having explicit, traceable ordinance references. The YAML section should include: city name, ordinance section reference, day/night hour boundaries, zone-specific dB thresholds per category (continuous, intermittent, impulse), measurement guidance (weighting, mic placement), and legal notes. `ordinance.py` becomes a loader that reads from config instead of a hardcoded dict. All existing test assertions against `ORDINANCE` values need to be updated to use fixture-injected config.
-
-### Functionality
-
-- **`music_like_score` formula still uses undocumented magic numbers** — Same formula as v3 (`0.6 * low + 0.4 * tonal_window`). Now documented inline as "strong low-band energy + not-too-flat spectrum" which is better, but the specific weights (0.6, 0.4, 1.6, 0.35) remain unvalidated.
-
-### Performance
-
-- **Dual-mic plugins not wired into engine** — `ReferenceSubtractor` (NLMS) and `DualMicDifferential` (spectral subtraction) are implemented in `plugins.py` with documented algorithms but not yet called from the engine loop. Requires creating a second `AudioCapture` instance for the reference device.
-
-### Usability
-
-- **Build page only stores one photo** — Uploading a new photo will overwrite the previous one.
-
-### Security
-
-- **Auth token now encrypted in transit** — Bearer token transmitted over TLS (self-signed certificate generated during install). While a self-signed cert doesn't verify identity, it does encrypt traffic — sniffing the LAN no longer exposes the token in cleartext.
-- **`/api/state` and `/api/health` have no auth** — These endpoints bypass `must_auth()`. Low-risk read-only data on LAN, but noted for awareness.
-
-### Install / deploy
-
-- **Install script enforces `/opt/noise-warden/` but config hardcodes paths** — Both `install_pi.sh` and `noise_warden.yaml` assume `/opt/noise-warden/` paths. Changing one without the other breaks silently. The `NOISE_WARDEN_CONFIG` env var helps for the config file itself but doesn't address the hardcoded `shared_dir`, `base_dir`, etc. inside the YAML.
-
-</details>
+> **Where things live now:** Remaining engineering work is tracked in [NEXT.md](NEXT.md).
+> The reasoning behind significant/rejected design choices (why beat detection was
+> removed, infraction-first, the in-house-mic vs. studio-recording problem, the
+> single-process architecture, etc.) is in [docs/DECISIONS.md](docs/DECISIONS.md).
+> This section keeps only physical-deployment notes and a few open issues not yet
+> promoted into NEXT.md.

@@ -14,7 +14,6 @@ CREATE TABLE IF NOT EXISTS incidents (
   avg_db REAL,
   threshold_db REAL,
   music_like_score REAL,
-  beat_confidence REAL,
   classification TEXT,
   mode TEXT,
   responded INTEGER DEFAULT 0,
@@ -45,7 +44,7 @@ CREATE TABLE IF NOT EXISTS calibration_profiles (
 '''
 
 # Increment this when adding migrations. Each migration runs exactly once.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 class Storage:
     def __init__(self, db_path: str):
@@ -100,6 +99,18 @@ class Storage:
             except Exception:
                 pass  # Column already exists (fresh DB created with updated SCHEMA)
 
+        # Migration 4: drop beat_confidence — empirically it does not discriminate
+        # music from rhythmic engine noise (planes/diesels/helicopters share the
+        # same autocorrelation range as music), so the feature was fully removed.
+        # SQLite 3.35+ supports DROP COLUMN; the try/except covers older engines
+        # and the already-dropped case (fresh DB created with the updated SCHEMA).
+        if current < 4:
+            print(f"[storage] Running migration to schema version 4")
+            try:
+                c.execute("ALTER TABLE incidents DROP COLUMN beat_confidence")
+            except Exception:
+                pass
+
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         print(f"[storage] Schema version now {SCHEMA_VERSION}")
 
@@ -108,37 +119,38 @@ class Storage:
             cur = c.execute('''
                 INSERT INTO incidents (
                     start_ts,start_db,peak_db,avg_db,threshold_db,music_like_score,
-                    beat_confidence,classification,mode,responded,merge_count,snippet_path,notes,excluded
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    classification,mode,responded,merge_count,snippet_path,notes,excluded
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             ''', (
                 row["start_ts"], row["start_db"], row["peak_db"], row["avg_db"], row["threshold_db"],
-                row["music_like_score"], row["beat_confidence"], row["classification"], row["mode"],
+                row["music_like_score"], row["classification"], row["mode"],
                 int(row.get("responded", 0)), int(row.get("merge_count", 0)), row.get("snippet_path"), row.get("notes", ""),
                 int(row.get("excluded", 0))
             ))
             return int(cur.lastrowid)
 
-    def finalize_incident(self, incident_id: int, end_ts: str, duration_sec: float, peak_db: float, avg_db: float, snippet_path: str | None, class_journal: str | None = None, classification: str | None = None):
+    def finalize_incident(self, incident_id: int, end_ts: str, duration_sec: float, peak_db: float, avg_db: float, snippet_path: str | None, class_journal: str | None = None, classification: str | None = None, music_like_score: float | None = None):
         with self.conn() as c:
             c.execute('''
                 UPDATE incidents
                 SET end_ts=?, duration_sec=?, peak_db=?, avg_db=?, snippet_path=?,
                     class_journal=COALESCE(?, class_journal),
-                    classification=COALESCE(?, classification)
+                    classification=COALESCE(?, classification),
+                    music_like_score=COALESCE(?, music_like_score)
                 WHERE id=?
-            ''', (end_ts, duration_sec, peak_db, avg_db, snippet_path, class_journal, classification, incident_id))
+            ''', (end_ts, duration_sec, peak_db, avg_db, snippet_path, class_journal, classification, music_like_score, incident_id))
 
     def update_incident_notes(self, incident_id: int, notes: str):
         with self.conn() as c:
             c.execute("UPDATE incidents SET notes=? WHERE id=?", (notes, incident_id))
 
     def soft_delete_incident(self, incident_id: int):
-        """Soft-delete an incident and remove its snippet file from disk.
+        """Hard-delete an incident and remove its snippet file from disk.
 
-        The snippet WAV is the primary disk consumer — leaving it behind after
-        deletion creates orphaned files that confuse reclassify --all and waste
-        SD card space on the Pi. The snippet_path column is NULLed to prevent
-        stale references."""
+        Deleting via the UI implies the user wants the incident gone entirely —
+        not just hidden. Removes the WAV (checking both the original path and
+        the autodismissed/ quarantine), then DELETEs the DB row so it no longer
+        inflates counts or appears in reclassify-all."""
         with self.conn() as c:
             row = c.execute(
                 "SELECT snippet_path FROM incidents WHERE id=?", (incident_id,)
@@ -152,23 +164,33 @@ class Storage:
                             os.remove(candidate)
                         except OSError:
                             pass
-            c.execute(
-                "UPDATE incidents SET deleted=1, snippet_path=NULL WHERE id=?",
-                (incident_id,),
-            )
+            c.execute("DELETE FROM incidents WHERE id=?", (incident_id,))
 
     def soft_delete_all_incidents(self):
         """Soft-delete all non-deleted incidents."""
         with self.conn() as c:
             c.execute("UPDATE incidents SET deleted=1 WHERE deleted=0")
 
-    def purge_orphaned_incidents(self):
-        """NULL out snippet_path for incidents whose WAV file no longer exists.
+    def purge_orphaned_incidents(self, snippets_dir=None):
+        """NULL out snippet_path for incidents whose WAV file cannot be found.
 
         This prevents reclassify --all from reporting hundreds of "skipped
         (no file)" entries after manual snippet cleanup on the Pi. Only
         touches non-deleted rows — deleted rows are already invisible to
-        normal queries. Returns count of orphaned rows cleaned up."""
+        normal queries. Returns count of orphaned rows cleaned up.
+
+        Resolution is portable: a row is only considered orphaned if its WAV
+        cannot be found at the stored path NOR by basename in the current
+        snippets directory (nor its autodismissed/ subfolder). This is critical
+        when a database is copied from the Pi (/opt/.../snippets/) to a dev
+        machine (./local_data/snippets/) — the stored absolute paths won't
+        exist, but the files do, so we must NOT null them out. snippets_dir
+        defaults to the snippets directory beside the database file."""
+        from .config import resolve_snippet_path
+
+        if snippets_dir is None:
+            snippets_dir = os.path.join(os.path.dirname(self.db_path), "snippets")
+
         with self.conn() as c:
             rows = c.execute(
                 "SELECT id, snippet_path FROM incidents "
@@ -177,8 +199,7 @@ class Storage:
 
         orphaned = 0
         for row in rows:
-            path = row["snippet_path"]
-            if not os.path.exists(path):
+            if resolve_snippet_path(row["snippet_path"], snippets_dir) is None:
                 with self.conn() as c:
                     c.execute(
                         "UPDATE incidents SET snippet_path=NULL WHERE id=?",
@@ -187,6 +208,59 @@ class Storage:
                 orphaned += 1
 
         return orphaned
+
+    def repair_snippet_paths(self, snippets_dir=None):
+        """Restore snippet_path for rows where it is NULL but a matching WAV exists.
+
+        Snippet filenames embed the incident id as `incident_{id}_{token}.wav`,
+        so the files on disk are a recoverable source of truth even when the DB
+        column has been wiped — e.g. after an over-eager orphan purge ran against
+        a database copied from another machine before snippet-path resolution was
+        portable. Scans both the snippets directory and its autodismissed/
+        quarantine subfolder, and only fills rows whose snippet_path is currently
+        NULL (never overwrites an existing value). snippets_dir defaults to the
+        snippets directory beside the database file. Returns count of rows repaired."""
+        if snippets_dir is None:
+            snippets_dir = os.path.join(os.path.dirname(self.db_path), "snippets")
+
+        # Map incident_id -> absolute WAV path, scanning the main dir first so a
+        # live snippet takes precedence over a quarantined one of the same id.
+        id_to_path = {}
+        search_dirs = [
+            os.path.join(snippets_dir, "autodismissed"),  # lower precedence
+            snippets_dir,                                  # higher precedence (scanned last)
+        ]
+        for directory in search_dirs:
+            if not os.path.isdir(directory):
+                continue
+            for filepath in glob.glob(os.path.join(directory, "incident_*.wav")):
+                basename = os.path.basename(filepath)
+                # Parse the id from "incident_{id}_{token}.wav"
+                parts = basename.split("_")
+                if len(parts) < 3:
+                    continue
+                try:
+                    iid = int(parts[1])
+                except ValueError:
+                    continue
+                id_to_path[iid] = filepath
+
+        repaired = 0
+        with self.conn() as c:
+            null_ids = {
+                r["id"] for r in c.execute(
+                    "SELECT id FROM incidents WHERE deleted=0 AND snippet_path IS NULL"
+                ).fetchall()
+            }
+            for iid, filepath in id_to_path.items():
+                if iid in null_ids:
+                    c.execute(
+                        "UPDATE incidents SET snippet_path=? WHERE id=?",
+                        (filepath, iid),
+                    )
+                    repaired += 1
+
+        return repaired
 
     def hard_clear_all_incidents(self, snippets_dir=None):
         """Delete ALL incident rows (including soft-deleted), reset the ID counter
@@ -229,16 +303,50 @@ class Storage:
 
         return removed
 
+    def clear_autodismissed(self, snippets_dir=None):
+        """Hard-delete all excluded (auto-dismissed) incidents and their quarantined WAV files.
+
+        Removes DB rows with excluded=1, clears the autodismissed/ quarantine directory,
+        and VACUUMs to reclaim disk space. Returns (rows_deleted, files_removed) tuple."""
+        with self.conn() as c:
+            # Count before deleting for the return value
+            rows_deleted = c.execute(
+                "SELECT COUNT(*) FROM incidents WHERE excluded=1"
+            ).fetchone()[0]
+            c.execute("DELETE FROM incidents WHERE excluded=1")
+
+        # Clear the quarantine folder
+        files_removed = 0
+        if snippets_dir:
+            quarantine = os.path.join(snippets_dir, "autodismissed")
+            if os.path.isdir(quarantine):
+                for filepath in glob.glob(os.path.join(quarantine, "*.wav")):
+                    try:
+                        os.remove(filepath)
+                        files_removed += 1
+                    except OSError:
+                        pass
+
+        with self.conn() as c:
+            c.execute("VACUUM")
+
+        return rows_deleted, files_removed
+
     def get_incident(self, incident_id: int):
         """Fetch a single incident by ID (returns None if not found or soft-deleted)."""
         with self.conn() as c:
             row = c.execute("SELECT * FROM incidents WHERE id=? AND deleted=0", (incident_id,)).fetchone()
             return dict(row) if row else None
 
-    def list_incidents(self, limit=200, offset=0, since=None, include_excluded=False):
+    def list_incidents(self, limit=200, offset=0, since=None, include_excluded=False, show_classifications=None):
         q = "SELECT * FROM incidents WHERE deleted=0"
         params = []
-        if not include_excluded:
+        if show_classifications:
+            # Show normal incidents PLUS excluded incidents matching these classifications
+            placeholders = ",".join(["?" for _ in show_classifications])
+            q += f" AND ((excluded IS NULL OR excluded=0) OR classification IN ({placeholders}))"
+            params.extend(show_classifications)
+        elif not include_excluded:
             q += " AND (excluded IS NULL OR excluded=0)"
         if since:
             q += " AND start_ts >= ?"
@@ -248,10 +356,14 @@ class Storage:
         with self.conn() as c:
             return [dict(r) for r in c.execute(q, params).fetchall()]
 
-    def count_incidents(self, since=None, include_excluded=False):
+    def count_incidents(self, since=None, include_excluded=False, show_classifications=None):
         q = "SELECT COUNT(*) FROM incidents WHERE deleted=0"
         params = []
-        if not include_excluded:
+        if show_classifications:
+            placeholders = ",".join(["?" for _ in show_classifications])
+            q += f" AND ((excluded IS NULL OR excluded=0) OR classification IN ({placeholders}))"
+            params.extend(show_classifications)
+        elif not include_excluded:
             q += " AND (excluded IS NULL OR excluded=0)"
         if since:
             q += " AND start_ts >= ?"

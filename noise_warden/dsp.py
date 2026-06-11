@@ -4,9 +4,8 @@ Pipeline overview (called per audio block in the engine's main loop):
   1. rms_dbfs        → raw amplitude in dBFS
   2. dba_estimate    → calibrated dBA via mic offset
   3. spectrum_features → band-energy ratios, spectral centroid, flatness
-  4. beat_confidence  → autocorrelation-based rhythmicity score
-  5. music_like_score → composite heuristic combining bass energy + tonality
-  6. Exclusion filters (impulse, thunder, rain, mower, birdsong)
+  4. music_like_score → composite heuristic combining bass energy + tonality
+  5. Exclusion filters (impulse, thunder, rain, mower, birdsong)
 
 All thresholds are either function parameters (configurable via YAML) or
 documented inline with rationale. "Magic numbers" in this file fall into
@@ -187,7 +186,7 @@ def spectrum_features(arr: np.ndarray, sr: int):
     # -- Intra-block envelope variance (CV = std/mean of RMS at 10ms hop) --
     # Music has dynamic amplitude (kicks, syncopation) producing CV 0.15–0.80.
     # Mechanical drones maintain near-constant amplitude (CV < 0.10).
-    # Uses the same 10ms hop as intra_block_beat_confidence for consistency.
+    # Uses the same 10ms hop as the spectral envelope analysis for consistency.
     hop = int(sr * 0.01)
     n_frames = len(arr) // hop
     envelope_cv = 0.0
@@ -223,147 +222,6 @@ def spectrum_features(arr: np.ndarray, sr: int):
         "lowband_ratio": lowband_ratio,
         "midband_ratio": midband_ratio,
     }
-
-def _inter_block_beat_confidence(db_history):
-    """Detect slow macro-level amplitude periodicity across multiple blocks.
-
-    Autocorrelates the dB history at lags of 2–8 blocks. At 1 block/sec,
-    this detects patterns repeating every 2–8 seconds (7.5–30 BPM range) —
-    NOT actual musical beats, but structural dynamics like verse/chorus
-    volume changes, DJ drops, or pulsing alarms of the particularly
-    obnoxious variety.
-
-    This is the slower complement to intra_block_beat_confidence(), which
-    detects actual musical tempo within each audio block. The two are
-    combined via max() in beat_confidence().
-
-    Constants:
-      8   — minimum readings to analyze. Below this there isn't enough data
-            for meaningful correlation. At 1 block/sec, this is 8 seconds.
-      24  — analysis window (last 24 blocks).
-      2–8 — lag range in blocks. At 1 block/sec:
-            lag 2 = 30 BPM (repeats every 2 seconds)
-            lag 8 = 7.5 BPM (repeats every 8 seconds)
-      Normalized autocorrelation is in [0, +1] because we take the max
-            of positive correlations only. 0 = no pattern, 1.0 = perfect
-            repetition.
-    """
-    if len(db_history) < 8:
-        return 0.0
-    x = np.array(db_history[-24:], dtype=float)
-    x = x - np.mean(x)
-    if np.allclose(x, 0):
-        return 0.0
-    best = 0.0
-    for lag in range(2, min(8, len(x)-1)):
-        a = x[:-lag]
-        b = x[lag:]
-        denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9
-        corr = float(np.dot(a, b) / denom)
-        best = max(best, corr)
-    return max(0.0, min(1.0, best))
-
-def intra_block_beat_confidence(block, sr):
-    """Detect rhythmic beat patterns within a single audio block.
-
-    Computes a short-time RMS energy envelope at 10ms hop, then
-    autocorrelates at lags corresponding to common musical tempos
-    (80–180 BPM). This catches the actual thump-thump-thump that
-    the inter-block approach cannot see — at 1-second block resolution,
-    a 120 BPM track has 2 beats per block, which averages to a flat
-    dB reading and produces no inter-block periodicity.
-
-    Real-world validation:
-        bass music through walls: median 0.77, detects ~143 BPM
-        rain:                     median 0.50 (no rhythm — baseline)
-        birdsong chorus:          median 0.50 (no rhythm)
-        diesel engine:            median 0.90 (engine firing cycle is
-                                  genuinely periodic — correct)
-
-    Constants:
-      10ms hop — 100 envelope frames per second at any sample rate.
-            Fine enough to resolve 180 BPM (beat every 333ms = 33 frames).
-      80–180 BPM range — covers the vast majority of popular music.
-            At 10ms hop: 80 BPM → lag 75, 180 BPM → lag 33.
-      max_lag capped at n_frames/2 — autocorrelation is unreliable
-            when lag approaches signal length.
-      Output is in [0, 1] — raw normalized autocorrelation is already
-            in [-1, +1], and we take the max of positive correlations only.
-            0 = no pattern, 1.0 = perfect periodic amplitude at some tempo.
-
-    Args:
-        block: raw audio samples (numpy array, float32)
-        sr: sample rate in Hz
-    """
-    hop = int(sr * 0.01)  # 10ms hop
-    n_frames = len(block) // hop
-
-    if n_frames < 20:
-        return 0.0
-
-    # RMS energy per frame — captures amplitude envelope
-    envelope = np.array([
-        np.sqrt(np.mean(block[i * hop:(i + 1) * hop] ** 2))
-        for i in range(n_frames)
-    ])
-
-    env_mean = np.mean(envelope)
-    if env_mean < 1e-8:
-        return 0.0  # silence
-
-    # Guard: if amplitude variation is negligible relative to mean energy,
-    # there's no beat to detect. A pure tone or constant noise has tiny
-    # float-precision jitter that, when autocorrelated and normalized,
-    # produces spuriously high correlation. CV < 5% → steady signal.
-    if np.std(envelope) / env_mean < 0.05:
-        return 0.0
-
-    envelope = envelope - env_mean
-
-    # Lag range for 80–180 BPM at 10ms hop resolution
-    min_lag = int(60.0 / 180.0 / 0.01)  # 33 frames = 180 BPM
-    max_lag = min(n_frames // 2, int(60.0 / 80.0 / 0.01))  # 75 frames = 80 BPM
-
-    if min_lag >= max_lag or max_lag >= n_frames:
-        return 0.0
-
-    best = 0.0
-    for lag in range(min_lag, max_lag + 1):
-        a = envelope[:-lag]
-        b = envelope[lag:]
-        denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9
-        corr = float(np.dot(a, b) / denom)
-        best = max(best, corr)
-
-    return max(0.0, min(1.0, best))
-
-def beat_confidence(block, sr, db_history):
-    """Beat confidence from intra-block rhythm analysis.
-
-    Uses only the intra-block component: short-time RMS envelope
-    autocorrelated at 80–180 BPM lags. This detects actual musical
-    tempo within each audio block.
-
-    The inter-block component (_inter_block_beat_confidence) was removed
-    from this combined function because it measures dB-level *stability*,
-    not rhythm. Any steady source (mower, rain, constant HVAC) produces
-    high inter-block autocorrelation simply because the dB doesn't change
-    much between blocks — inflating scores for non-musical sources:
-        gas mower:   0.805 inter (steady dB, not musical)
-        thunder-rain: 0.773 inter (steady rain dB)
-        bass music:   0.056 inter (irrelevant — rhythm is intra-block)
-    The inter-block function is retained for reference but no longer
-    contributes to the combined score.
-
-    The db_history parameter is accepted but unused, preserving the
-    call signature for engine.py and reclassify.py callers.
-
-    Args:
-        block: raw audio samples for the current block (numpy array)
-        sr: sample rate in Hz
-        db_history: list of recent dB readings (unused; kept for API compat)
-    """
-    return intra_block_beat_confidence(block, sr)
 
 def music_like_score(features: dict):
     """Composite heuristic: how much does this sound resemble music?
@@ -528,7 +386,6 @@ def looks_like_thunder(features, db_now, db_prev, delta_threshold,
 def looks_like_amplified_bass(features, recent_db, min_music_score=0.45,
                               lowband_min=0.16, centroid_max=4000.0,
                               env_std_max=3.0, min_history=6, window=12,
-                              beat_confidence=None, min_beat_confidence=0.0,
                               flatness_min=0.20):
     """Bass-heavy music — the neighborhood thump filter.
 
@@ -539,14 +396,12 @@ def looks_like_amplified_bass(features, recent_db, min_music_score=0.45,
         centroid: 1833–3301 Hz
         flatness: 0.18–0.33
         mscore:   0.69–0.79 (median 0.73, all blocks ≥ 0.60)
-        bconf:    0.04–0.86 (median 0.54)
 
     Open windows/doors (broader spectrum, less bass-dominant):
         lowband:  0.09–0.44 (median 0.19)
         centroid: 2131–4678 Hz
         flatness: 0.21–0.44 (median 0.28)
         mscore:   0.40–0.73 (median 0.50)
-        bconf:    0.00–0.66 (median 0.15, truck overlay kills rhythm)
 
     HOWEVER, comma, this filter MUST run before rain and mower because those
     filters would steal bass-music blocks without the music score guard or
@@ -554,9 +409,9 @@ def looks_like_amplified_bass(features, recent_db, min_music_score=0.45,
 
     The flatness floor (≥ 0.20) is critical for diesel separation — diesel
     engines have flatness median 0.151 (max 0.285), while bass music always
-    exceeds 0.20 (min 0.207 across all recordings). This replaced beat
-    confidence as the diesel guard after open-window recordings showed that
-    overlapping noise sources (e.g., truck + music) destroy rhythm detection.
+    exceeds 0.20 (min 0.207 across all recordings). This is the primary diesel
+    guard, robust even when overlapping noise sources (e.g., truck + music)
+    are present.
 
     Safety margins vs. false-positive sources at current thresholds:
         rain:    blocked by lowband (rain max 0.137 < 0.16 floor, margin 0.023)
@@ -583,13 +438,6 @@ def looks_like_amplified_bass(features, recent_db, min_music_score=0.45,
             bass thump has low amplitude variation (0.68–2.05).
         min_history: minimum readings before filter activates (default 6)
         window: number of recent readings to evaluate (default 12)
-        beat_confidence: pre-computed beat confidence for the current block.
-            If provided and min_beat_confidence > 0, must meet threshold.
-            None skips the check (backward-compatible).
-        min_beat_confidence: minimum beat confidence threshold (default 0.0).
-            Disabled by default because overlapping noise sources (truck +
-            music) destroy rhythm detection in open-window scenarios. The
-            flatness floor handles diesel separation instead.
         flatness_min: minimum spectral flatness (default 0.20). Critical
             diesel guard — diesel flatness median 0.151, bass music min 0.207.
     """
@@ -601,13 +449,6 @@ def looks_like_amplified_bass(features, recent_db, min_music_score=0.45,
     # The music score is the primary discriminator — if it doesn't register
     # as music, it's probably just a diesel/mower/rain source
     if mscore < min_music_score:
-        return False
-
-    # Beat confidence gate — music has rhythm. Disabled by default (threshold
-    # 0.0) because truck/wind overlays destroy rhythm detection. The flatness
-    # floor now handles diesel separation. Retained as optional strengthening.
-    if (beat_confidence is not None and min_beat_confidence > 0 and
-            beat_confidence < min_beat_confidence):
         return False
 
     env_std = float(np.std(np.array(recent_db[-window:], dtype=float)))
@@ -1061,9 +902,7 @@ def looks_like_flyover(features, recent_db, flatness_min=0.15,
                        centroid_max=12000.0, midband_min=0.15,
                        lowband_min=0.10, lowband_max=0.50,
                        highband_max=0.60, env_std_max=8.0,
-                       min_history=4, window=12,
-                       max_beat_confidence=0.50,
-                       beat_confidence_val=None):
+                       min_history=4, window=12):
     """Aerial vehicle or transient engine — planes, helicopters, fast-pass vehicles.
 
     This filter runs late in the priority chain (after wind, rain, weedwhacker,
@@ -1080,22 +919,12 @@ def looks_like_flyover(features, recent_db, flatness_min=0.15,
       midband:   0.186–0.416 (median 0.310 — engine fundamentals)
       highband:  0.220–0.651 (median 0.400)
       env_std:   0–6.16 (median 2.714 — approach/sustain/departure arc)
-      bconf:     0–0.685 (median 0.212 — low, not rhythmic like music)
 
     Real-world calibration — vehicle acceleration (engine speed launch):
       flatness:  0.107–0.472 (median 0.214 — tonal engine harmonics)
       centroid:  1412–5283 (median 2408 — mid-frequency engine sound)
       midband:   0.326–0.725 (median 0.632 — dominant midband = engine signature)
       env_std:   0–7.87 (median 7.04 — rapidly changing RPMs)
-      bconf:     0–0.170 (median 0.000 — no rhythm in changing RPMs)
-
-    Key separator from music: beat confidence. Engine sounds have low beat
-    confidence (propeller noise is broadband, not rhythmic; changing RPMs
-    destroy periodicity), while music has consistent rhythm (bconf > 0.38).
-    The max_beat_confidence guard (default 0.50) rejects rhythmic sounds
-    that are more likely music than engine noise. Diesel engines DO have
-    high bconf from the firing cycle, but diesel is caught by its own
-    filter earlier in the chain.
 
     Key separator from mower: highband ceiling. Mower blocks that slip past
     their own filter (centroid > 4000) have very high highband (0.56–0.82).
@@ -1129,19 +958,8 @@ def looks_like_flyover(features, recent_db, flatness_min=0.15,
         min_history: minimum readings before filter activates (default 4 — short for
             transient flyovers)
         window: number of recent readings to evaluate (default 12)
-        max_beat_confidence: maximum beat confidence (default 0.50). Rejects rhythmic
-            sounds that are more likely music. Engine noise is non-periodic (bconf
-            median 0.00–0.21); music has consistent rhythm (bconf > 0.38).
-        beat_confidence_val: pre-computed beat confidence for the current block.
-            When provided and above max_beat_confidence, the filter rejects.
     """
     if len(recent_db) < min_history:
-        return False
-
-    # Rhythm guard: engines are non-periodic (propeller broadband, changing RPMs).
-    # Music has consistent rhythm. Reject blocks with high beat confidence.
-    if (beat_confidence_val is not None and max_beat_confidence > 0 and
-            beat_confidence_val > max_beat_confidence):
         return False
 
     env_std = float(np.std(np.array(recent_db[-window:], dtype=float)))
@@ -1278,7 +1096,7 @@ def looks_like_conversation(features, recent_db, centroid_min=500.0,
 # The engine never touches individual filter parameters — it just calls
 # identify_filter() with the raw detection config dict.
 
-def _check_thunder(features, db_history, db_now, prev_db, det, feature_history=None, beat_confidence=None):
+def _check_thunder(features, db_history, db_now, prev_db, det, feature_history=None):
     return looks_like_thunder(
         features, db_now, prev_db,
         float(det.get("thunder_peak_delta_db", 18.0)),
@@ -1293,7 +1111,7 @@ def _check_thunder(features, db_history, db_now, prev_db, det, feature_history=N
         rumble_window=int(det.get("thunder_rumble_window", 12)),
     )
 
-def _check_impulse(features, db_history, db_now, prev_db, det, feature_history=None, beat_confidence=None):
+def _check_impulse(features, db_history, db_now, prev_db, det, feature_history=None):
     if not is_impulse(db_now, prev_db, float(det.get("impulse_peak_delta_db", 14.0))):
         return False
 
@@ -1310,7 +1128,7 @@ def _check_impulse(features, db_history, db_now, prev_db, det, feature_history=N
 
     return True
 
-def _check_birdsong(features, db_history, db_now, prev_db, det, feature_history=None, beat_confidence=None):
+def _check_birdsong(features, db_history, db_now, prev_db, det, feature_history=None):
     return looks_like_birdsong(
         features, db_history,
         highband_min=float(det.get("birdsong_highband_min", 0.70)),
@@ -1330,7 +1148,7 @@ def _check_birdsong(features, db_history, db_now, prev_db, det, feature_history=
         chorus_min_history=int(det.get("birdsong_chorus_min_history", 12)),
     )
 
-def _check_amplified_bass(features, db_history, db_now, prev_db, det, feature_history=None, beat_confidence=None):
+def _check_amplified_bass(features, db_history, db_now, prev_db, det, feature_history=None):
     return looks_like_amplified_bass(
         features, db_history,
         min_music_score=float(det.get("amplified_bass_min_music_score", 0.45)),
@@ -1338,12 +1156,10 @@ def _check_amplified_bass(features, db_history, db_now, prev_db, det, feature_hi
         centroid_max=float(det.get("amplified_bass_centroid_max_hz", 4000)),
         env_std_max=float(det.get("amplified_bass_env_std_max", 3.0)),
         min_history=int(det.get("amplified_bass_min_history", 6)),
-        beat_confidence=beat_confidence,
-        min_beat_confidence=float(det.get("amplified_bass_min_beat_confidence", 0.0)),
         flatness_min=float(det.get("amplified_bass_flatness_min", 0.20)),
     )
 
-def _check_rain(features, db_history, db_now, prev_db, det, feature_history=None, beat_confidence=None):
+def _check_rain(features, db_history, db_now, prev_db, det, feature_history=None):
     return looks_like_rain(
         features, db_history,
         float(det.get("rain_flatness_threshold", 0.27)),
@@ -1353,7 +1169,7 @@ def _check_rain(features, db_history, db_now, prev_db, det, feature_history=None
         max_music_score=float(det.get("rain_max_music_score", 0.70)),
     )
 
-def _check_wind(features, db_history, db_now, prev_db, det, feature_history=None, beat_confidence=None):
+def _check_wind(features, db_history, db_now, prev_db, det, feature_history=None):
     return looks_like_wind(
         features, db_history,
         flatness_min=float(det.get("wind_flatness_min", 0.30)),
@@ -1368,7 +1184,7 @@ def _check_wind(features, db_history, db_now, prev_db, det, feature_history=None
         max_music_score=float(det.get("wind_max_music_score", 0.70)),
     )
 
-def _check_weedwhacker(features, db_history, db_now, prev_db, det, feature_history=None, beat_confidence=None):
+def _check_weedwhacker(features, db_history, db_now, prev_db, det, feature_history=None):
     return looks_like_weedwhacker(
         features, db_history,
         centroid_min=float(det.get("weedwhacker_centroid_min_hz", 2000)),
@@ -1378,7 +1194,7 @@ def _check_weedwhacker(features, db_history, db_now, prev_db, det, feature_histo
         env_std_max=float(det.get("weedwhacker_env_std_max", 5.0)),
     )
 
-def _check_mower(features, db_history, db_now, prev_db, det, feature_history=None, beat_confidence=None):
+def _check_mower(features, db_history, db_now, prev_db, det, feature_history=None):
     return looks_like_mower(
         features, db_history,
         float(det.get("mower_flatness_threshold", 0.28)),
@@ -1391,7 +1207,7 @@ def _check_mower(features, db_history, db_now, prev_db, det, feature_history=Non
         max_music_score=float(det.get("mower_max_music_score", 0.70)),
     )
 
-def _check_diesel(features, db_history, db_now, prev_db, det, feature_history=None, beat_confidence=None):
+def _check_diesel(features, db_history, db_now, prev_db, det, feature_history=None):
     return looks_like_diesel(
         features, db_history,
         centroid_min=float(det.get("diesel_centroid_min_hz", 1200)),
@@ -1403,7 +1219,7 @@ def _check_diesel(features, db_history, db_now, prev_db, det, feature_history=No
         min_history=int(det.get("diesel_min_history", 8)),
     )
 
-def _check_flyover(features, db_history, db_now, prev_db, det, feature_history=None, beat_confidence=None):
+def _check_flyover(features, db_history, db_now, prev_db, det, feature_history=None):
     return looks_like_flyover(
         features, db_history,
         flatness_min=float(det.get("flyover_flatness_min", 0.15)),
@@ -1416,11 +1232,9 @@ def _check_flyover(features, db_history, db_now, prev_db, det, feature_history=N
         highband_max=float(det.get("flyover_highband_max", 0.60)),
         env_std_max=float(det.get("flyover_env_std_max", 8.0)),
         min_history=int(det.get("flyover_min_history", 4)),
-        max_beat_confidence=float(det.get("flyover_max_beat_confidence", 0.50)),
-        beat_confidence_val=beat_confidence,
     )
 
-def _check_conversation(features, db_history, db_now, prev_db, det, feature_history=None, beat_confidence=None):
+def _check_conversation(features, db_history, db_now, prev_db, det, feature_history=None):
     return looks_like_conversation(
         features, db_history,
         centroid_min=float(det.get("conversation_centroid_min_hz", 500)),
@@ -1471,7 +1285,7 @@ FILTER_CHAIN = [
 FILTER_PRIORITY = {name: idx for idx, (name, _) in enumerate(FILTER_CHAIN)}
 
 def identify_filter(features, db_history, db_now, prev_db, detection_cfg,
-                    feature_history=None, beat_confidence=None):
+                    feature_history=None):
     """Run all exclusion filters in priority order and return the first match.
 
     This is the single entry point the engine uses for filter identification.
@@ -1491,17 +1305,13 @@ def identify_filter(features, db_history, db_now, prev_db, detection_cfg,
         feature_history: list of recent spectrum_features() dicts (for temporal
             pattern analysis like chorus birdsong detection). Optional; only
             used by the birdsong filter's Path D.
-        beat_confidence: pre-computed beat confidence for the current block.
-            Optional; only used by the amplified_bass filter to verify that
-            bass-heavy signals actually have rhythmic content.
 
     Returns:
         Filter name string (e.g. "thunder", "birdsong") or None if no filter matches.
     """
     for name, check_fn in FILTER_CHAIN:
         if check_fn(features, db_history, db_now, prev_db, detection_cfg,
-                     feature_history=feature_history,
-                     beat_confidence=beat_confidence):
+                     feature_history=feature_history):
             return name
 
     return None

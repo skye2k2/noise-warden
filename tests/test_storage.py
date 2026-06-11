@@ -68,8 +68,8 @@ class TestSoftDelete:
         assert all(r["id"] != iid for r in rows)
 
     def test_soft_delete_removes_snippet_file(self, tmp_storage, tmp_path, sample_incident):
-        """Soft-deleting an incident should remove its snippet WAV from disk
-        and NULL out snippet_path in the DB (prevents orphaned files)."""
+        """Deleting an incident should remove its snippet WAV from disk
+        and hard-delete the DB row entirely."""
         snippets_dir = str(tmp_path / "snippets")
         os.makedirs(snippets_dir)
         snippet_file = os.path.join(snippets_dir, "incident_1.wav")
@@ -86,15 +86,13 @@ class TestSoftDelete:
         # File should be removed from disk
         assert not os.path.exists(snippet_file)
 
-        # snippet_path should be NULLed in DB (even though row is soft-deleted,
-        # check via raw query to bypass the deleted=0 filter)
+        # Row should be fully deleted from the DB (hard delete)
         import sqlite3
         c = sqlite3.connect(str(tmp_path / "test.db"))
         c.row_factory = sqlite3.Row
-        row = c.execute("SELECT snippet_path, deleted FROM incidents WHERE id=?", (iid,)).fetchone()
+        row = c.execute("SELECT * FROM incidents WHERE id=?", (iid,)).fetchone()
         c.close()
-        assert row["deleted"] == 1
-        assert row["snippet_path"] is None
+        assert row is None
 
     def test_soft_delete_removes_autodismissed_snippet(self, tmp_storage, tmp_path, sample_incident):
         """Soft-delete should find and remove snippet from autodismissed/ too."""
@@ -149,14 +147,15 @@ class TestSoftDelete:
         new_id = tmp_storage.create_incident(sample_incident)
         assert new_id == 1
 
-    def test_hard_clear_removes_soft_deleted_too(self, tmp_storage, sample_incident):
-        """hard_clear should remove even previously soft-deleted incidents."""
+    def test_hard_clear_resets_id_after_deletion(self, tmp_storage, sample_incident):
+        """hard_clear should reset the autoincrement counter even after
+        individual deletions have already removed all rows."""
         iid = tmp_storage.create_incident(sample_incident)
         tmp_storage.soft_delete_incident(iid)
-        # Soft-deleted row still exists in DB, just hidden from queries
+        # Row is already gone (hard-deleted), but autoincrement counter is still at 1
         tmp_storage.hard_clear_all_incidents()
 
-        # Confirm truly gone — create new incident, ID should be 1
+        # ID counter should be reset — next incident gets ID 1
         new_id = tmp_storage.create_incident(sample_incident)
         assert new_id == 1
 
@@ -207,6 +206,89 @@ class TestListAndCount:
         self._create_n(tmp_storage, sample_incident, 7)
         assert tmp_storage.count_incidents() == 7
         assert tmp_storage.count_incidents() == len(tmp_storage.list_incidents(limit=100))
+
+    def test_show_classifications_includes_excluded(self, tmp_storage, sample_incident):
+        """show_classifications should include excluded incidents matching the filter
+        alongside normal non-excluded incidents."""
+        # Create a normal incident
+        normal = dict(sample_incident)
+        normal["classification"] = "music"
+        tmp_storage.create_incident(normal)
+
+        # Create an excluded incident
+        excluded = dict(sample_incident)
+        excluded["classification"] = "drive_by"
+        excluded["excluded"] = 1
+        tmp_storage.create_incident(excluded)
+
+        # Default view: only normal
+        assert tmp_storage.count_incidents() == 1
+        assert len(tmp_storage.list_incidents()) == 1
+
+        # With show_classifications: both visible
+        assert tmp_storage.count_incidents(show_classifications=["drive_by"]) == 2
+        rows = tmp_storage.list_incidents(show_classifications=["drive_by"])
+        assert len(rows) == 2
+        classifications = [r["classification"] for r in rows]
+        assert "music" in classifications
+        assert "drive_by" in classifications
+
+    def test_show_classifications_only_selected(self, tmp_storage, sample_incident):
+        """Only the selected excluded classifications should appear, not all."""
+        for cls, exc in [("music", 0), ("drive_by", 1), ("too_short", 1), ("borderline", 1)]:
+            row = dict(sample_incident)
+            row["classification"] = cls
+            row["excluded"] = exc
+            tmp_storage.create_incident(row)
+
+        # Filter for drive_by only — should see music + drive_by, not too_short/borderline
+        rows = tmp_storage.list_incidents(show_classifications=["drive_by"])
+        assert len(rows) == 2
+
+
+# ---------------------------------------------------------------------------
+# Clear auto-dismissed
+# ---------------------------------------------------------------------------
+
+class TestClearAutodismissed:
+
+    def test_clear_removes_excluded_rows_and_files(self, tmp_storage, tmp_path, sample_incident):
+        """clear_autodismissed should hard-delete excluded DB rows and quarantined WAVs."""
+        snippets_dir = str(tmp_path / "snippets")
+        quarantine = os.path.join(snippets_dir, "autodismissed")
+        os.makedirs(quarantine)
+
+        # Create a quarantined WAV
+        wav_path = os.path.join(quarantine, "incident_1.wav")
+        with open(wav_path, "wb") as f:
+            f.write(b"RIFF" + b"\x00" * 40)
+
+        # Create an excluded DB entry
+        row = dict(sample_incident)
+        row["classification"] = "drive_by"
+        row["excluded"] = 1
+        row["snippet_path"] = wav_path
+        tmp_storage.create_incident(row)
+
+        # Also create a normal incident that should survive
+        normal = dict(sample_incident)
+        normal["classification"] = "music"
+        tmp_storage.create_incident(normal)
+
+        rows_deleted, files_removed = tmp_storage.clear_autodismissed(snippets_dir)
+        assert rows_deleted == 1
+        assert files_removed == 1
+        assert not os.path.exists(wav_path)
+
+        # Normal incident should still exist
+        assert tmp_storage.count_incidents() == 1
+
+    def test_clear_on_empty_is_safe(self, tmp_storage, tmp_path):
+        """Clearing when no excluded incidents exist should not error."""
+        snippets_dir = str(tmp_path / "snippets")
+        rows_deleted, files_removed = tmp_storage.clear_autodismissed(snippets_dir)
+        assert rows_deleted == 0
+        assert files_removed == 0
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +576,63 @@ class TestPurgeOrphans:
         assert count == 0
 
 
+class TestRepairSnippetPaths:
+    """repair_snippet_paths reconstructs snippet_path from the WAV files on disk,
+    using the incident id embedded in `incident_{id}_{token}.wav` filenames. This
+    recovers a database whose snippet references were wiped (e.g. by an orphan
+    purge run against a copied DB before path resolution was portable)."""
+
+    def _make_wav(self, directory, iid, token="abc"):
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"incident_{iid}_{token}.wav")
+        with open(path, "wb") as f:
+            f.write(b"RIFF" + b"\x00" * 40)
+        return path
+
+    def test_restores_null_path_from_matching_file(self, tmp_storage, tmp_path, sample_incident):
+        snippets = str(tmp_path / "snippets")
+        iid = tmp_storage.create_incident(sample_incident)  # snippet_path is NULL
+        wav = self._make_wav(snippets, iid)
+
+        count = tmp_storage.repair_snippet_paths(snippets_dir=snippets)
+        assert count == 1
+        assert tmp_storage.get_incident(iid)["snippet_path"] == wav
+
+    def test_restores_from_autodismissed_subfolder(self, tmp_storage, tmp_path, sample_incident):
+        snippets = str(tmp_path / "snippets")
+        iid = tmp_storage.create_incident(sample_incident)
+        wav = self._make_wav(os.path.join(snippets, "autodismissed"), iid)
+
+        count = tmp_storage.repair_snippet_paths(snippets_dir=snippets)
+        assert count == 1
+        assert tmp_storage.get_incident(iid)["snippet_path"] == wav
+
+    def test_never_overwrites_existing_path(self, tmp_storage, tmp_path, sample_incident):
+        """A row that already has a snippet_path must not be clobbered."""
+        snippets = str(tmp_path / "snippets")
+        row = dict(sample_incident)
+        row["snippet_path"] = "/some/existing/value.wav"
+        iid = tmp_storage.create_incident(row)
+        self._make_wav(snippets, iid)  # a matching file exists on disk
+
+        count = tmp_storage.repair_snippet_paths(snippets_dir=snippets)
+        assert count == 0
+        assert tmp_storage.get_incident(iid)["snippet_path"] == "/some/existing/value.wav"
+
+    def test_ignores_files_without_matching_row(self, tmp_storage, tmp_path):
+        """A WAV whose id has no DB row should be skipped silently."""
+        snippets = str(tmp_path / "snippets")
+        self._make_wav(snippets, 9999)
+
+        count = tmp_storage.repair_snippet_paths(snippets_dir=snippets)
+        assert count == 0
+
+    def test_missing_snippets_dir_is_safe(self, tmp_storage, tmp_path, sample_incident):
+        tmp_storage.create_incident(sample_incident)
+        count = tmp_storage.repair_snippet_paths(snippets_dir=str(tmp_path / "does_not_exist"))
+        assert count == 0
+
+
 # ---------------------------------------------------------------------------
 # Excluded incidents
 # ---------------------------------------------------------------------------
@@ -542,12 +681,12 @@ class TestExcludedIncidents:
         s = Storage(str(tmp_path / "test.db"))
         with s.conn() as c:
             version = c.execute("PRAGMA user_version").fetchone()[0]
-            assert version == 3
+            assert version == 4
             # Verify the column exists by inserting with excluded=1
             row = {
                 "start_ts": "2026-04-01T12:00:00+00:00", "start_db": 70, "peak_db": 70,
                 "avg_db": 70, "threshold_db": 65, "music_like_score": 0.5,
-                "beat_confidence": 0.3, "classification": "rain", "mode": "respond",
+                "classification": "rain", "mode": "respond",
                 "excluded": 1,
             }
             iid = s.create_incident(row)

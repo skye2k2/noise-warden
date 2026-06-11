@@ -180,7 +180,7 @@ class TestAnalyzeClip:
         expected_keys = {
             "block", "dba", "centroid_hz", "envelope_cv", "flatness",
             "harmonic_ratio", "lowband", "midband", "highband", "mscore",
-            "bconf", "env_std", "filter", "classification",
+            "env_std", "filter", "classification",
         }
         assert set(block.keys()) == expected_keys
 
@@ -675,6 +675,17 @@ class TestAnalyzeClipLeadInOut:
         journal = [(-5, "lead-in"), (0, "mower"), (50, "lead-out")]
         result = _compute_dominant(journal, 55)
         assert result == "mower"
+
+    def test_lead_in_never_becomes_primary(self):
+        """When all non-bookend classes are ignorable (unknown, engine_noise),
+        the fallback should pick the longest ignorable class — NOT lead-in.
+        Regression test: a 13-second all-unknown incident was classified as
+        'lead-in+' because the 2s preroll outweighed other short blocks."""
+        journal = [(-2, "lead-in"), (0, "unknown"), (1, "engine_noise")]
+        result = _compute_dominant(journal, 13)
+        assert "lead-in" not in result
+        # engine_noise holds 12s vs unknown's 1s — should win
+        assert result == "engine_noise+"
 
     def test_lead_in_lead_out_clamped_when_too_large(self, tmp_path):
         """If pre+post >= clip length, both revert to 0 (full DSP analysis)."""

@@ -10,12 +10,9 @@ import pytest
 
 from noise_warden.dsp import (
     apply_filter_holdover,
-    beat_confidence,
-    _inter_block_beat_confidence,
     dba_estimate,
     get_filter_detection_latency,
     identify_filter,
-    intra_block_beat_confidence,
     is_impulse,
     looks_like_amplified_bass,
     looks_like_birdsong,
@@ -131,157 +128,6 @@ class TestSpectrumFeatures:
         noise = rng.standard_normal(8000).astype(np.float32)
         feats = spectrum_features(noise, 16000)
         assert feats["flatness"] > 0.3
-
-
-# ---------------------------------------------------------------------------
-# _inter_block_beat_confidence
-# ---------------------------------------------------------------------------
-
-class TestInterBlockBeatConfidence:
-    """Tests for the inter-block (macro-level) beat detection."""
-
-    def test_short_history_returns_zero(self):
-        assert _inter_block_beat_confidence([60, 62, 61]) == pytest.approx(0.0)
-
-    def test_constant_returns_base_value(self):
-        """Flat dB history → no periodicity → 0.0 (allclose guard trips)."""
-        flat = [65.0] * 24
-        result = _inter_block_beat_confidence(flat)
-        assert result == pytest.approx(0.0)
-
-    def test_periodic_pattern_higher_than_random(self):
-        """An oscillating pattern should show higher beat confidence than random."""
-        periodic = [60, 70, 60, 70] * 6  # 24 samples, period = 2
-        rng = np.random.default_rng(123)
-        random_db = list(rng.uniform(55, 75, 24))
-
-        conf_periodic = _inter_block_beat_confidence(periodic)
-        conf_random = _inter_block_beat_confidence(random_db)
-        assert conf_periodic > conf_random
-
-    def test_returns_between_zero_and_one(self):
-        rng = np.random.default_rng(99)
-        history = list(rng.uniform(50, 80, 24))
-        result = _inter_block_beat_confidence(history)
-        assert 0.0 <= result <= 1.0
-
-
-class TestIntraBlockBeatConfidence:
-    """Tests for intra-block beat detection (actual musical tempo within 1 block)."""
-
-    SR = 22050  # Standard sample rate
-
-    def _make_beat_block(self, bpm=120, sr=22050, amplitude=0.5, n_seconds=1):
-        """Generate a synthetic block with amplitude pulses at the given BPM."""
-        n_samples = sr * n_seconds
-        t = np.arange(n_samples, dtype=np.float32) / sr
-        # Amplitude envelope: periodic bumps at the beat frequency
-        beat_freq = bpm / 60.0
-        # Sharp pulses via half-rectified sine
-        envelope = np.maximum(0, np.sin(2 * np.pi * beat_freq * t))
-        # Modulate a carrier tone to create audible beats
-        carrier = np.sin(2 * np.pi * 200 * t).astype(np.float32)
-        return (carrier * envelope * amplitude).astype(np.float32)
-
-    def test_rhythmic_block_high_confidence(self):
-        """A block with clear 120 BPM beats should score high."""
-        block = self._make_beat_block(bpm=120)
-        result = intra_block_beat_confidence(block, self.SR)
-        assert result > 0.90
-
-    def test_silence_returns_zero(self):
-        """A silent block should return 0.0."""
-        block = np.zeros(self.SR, dtype=np.float32)
-        result = intra_block_beat_confidence(block, self.SR)
-        assert result == pytest.approx(0.0)
-
-    def test_constant_tone_returns_zero(self):
-        """A steady tone has negligible amplitude variation → 0.0.
-
-        The CV guard catches this: a pure sine's frame-by-frame RMS
-        varies only by float-precision phase alignment jitter."""
-        t = np.arange(self.SR, dtype=np.float32) / self.SR
-        block = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
-        result = intra_block_beat_confidence(block, self.SR)
-        assert result == pytest.approx(0.0)
-
-    def test_white_noise_low_confidence(self):
-        """Random noise should not register as rhythmic."""
-        rng = np.random.default_rng(42)
-        block = rng.standard_normal(self.SR).astype(np.float32) * 0.3
-        result = intra_block_beat_confidence(block, self.SR)
-        assert result < 0.10
-
-    def test_fast_tempo_detected(self):
-        """180 BPM (upper range) should still be detectable."""
-        block = self._make_beat_block(bpm=180)
-        result = intra_block_beat_confidence(block, self.SR)
-        assert result > 0.90
-
-    def test_slow_tempo_detected(self):
-        """100 BPM should produce non-trivial correlation, though only ~1.67
-        beat cycles fit in a 1-second block, limiting autocorrelation strength."""
-        block = self._make_beat_block(bpm=100)
-        result = intra_block_beat_confidence(block, self.SR)
-        assert result > 0.15
-
-    def test_very_short_block_returns_zero(self):
-        """A block shorter than 20 hop frames should return 0.0."""
-        # At 10ms hop, need 20 frames = 200ms. 100ms block = too short.
-        short_block = np.zeros(int(self.SR * 0.10), dtype=np.float32)
-        result = intra_block_beat_confidence(short_block, self.SR)
-        assert result == pytest.approx(0.0)
-
-    def test_returns_between_zero_and_one(self):
-        block = self._make_beat_block(bpm=120)
-        result = intra_block_beat_confidence(block, self.SR)
-        assert 0.0 <= result <= 1.0
-
-
-class TestCombinedBeatConfidence:
-    """Tests for beat_confidence() — intra-block only (inter-block removed).
-
-    The inter-block component was dropped because it measures dB *stability*,
-    not rhythm. Any steady source (mower, rain) produces high inter-block
-    autocorrelation from consistent dB levels, inflating non-musical scores.
-    """
-
-    SR = 22050
-
-    def test_equals_intra_block(self):
-        """beat_confidence should return exactly the intra-block value."""
-        t = np.arange(self.SR, dtype=np.float32) / self.SR
-        beat_freq = 120 / 60.0
-        envelope = np.maximum(0, np.sin(2 * np.pi * beat_freq * t))
-        carrier = np.sin(2 * np.pi * 200 * t).astype(np.float32)
-        block = (carrier * envelope * 0.5).astype(np.float32)
-        db_history = [60, 70, 60, 70] * 6
-
-        combined = beat_confidence(block, self.SR, db_history)
-        intra = intra_block_beat_confidence(block, self.SR)
-
-        assert combined == pytest.approx(intra)
-
-    def test_ignores_inter_block(self):
-        """Even with strong inter-block pattern, only intra matters."""
-        block = np.zeros(self.SR, dtype=np.float32)
-        db_history = [60, 70, 60, 70] * 6  # Strong inter-block pattern
-        combined = beat_confidence(block, self.SR, db_history)
-        # Silent block → intra is 0.0, and inter is ignored
-        assert combined == pytest.approx(0.0)
-
-    def test_accepts_db_history_param(self):
-        """db_history param accepted for API compatibility even though unused."""
-        t = np.arange(self.SR, dtype=np.float32) / self.SR
-        beat_freq = 120 / 60.0
-        envelope = np.maximum(0, np.sin(2 * np.pi * beat_freq * t))
-        carrier = np.sin(2 * np.pi * 200 * t).astype(np.float32)
-        block = (carrier * envelope * 0.5).astype(np.float32)
-
-        # Should work with short, long, or empty history
-        for history in [[], [65.0, 66.0], [70.0] * 100]:
-            result = beat_confidence(block, self.SR, history)
-            assert result > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -464,43 +310,14 @@ class TestLooksLikeAmplifiedBass:
                  "midband_ratio": 0.44, "highband_ratio": 0.30}
         assert looks_like_amplified_bass(feats, self.STABLE_DB) is True
 
-    def test_low_beat_confidence_rejected(self):
-        """When beat_confidence is below an explicitly set threshold, reject.
-
-        The default min_beat_confidence is 0.0 (disabled), but when set
-        explicitly (e.g., via config), low bconf should still reject.
-        """
-        assert looks_like_amplified_bass(
-            self.BASS_FEATS, self.STABLE_DB,
-            beat_confidence=0.10, min_beat_confidence=0.20) is False
-
-    def test_beat_confidence_disabled_by_default(self):
-        """Default min_beat_confidence=0.0 means any bconf passes.
-
-        Open-window recordings + truck overlays destroy rhythm detection,
-        so bconf is disabled by default. Flatness guards diesel instead.
-        """
-        assert looks_like_amplified_bass(
-            self.BASS_FEATS, self.STABLE_DB, beat_confidence=0.0) is True
-
     def test_low_flatness_rejected(self):
         """Diesel engines have flatness median 0.151 — the flatness floor blocks them.
 
-        This is the primary diesel guard since bconf was disabled (diesel
-        bconf median 0.80 would easily pass a bconf gate).
+        This is the primary diesel guard — diesel flatness median 0.151 sits
+        below the 0.20 floor, while bass music always exceeds 0.207.
         """
         diesel_like = {**self.BASS_FEATS, "flatness": 0.15}
         assert looks_like_amplified_bass(diesel_like, self.STABLE_DB) is False
-
-    def test_high_beat_confidence_accepted(self):
-        """When beat_confidence meets threshold, accept (all other criteria met)."""
-        assert looks_like_amplified_bass(
-            self.BASS_FEATS, self.STABLE_DB, beat_confidence=0.54) is True
-
-    def test_beat_confidence_none_skips_check(self):
-        """When beat_confidence is None (default), the check is bypassed."""
-        assert looks_like_amplified_bass(
-            self.BASS_FEATS, self.STABLE_DB, beat_confidence=None) is True
 
 
 # ---------------------------------------------------------------------------
@@ -1005,42 +822,6 @@ class TestMusicLikeScoreSensitivity:
         feats = {"lowband_ratio": 0.0, "flatness": 0.35, "midband_ratio": 0.50,
                  "highband_ratio": 0.50, "centroid_hz": 2000}
         assert music_like_score(feats) < 0.50
-
-
-class TestBeatConfidenceSensitivity:
-    """Verify the autocorrelation lag range captures relevant beat patterns."""
-
-    def test_lag2_pattern_highest_confidence(self):
-        """Alternating loud/quiet every 2 blocks (120 BPM at 1 block/sec)
-        should produce the highest confidence — lag 2 is the first checked.
-        """
-        pattern_2 = [60, 75, 60, 75] * 6  # 24 samples, period = 2
-        pattern_4 = [60, 60, 75, 75] * 6  # 24 samples, period = 4
-        conf_2 = _inter_block_beat_confidence(pattern_2)
-        conf_4 = _inter_block_beat_confidence(pattern_4)
-        # Both should be high, but lag-2 correlation is direct
-        assert conf_2 > 0.7
-        assert conf_4 > 0.5
-
-    def test_random_noise_low_confidence(self):
-        """Random amplitude fluctuations should not register as rhythmic."""
-        rng = np.random.default_rng(42)
-        noise = list(rng.uniform(50, 80, 24))
-        assert _inter_block_beat_confidence(noise) < 0.7
-
-    def test_monotone_returns_zero(self):
-        """Constant dB (all-zero deltas) returns exactly 0.0 via the allclose check."""
-        assert _inter_block_beat_confidence([65.0] * 24) == 0.0
-
-    def test_minimum_history_boundary(self):
-        """Exactly 8 readings should produce a valid (non-zero) result for a pattern."""
-        pattern = [60, 75, 60, 75, 60, 75, 60, 75]
-        result = _inter_block_beat_confidence(pattern)
-        assert result > 0.0
-
-    def test_seven_readings_returns_zero(self):
-        """7 readings (below minimum of 8) should return 0.0."""
-        assert _inter_block_beat_confidence([60, 75] * 3 + [60]) == 0.0
 
 
 class TestThunderSensitivity:
@@ -1975,24 +1756,6 @@ class TestLooksLikeFlyover:
 
     def test_short_history_not_flyover(self):
         assert looks_like_flyover(self.PLANE_FEATS, [70.0, 70.0]) is False
-
-    def test_high_bconf_rejected(self):
-        """High beat confidence indicates music, not engine noise."""
-        assert looks_like_flyover(
-            self.PLANE_FEATS, self.STABLE_DB,
-            beat_confidence_val=0.60) is False
-
-    def test_low_bconf_accepted(self):
-        """Engine noise has low beat confidence — should pass."""
-        assert looks_like_flyover(
-            self.PLANE_FEATS, self.STABLE_DB,
-            beat_confidence_val=0.20) is True
-
-    def test_bconf_guard_disabled(self):
-        """When max_beat_confidence=0, guard is disabled."""
-        assert looks_like_flyover(
-            self.PLANE_FEATS, self.STABLE_DB,
-            max_beat_confidence=0, beat_confidence_val=0.90) is True
 
     def test_mower_blocks_rejected_by_highband(self):
         """Escaped mower blocks have highband 0.56–0.82 — above ceiling."""

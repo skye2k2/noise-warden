@@ -93,8 +93,7 @@ def seed_clip(storage, wav_path, filename, detection_cfg, audio_cfg, full_cfg,
     _rule_name, threshold_db = applicable_threshold(full_cfg, end_time)
 
     # Build the incident row — mirrors engine._begin_incident() fields.
-    # Use the LAST block's mscore/bconf — block 0 has almost no history,
-    # and beat_confidence_from_history() needs 8+ readings to be non-zero.
+    # Use the LAST block's mscore — block 0 has almost no history.
     last_block = result["blocks"][-1] if result["blocks"] else {}
     row = {
         "start_ts": start_time.isoformat(),
@@ -103,7 +102,6 @@ def seed_clip(storage, wav_path, filename, detection_cfg, audio_cfg, full_cfg,
         "avg_db": result["avg_db"],
         "threshold_db": threshold_db,
         "music_like_score": last_block.get("mscore", 0.0),
-        "beat_confidence": last_block.get("bconf", 0.0),
         "classification": result["dominant"],
         "mode": "day",
         "responded": 0,

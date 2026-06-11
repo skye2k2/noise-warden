@@ -129,7 +129,7 @@ This project uses a **symlinked versioning layout** for Raspberry Pi deployment:
 
 **Audio Pipeline**:
 - `audio.py`: Continuous callback streaming via sounddevice, thread-safe queue, pre-roll buffer
-- `dsp.py`: RMS/dBFS, A-weighting, spectrum features, beat detection, music scoring
+- `dsp.py`: RMS/dBFS, A-weighting, spectrum features, music scoring
 - `engine.py`: State machine, incident lifecycle, exclusion filters, day/night enforcement
 
 **Exclusion Filters** (prevent false positives):

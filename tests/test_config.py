@@ -9,7 +9,7 @@ import os
 import pytest
 import yaml
 
-from noise_warden.config import ConfigError, load_yaml, validate_config, save_yaml_text_validated
+from noise_warden.config import ConfigError, load_yaml, validate_config, save_yaml_text_validated, resolve_snippet_path, get_app_version
 
 
 # ---------------------------------------------------------------------------
@@ -129,3 +129,65 @@ class TestSaveYamlTextValidated:
         cfg_path = str(tmp_path / "nonmap.yaml")
         with pytest.raises(ConfigError, match="mapping"):
             save_yaml_text_validated(cfg_path, "- a list\n- not a mapping\n")
+
+
+class TestResolveSnippetPath:
+    """resolve_snippet_path makes DB snippet paths portable across machines —
+    a database recorded on the Pi (/opt/.../snippets/X.wav) must still resolve
+    when opened locally against ./local_data/snippets/X.wav."""
+
+    def test_none_path_returns_none(self):
+        assert resolve_snippet_path(None, "/anything") is None
+        assert resolve_snippet_path("", "/anything") is None
+
+    def test_existing_stored_path_used_directly(self, tmp_path):
+        """If the stored absolute path exists (deployed Pi), use it as-is."""
+        wav = tmp_path / "incident_1_abc.wav"
+        wav.write_bytes(b"RIFF")
+        assert resolve_snippet_path(str(wav), "/some/other/dir") == str(wav)
+
+    def test_resolves_by_basename_in_snippets_dir(self, tmp_path):
+        """A stored /opt path that doesn't exist resolves to the local file."""
+        snippets = tmp_path / "snippets"
+        snippets.mkdir()
+        local = snippets / "incident_42_xyz.wav"
+        local.write_bytes(b"RIFF")
+        stored = "/opt/noise-warden/shared/snippets/incident_42_xyz.wav"
+        assert resolve_snippet_path(stored, str(snippets)) == str(local)
+
+    def test_resolves_in_autodismissed_subfolder(self, tmp_path):
+        """Quarantined snippets live in autodismissed/ — resolver checks there too."""
+        snippets = tmp_path / "snippets"
+        quarantine = snippets / "autodismissed"
+        quarantine.mkdir(parents=True)
+        local = quarantine / "incident_7_qq.wav"
+        local.write_bytes(b"RIFF")
+        stored = "/opt/noise-warden/shared/snippets/incident_7_qq.wav"
+        assert resolve_snippet_path(stored, str(snippets)) == str(local)
+
+    def test_missing_file_returns_none(self, tmp_path):
+        snippets = tmp_path / "snippets"
+        snippets.mkdir()
+        stored = "/opt/noise-warden/shared/snippets/gone.wav"
+        assert resolve_snippet_path(stored, str(snippets)) is None
+
+
+class TestGetAppVersion:
+    """get_app_version reads the release version from pyproject.toml so the nav
+    display stays in sync with the CHANGELOG without a reinstall."""
+
+    def test_returns_pyproject_version(self):
+        """Should return the actual version string from the project's pyproject.toml."""
+        import noise_warden.config as cfg
+        cfg._cached_version = None  # reset cache so the file is actually read
+        version = cfg.get_app_version()
+        assert isinstance(version, str)
+        assert version != "?"
+        # pyproject uses a simple integer release scheme matching the CHANGELOG (e.g. "17").
+        assert version.isdigit()
+
+    def test_result_is_cached(self):
+        import noise_warden.config as cfg
+        cfg._cached_version = "test-sentinel"
+        assert cfg.get_app_version() == "test-sentinel"
+        cfg._cached_version = None  # leave cache clean for other tests

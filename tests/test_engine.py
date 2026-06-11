@@ -789,6 +789,9 @@ class TestMinIncidentDuration:
         base_cfg["audio"]["recording_enabled"] = False
         base_cfg["audio"]["min_incident_seconds"] = 3
         base_cfg["detection"]["driveby_max_duration_sec"] = 0
+        # too_short dismissal is skipped in continuous_music_focus mode (a brief
+        # music burst is wanted there); use continuous so the mechanism under test fires.
+        base_cfg["detection"]["mode"] = "continuous"
 
         now = datetime.now(tz=timezone.utc)
         engine.active = {
@@ -917,6 +920,8 @@ class TestDriveByQuarantine:
 
     def test_driveby_moves_snippet_to_autodismissed(self, base_cfg, tmp_storage, tmp_state, tmp_path):
         """Drive-by auto-dismiss should move the snippet to autodismissed/ instead of deleting."""
+        # Drive-by dismissal is skipped in continuous_music_focus mode; use continuous.
+        base_cfg["detection"]["mode"] = "continuous"
         # Create a snippet file in the snippets directory
         snippets_dir = os.path.join(str(tmp_path), "snippets")
         os.makedirs(snippets_dir)
@@ -969,6 +974,102 @@ class TestDriveByQuarantine:
         assert inc is not None
         assert inc["classification"] == "drive_by"
         assert inc["excluded"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Music-focus policy: mode-aware auto-dismiss + gap-merge window
+# ---------------------------------------------------------------------------
+
+class TestMusicFocusPolicy:
+    """In continuous_music_focus mode, an incident only exists because a block
+    classified as music_like, so brief/fade-shaped music bursts must NOT be
+    auto-dismissed as drive_by / too_short (the 21:55 incident-8369 case). The
+    gap-merge window is also widened so dips between songs don't fragment a
+    session."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def _active(self, tmp_storage, dbs, start_offset, last_above_offset):
+        now = datetime.now(tz=timezone.utc)
+        return {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 72.0, "peak_db": 76.0, "avg_db": 73.0,
+                "threshold_db": 65.0, "music_like_score": 0.7,
+                "classification": "music_like", "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=start_offset),
+            "dbs": dbs,
+            "classification": "music_like",
+            "class_journal": [(0, "music_like")],
+            "period": "day",
+            "responded": False,
+            "last_above": now - timedelta(seconds=last_above_offset),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+    def test_music_focus_skips_driveby_dismissal(self, base_cfg, tmp_storage, tmp_state):
+        """A short fade-shaped music burst is kept (not dismissed as drive_by) in music focus."""
+        base_cfg["detection"]["mode"] = "continuous_music_focus"
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        # Fade-out shape that _looks_like_driveby would otherwise flag.
+        engine.active = self._active(tmp_storage, [76.0, 74.0, 72.0, 70.0, 68.0], 5, 0)
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+        incidents = tmp_storage.list_incidents()
+        assert len(incidents) == 1
+        assert incidents[0]["excluded"] in (0, None)
+        assert incidents[0]["classification"] != "drive_by"
+
+    def test_music_focus_skips_too_short_dismissal(self, base_cfg, tmp_storage, tmp_state):
+        """A sub-min_incident_seconds music burst is kept in music focus."""
+        base_cfg["detection"]["mode"] = "continuous_music_focus"
+        base_cfg["audio"]["min_incident_seconds"] = 3
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0  # isolate too_short path
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        # Only 2s active (last_above 0s ago, start 2s ago) → would be too_short.
+        engine.active = self._active(tmp_storage, [72.0, 73.0], 2, 0)
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+        incidents = tmp_storage.list_incidents()
+        assert len(incidents) == 1
+        assert incidents[0]["classification"] != "too_short"
+
+    def test_non_music_mode_still_dismisses_driveby(self, base_cfg, tmp_storage, tmp_state):
+        """The guard is mode-specific: continuous mode still dismisses drive-bys."""
+        base_cfg["detection"]["mode"] = "continuous"
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.active = self._active(tmp_storage, [76.0, 74.0, 72.0, 70.0, 68.0], 5, 0)
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+        incidents = tmp_storage.list_incidents()
+        assert len(incidents) == 0  # dismissed (excluded) → hidden from default list
+
+    def test_gap_merge_sec_longer_in_music_focus(self, base_cfg, tmp_storage, tmp_state):
+        base_cfg["detection"]["mode"] = "continuous_music_focus"
+        base_cfg["detection"]["song_gap_merge_sec"] = 12
+        base_cfg["detection"]["music_focus_gap_merge_sec"] = 45
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert engine._gap_merge_sec() == 45.0
+
+    def test_gap_merge_sec_default_in_other_modes(self, base_cfg, tmp_storage, tmp_state):
+        base_cfg["detection"]["mode"] = "continuous"
+        base_cfg["detection"]["song_gap_merge_sec"] = 12
+        base_cfg["detection"]["music_focus_gap_merge_sec"] = 45
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert engine._gap_merge_sec() == 12.0
+
+    def test_gap_merge_sec_falls_back_when_key_absent(self, base_cfg, tmp_storage, tmp_state):
+        """Music focus mode without the music key falls back to song_gap_merge_sec."""
+        base_cfg["detection"]["mode"] = "continuous_music_focus"
+        base_cfg["detection"]["song_gap_merge_sec"] = 12
+        base_cfg["detection"].pop("music_focus_gap_merge_sec", None)
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        assert engine._gap_merge_sec() == 12.0
 
 
 # ---------------------------------------------------------------------------
@@ -1217,7 +1318,7 @@ class TestPeriodBoundarySplit:
              patch.object(engine.ha, "publish_event"):
             # Night threshold for residential continuous = 55 dB; our 70 dB exceeds it
             split = engine._check_period_split(
-                db_now=70.0, threshold=55.0, mscore=0.5, bconf=0.3,
+                db_now=70.0, threshold=55.0, mscore=0.5,
                 classification="other", block=block
             )
 
@@ -1274,7 +1375,7 @@ class TestPeriodBoundarySplit:
         with patch("noise_warden.engine.is_night", return_value=False), \
              patch.object(engine.ha, "publish_event"):
             split = engine._check_period_split(
-                db_now=60.0, threshold=65.0, mscore=0.5, bconf=0.3,
+                db_now=60.0, threshold=65.0, mscore=0.5,
                 classification="other", block=block
             )
 
@@ -1316,7 +1417,7 @@ class TestPeriodBoundarySplit:
         # Still daytime — no split expected
         with patch("noise_warden.engine.is_night", return_value=False):
             split = engine._check_period_split(
-                db_now=70.0, threshold=65.0, mscore=0.5, bconf=0.3,
+                db_now=70.0, threshold=65.0, mscore=0.5,
                 classification="other", block=block
             )
 
@@ -1374,7 +1475,7 @@ class TestDurationSplit:
         with patch("noise_warden.engine.is_night", return_value=False), \
              patch.object(engine.ha, "publish_event"):
             split = engine._check_duration_split(
-                db_now=70.0, threshold=65.0, mscore=0.5, bconf=0.3,
+                db_now=70.0, threshold=65.0, mscore=0.5,
                 classification="other", block=block
             )
 
@@ -1423,7 +1524,7 @@ class TestDurationSplit:
 
         block = np.zeros(8000, dtype=np.float32)
         split = engine._check_duration_split(
-            db_now=70.0, threshold=65.0, mscore=0.5, bconf=0.3,
+            db_now=70.0, threshold=65.0, mscore=0.5,
             classification="other", block=block
         )
 
@@ -1463,7 +1564,7 @@ class TestDurationSplit:
         with patch("noise_warden.engine.is_night", return_value=True), \
              patch.object(engine.ha, "publish_event"):
             split = engine._check_duration_split(
-                db_now=50.0, threshold=55.0, mscore=0.5, bconf=0.3,
+                db_now=50.0, threshold=55.0, mscore=0.5,
                 classification="other", block=block
             )
 
@@ -1691,59 +1792,80 @@ class TestNoiseFloorGate:
 # ---------------------------------------------------------------------------
 
 class TestClassifySound:
-    """Tests for _classify_sound: music/music_like/unknown categorization."""
+    """Tests for _classify_sound: music_like/engine_noise/unknown categorization."""
 
     def _make_engine(self, base_cfg, tmp_storage, tmp_state):
         with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
             with patch("noise_warden.engine.HAClient"):
                 return Engine(base_cfg, tmp_storage, tmp_state)
 
-    def test_high_music_and_beat_returns_music(self, base_cfg, tmp_storage, tmp_state):
-        """High music score + high beat confidence = rhythmic music."""
+    def test_high_music_returns_music_like(self, base_cfg, tmp_storage, tmp_state):
+        """High music score (no engine veto) classifies as music_like."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        assert engine._classify_sound(0.80, 0.50) == "music"
-
-    def test_high_music_low_beat_returns_music_like(self, base_cfg, tmp_storage, tmp_state):
-        """High music score + low beat confidence = bass-heavy but non-rhythmic."""
-        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        assert engine._classify_sound(0.80, 0.20) == "music_like"
+        assert engine._classify_sound(0.80) == "music_like"
 
     def test_low_music_returns_unknown(self, base_cfg, tmp_storage, tmp_state):
         """Low music score = no recognizable pattern."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        assert engine._classify_sound(0.30, 0.50) == "unknown"
+        assert engine._classify_sound(0.30) == "unknown"
 
     def test_boundary_music_like_score(self, base_cfg, tmp_storage, tmp_state):
         """Score exactly at threshold should classify as music_like (not unknown)."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
         threshold = float(base_cfg["detection"]["min_music_like_score"])
-        assert engine._classify_sound(threshold, 0.10) == "music_like"
+        assert engine._classify_sound(threshold) == "music_like"
 
     def test_high_midband_returns_engine_noise(self, base_cfg, tmp_storage, tmp_state):
         """Dominant midband (engine-like) should classify as engine_noise.
 
-        Engine sounds concentrate energy in 180–1200 Hz (midband > 0.50),
-        while music follows a 'smiley EQ' with lower midband.
+        Engine sounds concentrate energy in 180–1200 Hz (midband above the
+        engine_midband_veto, default 0.40), while music follows a 'smiley EQ'
+        with lower midband.
         """
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
         engine_feats = {"midband_ratio": 0.65, "lowband_ratio": 0.10,
                         "highband_ratio": 0.25, "flatness": 0.30,
                         "centroid_hz": 2000}
-        # Even with high mscore and bconf, dominant midband → engine_noise
-        assert engine._classify_sound(0.80, 0.60, features=engine_feats) == "engine_noise"
+        # Even with high mscore, dominant midband → engine_noise
+        assert engine._classify_sound(0.80, features=engine_feats) == "engine_noise"
 
-    def test_moderate_midband_allows_music(self, base_cfg, tmp_storage, tmp_state):
-        """Music-typical midband (< 0.50) should still classify normally."""
+    def test_midband_veto_boundary_at_0_40(self, base_cfg, tmp_storage, tmp_state):
+        """The engine veto fires just above 0.40 and allows just below it.
+
+        Calibrated from labeled data: confirmed-music midband p75 ~0.22, so a
+        0.40 veto leaves comfortable headroom. This boundary test guards against
+        an accidental loosening back toward the old 0.50 threshold."""
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base = {"lowband_ratio": 0.40, "highband_ratio": 0.27,
+                "flatness": 0.35, "centroid_hz": 2500, "envelope_cv": 0.5,
+                "harmonic_ratio": 0.5}
+        just_over = dict(base, midband_ratio=0.41)
+        just_under = dict(base, midband_ratio=0.39)
+        assert engine._classify_sound(0.80, features=just_over) == "engine_noise"
+        assert engine._classify_sound(0.80, features=just_under) == "music_like"
+
+    def test_midband_veto_threshold_is_configurable(self, base_cfg, tmp_storage, tmp_state):
+        """A custom engine_midband_veto overrides the 0.40 default."""
+        base_cfg["detection"]["engine_midband_veto"] = 0.30
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        feats = {"midband_ratio": 0.35, "lowband_ratio": 0.40,
+                 "highband_ratio": 0.27, "flatness": 0.35, "centroid_hz": 2500,
+                 "envelope_cv": 0.5, "harmonic_ratio": 0.5}
+        # 0.35 > 0.30 custom veto → engine_noise (would be music_like at default 0.40)
+        assert engine._classify_sound(0.80, features=feats) == "engine_noise"
+
+    def test_moderate_midband_allows_music_like(self, base_cfg, tmp_storage, tmp_state):
+        """Music-typical midband (below the veto) should still classify as music_like."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
         music_feats = {"midband_ratio": 0.33, "lowband_ratio": 0.40,
                        "highband_ratio": 0.27, "flatness": 0.35,
                        "centroid_hz": 2500}
-        assert engine._classify_sound(0.80, 0.50, features=music_feats) == "music"
+        assert engine._classify_sound(0.80, features=music_feats) == "music_like"
 
     def test_no_features_backward_compatible(self, base_cfg, tmp_storage, tmp_state):
         """Without features parameter, midband guard is skipped (backward compat)."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        assert engine._classify_sound(0.80, 0.50) == "music"
+        assert engine._classify_sound(0.80) == "music_like"
 
 
 # ---------------------------------------------------------------------------
@@ -1809,7 +1931,7 @@ class TestExcludedIncidents:
     def test_begin_excluded_incident_creates_row(self, base_cfg, tmp_storage, tmp_state):
         """Starting an excluded incident should create a DB row with excluded=1."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_excluded_incident("thunder", 70.0, 65.0, 0.3, 0.2, "respond")
+        engine._begin_excluded_incident("thunder", 70.0, 65.0, 0.3, "respond")
         assert engine._excluded_id is not None
         inc = tmp_storage.get_incident(engine._excluded_id)
         assert inc["classification"] == "thunder"
@@ -1818,7 +1940,7 @@ class TestExcludedIncidents:
     def test_end_excluded_incident_sets_duration(self, base_cfg, tmp_storage, tmp_state):
         """Ending an excluded incident should finalize it with end_ts and duration."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_excluded_incident("rain", 68.0, 65.0, 0.1, 0.1, "respond")
+        engine._begin_excluded_incident("rain", 68.0, 65.0, 0.1, "respond")
         iid = engine._excluded_id
         engine._end_excluded_incident()
         assert engine._excluded_id is None
@@ -1920,6 +2042,13 @@ class TestClassificationJournal:
         # Disable min_incident_seconds — these tests finalize immediately,
         # producing ~0s duration incidents. Duration filtering is not under test.
         base_cfg["audio"]["min_incident_seconds"] = 0
+        # Disable recording so _finalize_incident takes the no-snippet fallback
+        # path, which derives the stored classification/journal from the live
+        # class_journal via _compute_dominant. (When a snippet exists, the
+        # finalize keystone instead re-analyzes the WAV through analyze_clip —
+        # that path's journal→dominant logic is covered by test_reclassify's
+        # TestComputeDominant. These tests exercise the live-journal mapping.)
+        base_cfg["audio"]["recording_enabled"] = False
         with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
             with patch("noise_warden.engine.HAClient"):
                 return Engine(base_cfg, tmp_storage, tmp_state)
@@ -1927,7 +2056,7 @@ class TestClassificationJournal:
     def test_journal_initialized_on_begin(self, base_cfg, tmp_storage, tmp_state):
         """_begin_incident should create a class_journal with the initial classification."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._begin_incident(72.0, 65.0, 0.7, "music", "respond")
         assert engine.active is not None
         journal = engine.active["class_journal"]
         assert journal == [(0, "music")]
@@ -1936,7 +2065,7 @@ class TestClassificationJournal:
         """Calling _update_class_journal with the same classification should not
         add a duplicate entry — the journal only logs transitions."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._begin_incident(72.0, 65.0, 0.7, "music", "respond")
         engine._update_class_journal("music")
         engine._update_class_journal("music")
         assert len(engine.active["class_journal"]) == 1
@@ -1944,7 +2073,7 @@ class TestClassificationJournal:
     def test_journal_records_transition(self, base_cfg, tmp_storage, tmp_state):
         """When classification changes, journal should record the new entry."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._begin_incident(72.0, 65.0, 0.7, "music", "respond")
         engine._update_class_journal("birdsong")
         journal = engine.active["class_journal"]
         assert len(journal) == 2
@@ -1955,7 +2084,7 @@ class TestClassificationJournal:
     def test_journal_multiple_transitions(self, base_cfg, tmp_storage, tmp_state):
         """Multiple transitions should all be recorded in order."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._begin_incident(72.0, 65.0, 0.7, "music", "respond")
         engine._update_class_journal("birdsong")
         engine._update_class_journal("mower")
         engine._update_class_journal("music")
@@ -1967,7 +2096,7 @@ class TestClassificationJournal:
     def test_finalize_single_class_no_multiple_suffix(self, base_cfg, tmp_storage, tmp_state):
         """An incident with only one classification should NOT get '(multiple)' suffix."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._begin_incident(72.0, 65.0, 0.7, "music", "respond")
         engine._update_class_journal("music")
         iid = engine.active["id"]
         engine._finalize_incident()
@@ -1982,7 +2111,7 @@ class TestClassificationJournal:
         """An incident with multiple classifications should get '(multiple)' suffix
         and the journal should be stored as JSON."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._begin_incident(72.0, 65.0, 0.7, "music", "respond")
         engine._update_class_journal("birdsong")
         engine._update_class_journal("music")
         iid = engine.active["id"]
@@ -2003,7 +2132,7 @@ class TestClassificationJournal:
         filter detection latency — filter-based classifications (mower, etc.)
         would backdate and erase the initial 'unknown' entry in the journal."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "unknown", "respond")
+        engine._begin_incident(72.0, 65.0, 0.7, "unknown", "respond")
         engine._update_class_journal("music_like")
         iid = engine.active["id"]
         engine._finalize_incident()
@@ -2013,8 +2142,12 @@ class TestClassificationJournal:
     def test_driveby_overrides_multiple_classification(self, base_cfg, tmp_storage, tmp_state):
         """Drive-by reclassification should override '(multiple)' if the incident
         matches drive-by criteria, since the drive-by check runs after journal storage."""
+        # Drive-by dismissal is intentionally skipped in continuous_music_focus mode
+        # (a brief music burst is a wanted detection there); use continuous mode so
+        # the general drive-by mechanism under test still fires.
+        base_cfg["detection"]["mode"] = "continuous"
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "unknown", "respond")
+        engine._begin_incident(72.0, 65.0, 0.7, "unknown", "respond")
         engine._update_class_journal("mower")
         iid = engine.active["id"]
         # Simulate a short incident with a fade-out tail (drive-by pattern)
@@ -2030,11 +2163,66 @@ class TestClassificationJournal:
         assert len(journal) == 1
         assert journal[0][1] == "mower"
 
+    def test_finalize_keystone_stores_body_median_from_wav(self, base_cfg, tmp_storage, tmp_state, tmp_path):
+        """With a real snippet, _finalize_incident re-analyzes the WAV through
+        analyze_clip (the reclassify keystone) and stores its body-median
+        music_like_score and dominant classification — NOT the first-block
+        snapshot. Verified by reproducing analyze_clip on the same final WAV and
+        asserting the stored values match exactly (parity by construction)."""
+        import soundfile as _sf
+        from noise_warden.reclassify import analyze_clip
+
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+
+        sr = 22050
+        block_samples = int(sr * float(base_cfg["audio"]["block_seconds"]))
+        # 20 blocks → after lead-in(2)/lead-out(8) marking, a 10-block body.
+        n_blocks = 20
+        wav_path = os.path.join(str(tmp_path), "keystone.wav")
+        rng = np.random.default_rng(1234)
+        audio = (rng.standard_normal(n_blocks * block_samples).astype(np.float32) * 0.05)
+        _sf.write(wav_path, audio, sr, subtype="PCM_16")
+
+        now = datetime.now(tz=timezone.utc)
+        iid = tmp_storage.create_incident({
+            "start_ts": "2026-01-01T00:00:00+00:00",
+            "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+            "threshold_db": 65.0, "music_like_score": 0.99,  # bogus first-block value
+            "classification": "unknown", "mode": "respond",
+        })
+        engine.active = {
+            "id": iid,
+            "start": now - timedelta(seconds=n_blocks),
+            "dbs": [70.0] * n_blocks,           # all above threshold → no tail trim
+            "classification": "unknown",
+            "class_journal": [(0, "unknown")],
+            "period": "day",
+            "responded": False,
+            "last_above": now,                   # no gap → nothing trimmed
+            "tmp_wav": wav_path,
+            "wav_handle": None,
+            "recording": True,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            # force=True bypasses the drive-by/too-short/borderline auto-dismiss
+            # checks (not under test here); the keystone runs before those gates.
+            engine._finalize_incident(force=True)
+
+        inc = tmp_storage.get_incident(iid)
+        # Reproduce the keystone on the (now-final) WAV — must match exactly.
+        expected = analyze_clip(wav_path, base_cfg["detection"], base_cfg["audio"],
+                                engine_captured=True)
+        assert inc["music_like_score"] == expected["music_like_median"]
+        assert inc["classification"] == expected["dominant"]
+        # The bogus 0.99 first-block value must have been overwritten.
+        assert inc["music_like_score"] != 0.99
+
     def test_last_above_refreshed_during_filter_hit(self, base_cfg, tmp_storage, tmp_state):
         """When a filter matches during an active incident and noise is above threshold,
         last_above should be refreshed so the incident doesn't zombie-timeout."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._begin_incident(72.0, 65.0, 0.7, "music", "respond")
         original_last_above = engine.active["last_above"]
 
         import time
@@ -2050,7 +2238,7 @@ class TestClassificationJournal:
         """When a normal incident is active and a filter matches, no separate excluded
         incident should be created — the journal captures the filter classification."""
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
-        engine._begin_incident(72.0, 65.0, 0.7, 0.5, "music", "respond")
+        engine._begin_incident(72.0, 65.0, 0.7, "music", "respond")
         assert engine._excluded_id is None
         engine._update_class_journal("birdsong")
         assert len(engine.active["class_journal"]) == 2

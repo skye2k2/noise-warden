@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse,
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .config import load_yaml, save_yaml_text_validated, ConfigError, _default_config_path
+from .config import load_yaml, save_yaml_text_validated, ConfigError, _default_config_path, resolve_snippet_path, get_app_version
 from .storage import Storage
 from .state import StateStore
 from .engine import Engine
@@ -29,6 +29,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Noise Warden", lifespan=lifespan)
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "..", "templates"))
+# Expose the release version to every template (used in the nav). A Jinja global
+# avoids threading it through each route's context dict.
+templates.env.globals["app_version"] = get_app_version()
 
 static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
 os.makedirs(static_dir, exist_ok=True)
@@ -106,16 +109,28 @@ def dashboard(request: Request):
         "has_systemd": _running_under_systemd(),
     })
 
+# Classification types that are auto-excluded (for the filter toggle UI)
+EXCLUDED_CLASSIFICATIONS = [
+    "borderline", "drive_by", "too_short",
+    "amplified_bass", "birdsong", "conversation", "diesel",
+    "impulse", "mower", "rain", "thunder", "weedwhacker",
+]
+
 @app.get("/incidents", response_class=HTMLResponse)
-def incidents(request: Request, page: int = 1):
+def incidents(request: Request, page: int = 1, show: str = ""):
+    # show is comma-separated classification names: ?show=drive_by,too_short
+    show_classifications = [s.strip() for s in show.split(",") if s.strip()] if show else None
     per_page = 50
     offset = (max(page,1)-1) * per_page
-    total = storage.count_incidents()
-    rows = storage.list_incidents(limit=per_page, offset=offset)
+    total = storage.count_incidents(show_classifications=show_classifications)
+    rows = storage.list_incidents(limit=per_page, offset=offset, show_classifications=show_classifications)
     return templates.TemplateResponse(request, "incidents.html", {
         "rows": rows, "page": page, "pages": max(1, (total + per_page - 1)//per_page),
         "ordinance_json": json.dumps(ORDINANCE),
         "borderline_margin_db": float(cfg["detection"].get("borderline_margin_db", 5.0)),
+        "excluded_classifications": EXCLUDED_CLASSIFICATIONS,
+        "active_filters": show_classifications or [],
+        "show_param": show,
     })
 
 @app.post("/incidents/{incident_id}/notes")
@@ -142,6 +157,15 @@ def clear_crash_repaired(request: Request):
     deleted = storage.delete_crash_repaired_incidents()
     print(f"[web] Hard-deleted {deleted} crash-repaired incident(s)")
     return RedirectResponse(url=f"/incidents?msg=crash-repaired-cleared-{deleted}", status_code=303)
+
+@app.post("/incidents/clear-autodismissed")
+def clear_autodismissed(request: Request):
+    """Hard-delete all excluded (auto-dismissed) incidents and their quarantined WAV files."""
+    must_auth(request)
+    snippets_dir = os.path.join(cfg["app"]["shared_dir"], "snippets")
+    rows_deleted, files_removed = storage.clear_autodismissed(snippets_dir)
+    print(f"[web] Cleared {rows_deleted} auto-dismissed incident(s), removed {files_removed} quarantined file(s)")
+    return RedirectResponse(url=f"/incidents?msg=autodismissed-cleared-{rows_deleted}", status_code=303)
 
 @app.post("/incidents/clear")
 def clear_all_incidents(request: Request):
@@ -236,7 +260,7 @@ def reclassify_all_api(request: Request, apply: bool = False):
     """Re-run the DSP pipeline on every incident with a snippet WAV.
 
     Returns a JSON summary of what changed. With ?apply=true, writes
-    updated classifications, journals, beat_confidence, and music_like_score
+    updated classifications, journals, and music_like_score
     back to the database. Can take several seconds for large databases —
     the client should indicate progress.
     """
@@ -271,10 +295,16 @@ def get_snippet(request: Request, incident_id: int):
     This has broken audio scrubbing in at least two previous releases.
     """
     row = storage.get_incident(incident_id)
-    if not row or not row.get("snippet_path") or not os.path.exists(row["snippet_path"]):
+    if not row or not row.get("snippet_path"):
         raise HTTPException(status_code=404)
 
-    file_path = row["snippet_path"]
+    # Resolve the stored path against the current snippets dir by basename, so a
+    # database copied from the Pi (/opt/...) still plays locally (./local_data/...).
+    snippets_dir = os.path.join(cfg["app"]["shared_dir"], "snippets")
+    file_path = resolve_snippet_path(row["snippet_path"], snippets_dir)
+    if not file_path:
+        raise HTTPException(status_code=404)
+
     file_size = os.path.getsize(file_path)
 
     # Common headers for all responses — Accept-Ranges tells the browser

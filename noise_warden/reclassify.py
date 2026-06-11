@@ -27,7 +27,6 @@ import yaml
 
 from noise_warden.dsp import (
     apply_filter_holdover,
-    beat_confidence,
     dba_estimate,
     get_filter_detection_latency,
     identify_filter,
@@ -36,6 +35,7 @@ from noise_warden.dsp import (
     rms_dbfs,
     spectrum_features,
 )
+from noise_warden.config import resolve_snippet_path
 
 # ---------------------------------------------------------------------------
 # Snippet audio processing (shared with engine.py)
@@ -257,7 +257,6 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
     """
     cal_offset = float(detection_cfg["calibration_offset_db"])
     min_music = float(detection_cfg["min_music_like_score"])
-    min_beat = float(detection_cfg.get("min_beat_confidence", 0.38))
 
     data, sr = sf.read(wav_path, dtype="float32")
     if len(data.shape) > 1:
@@ -314,7 +313,6 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
         feats = spectrum_features(block, sr)
         feature_history.append(feats)
         feature_history = feature_history[-24:]
-        bconf = beat_confidence(block, sr, db_history)
         mscore = music_like_score(feats)
 
         # Lead-in blocks: mark as "lead-in" without running the filter chain.
@@ -334,23 +332,22 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
             # Normal DSP classification for the incident body
             prev = db_history[-2] if len(db_history) > 1 else db_now
             raw_filt = identify_filter(feats, db_history, db_now, prev, detection_cfg,
-                                       feature_history=feature_history,
-                                       beat_confidence=bconf)
+                                       feature_history=feature_history)
 
             # Apply holdover (same as engine._identify_filter)
             filt, prev_filt, prev_filt_run, holdover_gap = apply_filter_holdover(
                 raw_filt, prev_filt, prev_filt_run, holdover_gap, detection_cfg,
             )
 
-            # Replicate engine._classify_sound logic (with engine_noise detection)
-            if feats.get("midband_ratio", 0) > 0.50:
+            # Replicate engine._classify_sound logic (with engine_noise veto).
+            # midband veto threshold must match the engine — see engine_midband_veto.
+            midband_veto = float(detection_cfg.get("engine_midband_veto", 0.40))
+            if feats.get("midband_ratio", 0) > midband_veto:
                 classify = "engine_noise"
             elif (feats.get("lowband_ratio", 0) > 0.10 and
                   feats.get("envelope_cv", 0.5) < 0.10 and
                   feats.get("harmonic_ratio", 0.5) < 0.40):
                 classify = "engine_noise"
-            elif mscore >= min_music and bconf >= min_beat:
-                classify = "music"
             elif mscore >= min_music:
                 classify = "music_like"
             else:
@@ -403,7 +400,6 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
             "midband": round(feats["midband_ratio"], 3),
             "highband": round(feats["highband_ratio"], 3),
             "mscore": round(mscore, 2),
-            "bconf": round(bconf, 2),
             "env_std": round(env_std, 2),
             "filter": filt,
             "classification": final,
@@ -425,6 +421,17 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
     body_blocks = n_blocks - lead_in_blocks - lead_out_blocks
     dominant = _compute_dominant(journal, body_blocks)
 
+    # Body-median music_like_score: the honest summary metric. Excludes lead-in
+    # and lead-out bookend blocks so a quiet preroll / fade-out tail can't drag
+    # the score. Median (not mean) resists transient spikes from a single noisy
+    # block. This is the value stored on the incident and reproduced verbatim by
+    # reclassify — see engine._finalize_incident's analyze_clip keystone.
+    body_mscores = [
+        b["mscore"] for b in blocks
+        if b["classification"] not in ("lead-in", "lead-out")
+    ]
+    music_like_median = round(float(np.median(body_mscores)), 2) if body_mscores else 0.0
+
     # Exponentially-weighted average dB (matches engine)
     if db_history:
         n = len(db_history)
@@ -442,6 +449,7 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
         "db_history": db_history,
         "peak_db": round(max(db_history), 1) if db_history else 0.0,
         "avg_db": round(avg_db, 1),
+        "music_like_median": music_like_median,
         "filter_counts": filter_counts,
         "n_blocks": n_blocks,
     }
@@ -505,7 +513,10 @@ def _compute_dominant(journal, duration):
         if meaningful:
             dominant = max(meaningful, key=meaningful.get)
         else:
-            dominant = max(durations, key=durations.get)
+            # All classes are ignorable — pick the longest non-bookend one.
+            # Bookends must be excluded here too, or "lead-in" wins on duration.
+            fallback = {k: v for k, v in durations.items() if k not in _BOOKENDS}
+            dominant = max(fallback, key=fallback.get) if fallback else "unknown"
 
         # "+" suffix when only one real source was identified alongside
         # ignorable ambient blocks (unknown, engine_noise); "(multiple)"
@@ -530,14 +541,14 @@ def print_block_table(blocks):
     """Print the full block-by-block analysis table."""
     header = (f"{'Blk':>3}  {'dBA':>6}  {'Centroid':>8}  {'Flat':>5}  "
               f"{'Low':>5}  {'Mid':>5}  {'High':>5}  {'MScore':>6}  "
-              f"{'BConf':>5}  {'EnvStd':>6}  {'Filter':>12}  Class")
+              f"{'EnvStd':>6}  {'Filter':>12}  Class")
     print(header)
     print("-" * 110)
     for b in blocks:
         filt_str = b["filter"] or "-"
         print(f"{b['block']:3d}  {b['dba']:6.1f}  {b['centroid_hz']:8d}  "
               f"{b['flatness']:5.3f}  {b['lowband']:5.3f}  {b['midband']:5.3f}  "
-              f"{b['highband']:5.3f}  {b['mscore']:6.3f}  {b['bconf']:5.3f}  "
+              f"{b['highband']:5.3f}  {b['mscore']:6.3f}  "
               f"{b['env_std']:6.2f}  {filt_str:>12}  {b['classification']}")
 
 
@@ -550,11 +561,10 @@ def print_summary(result, old_class=None, old_journal=None):
     print(f"  Peak dB: {result['peak_db']}  |  Avg dB: {result['avg_db']}")
     print(f"  Filter distribution: {result['filter_counts']}")
 
-    # Music/beat scores from the last block (what gets stored in DB)
+    # Music score from the last block (what gets stored in DB)
     if result["blocks"]:
         last = result["blocks"][-1]
-        print(f"  Music score: {last.get('mscore', 0.0):.2f}  |  "
-              f"Beat confidence: {last.get('bconf', 0.0):.2f}")
+        print(f"  Music score: {last.get('mscore', 0.0):.2f}")
 
     # Journal
     print(f"  Journal ({len(result['journal'])} entries):")
@@ -609,8 +619,12 @@ def reclassify_incident(storage, incident_id, detection_cfg, audio_cfg,
         return None
 
     wav_path = inc.get("snippet_path")
-    if not wav_path or not os.path.exists(wav_path):
-        print(f"[reclassify] Incident {incident_id}: no snippet at {wav_path}")
+    # Resolve against the snippets dir beside the DB so a database copied from
+    # the Pi still works locally (./local_data/snippets/ vs /opt/.../snippets/).
+    snippets_dir = os.path.join(os.path.dirname(storage.db_path), "snippets")
+    wav_path = resolve_snippet_path(wav_path, snippets_dir)
+    if not wav_path:
+        print(f"[reclassify] Incident {incident_id}: no snippet at {inc.get('snippet_path')}")
         return None
 
     print(f"=== Incident {incident_id} ===")
@@ -627,14 +641,12 @@ def reclassify_incident(storage, incident_id, detection_cfg, audio_cfg,
 
     if update:
         journal_json = json.dumps(result["journal"])
-        last_block = result["blocks"][-1] if result["blocks"] else {}
         with storage.conn() as c:
             c.execute(
                 "UPDATE incidents SET classification=?, class_journal=?, "
-                "beat_confidence=?, music_like_score=? WHERE id=?",
+                "music_like_score=? WHERE id=?",
                 (result["dominant"], journal_json,
-                 last_block.get("bconf", 0.0),
-                 last_block.get("mscore", 0.0),
+                 result["music_like_median"],
                  incident_id)
             )
         print(f"  ★ DB updated: classification={result['dominant']}")
@@ -705,13 +717,17 @@ def reclassify_all(storage, detection_cfg, audio_cfg, verbose=False, update=Fals
     print(f"[reclassify] Batch processing {total} incidents with snippets...")
     print()
 
+    # Resolve snippet paths against the snippets dir beside the DB, so a database
+    # copied from the Pi still works locally (basename is the stable identity).
+    snippets_dir = os.path.join(os.path.dirname(storage.db_path), "snippets")
+
     for row in rows:
         iid = row["id"]
         old_class = row["classification"]
         old_journal_raw = row["class_journal"]
-        wav_path = row["snippet_path"]
+        wav_path = resolve_snippet_path(row["snippet_path"], snippets_dir)
 
-        if not wav_path or not os.path.exists(wav_path):
+        if not wav_path:
             skipped += 1
             continue
 
@@ -750,14 +766,12 @@ def reclassify_all(storage, detection_cfg, audio_cfg, verbose=False, update=Fals
 
         if update and change_type:
             journal_json = json.dumps(new_journal)
-            last_block = result["blocks"][-1] if result["blocks"] else {}
             with storage.conn() as c:
                 c.execute(
                     "UPDATE incidents SET classification=?, class_journal=?, "
-                    "beat_confidence=?, music_like_score=? WHERE id=?",
+                    "music_like_score=? WHERE id=?",
                     (result["dominant"], journal_json,
-                     last_block.get("bconf", 0.0),
-                     last_block.get("mscore", 0.0),
+                     result["music_like_median"],
                      iid)
                 )
 
@@ -888,6 +902,12 @@ def main():
              "on disk. Run this after manually deleting snippet files to clean up "
              "stale references. Can be combined with --all.",
     )
+    parser.add_argument(
+        "--repair-snippet-paths", action="store_true", dest="repair_snippet_paths",
+        help="Restore snippet_path for rows where it is NULL but a matching WAV "
+             "(incident_{id}_*.wav) exists in the snippets directory. Use after "
+             "copying a database to a new machine if snippet references were lost.",
+    )
     args = parser.parse_args()
 
     # Resolve config path
@@ -942,6 +962,10 @@ def main():
     storage = Storage(db_path)
     print(f"[reclassify] Database: {db_path}")
 
+    if args.repair_snippet_paths:
+        count = storage.repair_snippet_paths()
+        print(f"[reclassify] Repaired {count} snippet reference(s) from disk")
+
     if args.purge_orphans:
         count = storage.purge_orphaned_incidents()
         print(f"[reclassify] Purged {count} orphaned snippet reference(s)")
@@ -964,7 +988,9 @@ def main():
                             denoise_alpha=denoise_alpha,
                             denoise_beta=denoise_beta)
     else:
-        if not args.purge_orphans:
+        # Maintenance-only operations (--purge-orphans, --repair-snippet-paths)
+        # are valid on their own; only error when no actionable target was given.
+        if not (args.purge_orphans or args.repair_snippet_paths):
             print("[reclassify] ERROR: Specify an incident ID, a WAV file path, or --all.")
             parser.print_help()
             sys.exit(1)
