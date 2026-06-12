@@ -7,26 +7,18 @@
 > story — see [DECISIONS.md](DECISIONS.md). Remaining work is in
 > [../NEXT.md](../NEXT.md).
 
-## TESTING RESOURCES:
+## v18 - 2026-06-12 — "Night Watch Edition"
 
-To help ensure that we don't corrupt our analysis engine, these are the source sound recordings used for initial calibration (NOTE: quality microphone and FLAC recordings give us the truest data to analyze, which are not available via YouTube compressed uploads):
+Stabilization release driven by a 5-hour total detection blackout on the first v17 deploy. The ALSA audio device rejected the configured 22050 Hz sample rate during a service restart (device still held by the previous process), silently fell back to 48000 Hz, and every spectral threshold became miscalibrated — zero incidents were created during an entire evening of confirmed loud music. This release adds retry-with-backoff to sample rate negotiation, fixes the `_compute_dominant` lead-in classification leak, and corrects the systemd service file for older systemd versions.
 
-- lawn mower:
-  - gas: https://creazilla.com/media/audio/15433161/domestic-machines-lawn-mower-fuel
-  - electric: https://creazilla.com/media/audio/15475724/electric-lawn-mower
-- birdsong (robin): https://www.youtube.com/watch?v=CCh-Ga7bu6M
-- rolling thunder (light rain): https://freesound.org/people/tim.kahn/sounds/536171/
-- cracking thunder: https://freesound.org/people/Erdie/sounds/23221/
+<details>
 
-> [!WARNING]
-> WARNING: DO NOT USE YOUTUBE RECORDINGS--THEY TEND TO EXHIBIT THE EXACT _OPPOSITE_ OF REAL-LIFE FULL-SPECTRUM RECORDINGS.
+- **Sample rate negotiation retry loop** — `_negotiate_sample_rate()` now retries the configured rate up to 5 times with 3-second delays before falling back to the device default. After a systemd restart, ALSA needs several seconds to fully release the audio device from the previous process; the old code tested once, failed, and silently fell back to 48000 Hz for the life of the process. At 48000 Hz the highband captures 1200–24000 Hz instead of 1200–11025 Hz, diluting `lowband_ratio` enough to drop `music_like_score` below the 0.62 threshold — in music_focus mode, that means zero incidents are created. The fallback warning now explicitly states that detection thresholds will be wrong. 4 new tests covering first-attempt success, mid-retry success, exhausted-retry fallback, and total-failure preservation. Root cause of the June 11 five-hour detection blackout.
+- **Fix `_compute_dominant` returning "lead-in" as a dominant classification** — the single-source fallback path in `_compute_dominant()` returned `journal[0][1]` when all non-bookend classes were ignorable. For short incidents with 2 lead-in blocks + 1 unknown body block + 3 lead-out blocks, this returned "lead-in" — a structural bookend label that should never be a dominant classification. The multi-source path already filtered bookends via `{k: v for k, v in durations.items() if k not in _BOOKENDS}`, but the single-source path lacked the same protection. Fixed to iterate journal entries and return the first non-bookend class, falling back to "unknown". Eliminates 233 spurious "lead-in" reclassifications out of the previous 702 total changes on the production database. 1 new regression test (incident 1287 reproduction).
+- Bug in the Desktop installer: it tries to chown to noisewarden before creating that user, and several /opt writes are not run with sudo. Now install and deploy do privileged writes safely and leave group-writable permissions for future manual file management.
+- **Systemd service file `+UMask` syntax** — the deployed copy on the Pi used `+UMask=0022` which requires systemd 252+; the Pi's older version ignored it with a warning. The repo file already uses the correct `UMask=0022` syntax; redeploying overwrites the old version.
 
-Past Bad Ideas:
-
-- (TERRIBLE IDEA--basically the inverse of real-life): https://www.youtube.com/watch?v=jzwom7I02ks
-- diesel truck (TERRIBLE IDEA--inverse of real-life): https://www.youtube.com/watch?v=3B_2mc2l10s&t=228
-
-Additionally, real-world recordings are saved in `tests/classification_data/` as version-controlled WAV files — empirical sources of truth decoupled from the incident database. These are replayed through the DSP pipeline during regression tests to prevent threshold changes from silently breaking known-good calibrations, and can seed a clean database for full reclassification after engine or filter changes without needing to manually re-record each sound type.
+</details>
 
 ## v17 - 2026-06-10 — "Management Edition"
 

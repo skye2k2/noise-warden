@@ -247,6 +247,13 @@ If the directory permissions are still too restrictive (owner-only), update them
 sudo chmod -R g+w /opt/noise-warden/shared/snippets/
 ```
 
+If you have an older install where the version directories were created `755`, normalize the whole tree once so group members can manage files without `sudo`:
+
+```bash
+sudo chmod -R g+rwX /opt/noise-warden
+sudo find /opt/noise-warden -type d -exec chmod g+s {} +
+```
+
 Alternatively, use the web UI to delete incidents — it runs as the `noisewarden` user and has full access. To clean up stale database references after manually deleting snippet files, run `python -m noise_warden.reclassify --purge-orphans`.
 
 </details>
@@ -835,9 +842,7 @@ Add to crontab (`crontab -e`):
 
 ## TODOs & Issues
 
-> **Where things live now:** Remaining engineering work is tracked in [NEXT.md](NEXT.md).
+> Remaining engineering work is tracked in [NEXT.md](NEXT.md).
 > The reasoning behind significant/rejected design choices (why beat detection was
 > removed, infraction-first, the in-house-mic vs. studio-recording problem, the
 > single-process architecture, etc.) is in [docs/DECISIONS.md](docs/DECISIONS.md).
-> This section keeps only physical-deployment notes and a few open issues not yet
-> promoted into NEXT.md.

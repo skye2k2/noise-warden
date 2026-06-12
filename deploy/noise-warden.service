@@ -12,7 +12,7 @@ Type=simple
 User=noisewarden
 Group=noisewarden
 # Without this, the noisewarden system user inherits systemd's default umask, and soundfile.write() creates WAVs as 600 (owner-only). With UMask=0022, files created will be 644 — readable by any user on the Pi.
-+UMask=0022
+UMask=0022
 WorkingDirectory=/opt/noise-warden/current
 Environment=NOISE_WARDEN_CONFIG=/opt/noise-warden/current/config/noise_warden.yaml
 ExecStartPre=/bin/sh -c 'test -d /opt/noise-warden/current/noise_warden || (echo "ERROR: /opt/noise-warden/current does not resolve to a valid project directory. Re-run install_pi.sh." && exit 1)'

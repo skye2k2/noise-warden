@@ -529,7 +529,11 @@ def _compute_dominant(journal, duration):
     meaningful_classes = unique_classes - _IGNORABLE_CLASSES
     if meaningful_classes:
         return next(iter(meaningful_classes))
-    return journal[0][1]
+    # All classes are ignorable — return the first non-bookend one so that
+    # structural labels ("lead-in", "lead-out") never become the dominant
+    # classification. Consistent with the multi-source fallback above.
+    non_bookend = [entry[1] for entry in journal if entry[1] not in _BOOKENDS]
+    return non_bookend[0] if non_bookend else "unknown"
 
 
 # ---------------------------------------------------------------------------

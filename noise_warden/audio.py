@@ -1,5 +1,7 @@
 from __future__ import annotations
+import logging
 import queue
+import time
 import sounddevice as sd
 import numpy as np
 from collections import deque
@@ -52,27 +54,58 @@ class AudioCapture:
         self._queue = queue.Queue(maxsize=128)
 
     def _negotiate_sample_rate(self):
-        """Verify the device supports the requested sample rate; fall back if not.
+        """Verify the device supports the requested sample rate; retry then fall back.
 
         Many cheap USB audio interfaces (common on Pi setups) only support
         44100 or 48000 Hz. PortAudio raises paInvalidSampleRate deep inside
-        ALSA with no helpful message. This method tests the configured rate
-        and, if it fails, tries the device's default rate instead. The engine
-        doesn't care about the exact rate — DSP functions accept sr as a
-        parameter, and WAV headers record whatever rate was actually used.
-        """
-        try:
-            sd.check_input_settings(
-                device=self.device,
-                samplerate=self.sr,
-                channels=self.channels,
-                dtype="float32",
-            )
-            return  # Configured rate works
-        except (sd.PortAudioError, ValueError):
-            pass
+        ALSA with no helpful message.
 
-        # Configured rate not supported — try the device's default
+        After a systemd service restart, ALSA may need several seconds to
+        fully release the audio device from the previous process. During that
+        window the device can reject the configured sample rate (e.g. 22050 Hz)
+        and only offer its default (e.g. 48000 Hz). A silent fallback here
+        causes catastrophic detection failure: all spectral thresholds are
+        calibrated for the configured rate, and a 2x sample-rate shift
+        dilutes band ratios enough to suppress every detection for hours.
+
+        This method retries the configured rate up to MAX_RETRIES times with
+        a RETRY_DELAY_SEC pause between attempts before falling back to the
+        device's default rate.
+        """
+        MAX_RETRIES = 5
+        RETRY_DELAY_SEC = 3.0
+        logger = logging.getLogger("noise_warden.audio")
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                sd.check_input_settings(
+                    device=self.device,
+                    samplerate=self.sr,
+                    channels=self.channels,
+                    dtype="float32",
+                )
+                if attempt > 1:
+                    logger.info(
+                        "Audio device accepted %d Hz on attempt %d/%d",
+                        self.sr, attempt, MAX_RETRIES,
+                    )
+                return  # Configured rate works
+            except (sd.PortAudioError, ValueError):
+                if attempt < MAX_RETRIES:
+                    logger.info(
+                        "Audio device rejected %d Hz (attempt %d/%d) — "
+                        "retrying in %.0fs (ALSA may still be releasing "
+                        "the device from the previous process)",
+                        self.sr, attempt, MAX_RETRIES, RETRY_DELAY_SEC,
+                    )
+                    time.sleep(RETRY_DELAY_SEC)
+
+        # All retries exhausted — try the device's default rate as a last resort
+        logger.warning(
+            "Audio device rejected %d Hz after %d attempts (%.0fs total wait)",
+            self.sr, MAX_RETRIES, MAX_RETRIES * RETRY_DELAY_SEC,
+        )
+
         try:
             info = sd.query_devices(self.device, kind="input")
             default_sr = int(info["default_samplerate"])
@@ -94,13 +127,13 @@ class AudioCapture:
             # Default rate also fails — nothing we can do here
             return
 
-        import logging
-        logger = logging.getLogger("noise_warden.audio")
         logger.warning(
-            "Audio device does not support %d Hz — falling back to %d Hz "
-            "(device default). To avoid this warning, set sample_rate: %d "
-            "in your config.",
-            self.sr, default_sr, default_sr,
+            "FALLING BACK to %d Hz (device default). Detection thresholds "
+            "are calibrated for %d Hz — spectral band ratios WILL be wrong "
+            "and classifications unreliable until the service is restarted "
+            "at the correct rate. To avoid this, set sample_rate: %d in "
+            "your config, or restart the service after a few seconds.",
+            default_sr, self.sr, default_sr,
         )
         self.sr = default_sr
         self.frames = int(default_sr * self.block_seconds)

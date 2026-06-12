@@ -687,6 +687,17 @@ class TestAnalyzeClipLeadInOut:
         # engine_noise holds 12s vs unknown's 1s — should win
         assert result == "engine_noise+"
 
+    def test_lead_in_single_source_fallback_never_returns_bookend(self):
+        """Single-source path: when a short clip has only lead-in + unknown +
+        lead-out (1 non-bookend class), the single-source fallback should
+        return 'unknown', not 'lead-in'. Regression from incident 1287: a
+        6-block recording with 2 lead-in, 1 unknown, 3 lead-out returned
+        'lead-in' because journal[0][1] was the raw fallback."""
+        journal = [(-2, "lead-in"), (0, "unknown"), (1, "lead-out")]
+        result = _compute_dominant(journal, 6)
+        assert result == "unknown"
+        assert "lead-in" not in result
+
     def test_lead_in_lead_out_clamped_when_too_large(self, tmp_path):
         """If pre+post >= clip length, both revert to 0 (full DSP analysis)."""
         wav_path = str(tmp_path / "test.wav")

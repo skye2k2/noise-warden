@@ -29,6 +29,11 @@ CURRENT="$BASE/current"
 VENV="$BASE/venv"
 SHARED="$BASE/shared"
 
+normalize_permissions() {
+    sudo chmod -R g+rwX "$BASE"
+    sudo find "$BASE" -type d -exec chmod g+s {} +
+}
+
 echo ""
 echo "=== noise-warden install ==="
 echo "  Source:      $SOURCE_DIR"
@@ -40,6 +45,7 @@ echo ""
 sudo mkdir -p "$BASE" "$SHARED" "$SHARED/snippets" "$SHARED/playlist" "$SHARED/build"
 # --- Set ownership for the service user ---
 sudo chown -R noisewarden:noisewarden "$BASE"
+normalize_permissions
 
 # --- Add the installing user to the noisewarden group ---
 # Allows SSH/VS Code file browsing without sudo. Only needed on the Pi —
@@ -56,10 +62,10 @@ if [ "$SOURCE_DIR" != "$DEST_DIR" ]; then
     # Remove stale version dir if it exists (clean re-install)
     if [ -d "$DEST_DIR" ]; then
         echo "  (removing existing $DEST_DIR)"
-        rm -rf "$DEST_DIR"
+        sudo rm -rf "$DEST_DIR"
     fi
-    mkdir -p "$DEST_DIR"
-    rsync -a \
+    sudo mkdir -p "$DEST_DIR"
+    sudo rsync -a \
         --exclude '.venv' \
         --exclude '.git' \
         --exclude '__pycache__' \
@@ -73,20 +79,17 @@ else
 fi
 
 # --- Copy deploy script to base (outside any version) ---
-if [ ! -f "$BASE/deploy_noise_warden.sh" ]; then
-    cp "$DEST_DIR/scripts/deploy_noise_warden.sh" "$BASE/deploy_noise_warden.sh"
-    chmod +x "$BASE/deploy_noise_warden.sh"
-fi
+sudo cp "$DEST_DIR/scripts/deploy_noise_warden.sh" "$BASE/deploy_noise_warden.sh"
+sudo chmod +x "$BASE/deploy_noise_warden.sh"
 
 # --- Point "current" symlink at the copied version ---
-ln -sfn "$DEST_DIR" "$CURRENT"
+sudo ln -sfn "$DEST_DIR" "$CURRENT"
 
 # --- Create venv and install dependencies ---
 echo "Setting up Python venv at $VENV ..."
-python3 -m venv "$VENV"
-source "$VENV/bin/activate"
-pip install --upgrade pip
-pip install -r "$CURRENT/requirements.txt"
+sudo python3 -m venv "$VENV"
+sudo "$VENV/bin/pip" install --upgrade pip
+sudo "$VENV/bin/pip" install -r "$CURRENT/requirements.txt"
 echo "  Dependencies installed."
 
 # --- Ensure adequate swap space ---
@@ -129,6 +132,7 @@ fi
 
 # --- Set ownership for the service user ---
 sudo chown -R noisewarden:noisewarden "$BASE"
+normalize_permissions
 
 # --- Generate self-signed TLS certificate (required for Service Worker) ---
 # Service Workers only register on secure contexts (HTTPS or localhost).

@@ -16,6 +16,11 @@ set -euo pipefail
 BASE=/opt/noise-warden
 TARGET="${1:-}"
 
+normalize_permissions() {
+    sudo chmod -R g+rwX "$BASE"
+    sudo find "$BASE" -type d -exec chmod g+s {} +
+}
+
 if [ -z "$TARGET" ]; then
     echo "Usage: $0 <version-dir-name>"
     echo ""
@@ -52,13 +57,15 @@ fi
 echo "=== Deploying $TARGET ==="
 
 sudo systemctl stop noise-warden || true
-ln -sfn "$BASE/$TARGET" "$BASE/current"
+sudo ln -sfn "$BASE/$TARGET" "$BASE/current"
 
 echo "Updating Python venv ..."
-python3 -m venv "$BASE/venv"
-source "$BASE/venv/bin/activate"
-pip install --upgrade pip
-pip install -r "$BASE/current/requirements.txt"
+if [ -d "$BASE/venv" ]; then
+    sudo rm -rf "$BASE/venv"
+fi
+sudo python3 -m venv "$BASE/venv"
+sudo "$BASE/venv/bin/pip" install --upgrade pip
+sudo "$BASE/venv/bin/pip" install -r "$BASE/current/requirements.txt"
 
 # Update service file in case it changed
 sudo cp "$BASE/current/deploy/noise-warden.service" /etc/systemd/system/noise-warden.service
@@ -66,6 +73,7 @@ sudo systemctl daemon-reload
 
 # Ensure ownership is correct after any file changes
 sudo chown -R noisewarden:noisewarden "$BASE"
+normalize_permissions
 
 echo "Starting service ..."
 sudo systemctl start noise-warden

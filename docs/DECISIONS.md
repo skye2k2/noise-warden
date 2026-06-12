@@ -4,6 +4,34 @@ This file records the **why** behind noise-warden's significant and counter-intu
 
 The [CHANGELOG](CHANGELOG.md) records *what* changed and *when*. This file records *why*, especially for things that were **tried and rejected**. If you are about to add beat detection back, or wonder why classification is hidden by default, read here first.
 
+## D0. Testing resources are curated from real-world and high-fidelity sources
+
+**Decision:** Calibration and regression inputs must come from either real-world captures from the deployed environment or high-fidelity source files (for example FLAC-quality assets). Convenience web audio, especially YouTube-compressed clips, is not an acceptable calibration source for engine thresholds or classification tuning.
+
+<details>
+
+**Why:** The current product direction de-emphasizes classification as a primary product signal, so the remaining classification and tuning paths must be grounded in trustworthy data, not brittle convenience samples. Real-world and high-fidelity sources preserve the spectral structure needed for reproducible DSP behavior; lossy web transcodes often destroy or invert those signatures.
+
+**Current reference sources used during early calibration:**
+
+- lawn mower (gas): https://creazilla.com/media/audio/15433161/domestic-machines-lawn-mower-fuel
+- lawn mower (electric): https://creazilla.com/media/audio/15475724/electric-lawn-mower
+- birdsong (robin): https://www.youtube.com/watch?v=CCh-Ga7bu6M
+- rolling thunder (light rain): https://freesound.org/people/tim.kahn/sounds/536171/
+- cracking thunder: https://freesound.org/people/Erdie/sounds/23221/
+
+> [!WARNING]
+> DO NOT USE YOUTUBE RECORDINGS AS PRIMARY CALIBRATION INPUTS. They frequently exhibit the opposite spectral behavior from local full-spectrum captures and can mislead threshold tuning.
+
+**Known bad examples (kept as anti-pattern references):**
+
+- broad environmental sample (terrible fit; inverse of real-life behavior): https://www.youtube.com/watch?v=jzwom7I02ks
+- diesel truck sample (terrible fit; inverse of real-life behavior): https://www.youtube.com/watch?v=3B_2mc2l10s&t=228
+
+**Operationalization:** The canonical regression assets live in `tests/classification_data/` as version-controlled WAV files. They are replayed through the DSP pipeline during tests so threshold changes that break known-good behavior fail loudly. The same assets can bootstrap a clean database for full reclassification after DSP/filter changes without re-recording the full source set.
+
+</details>
+
 ---
 
 ## D1. Beat confidence was removed — rhythm does not separate music from engines

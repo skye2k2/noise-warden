@@ -96,7 +96,6 @@ These are lower-value polish items noted across prior analysis and the README TO
 - **Backup guidance is DB-only.** The recommended cron backup grabs only `noise_warden.db`; the snippets directory (the actual evidence) is not included. Document that a full backup needs both, and surface a "download all" affordance in the UI rather than right-click-save per incident.
 - **Add a "Save Audio as…" export hint** — document that right-clicking the player exports the snippet; ideally pair with the "download all" affordance.
 - **Speculative use cases** (not committed): per-dog-bark spectral identification/tagging (`dog1`, `dog2`); positive bird-species identification/exclusion; a nighttime-only snoring monitor variant.
-- TODO: On June 10th, IDIOT ran music from ~7pm to 11:15pm and not a single incident was reported — but the Pi was on an old release. The audio may be recoverable from the `autodismissed/` quarantine. (Going forward, the v17 mode-aware auto-dismiss + longer music-focus gap merge should prevent this class of miss; see DECISIONS D5. Recovering the June 10th data specifically is a one-time manual review.)
 
 </details>
 

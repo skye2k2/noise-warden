@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+import sounddevice as sd
 
 # Patch sounddevice before importing AudioCapture so it doesn't try to init PortAudio
 with patch("sounddevice.query_devices", return_value={"name": "FakeMic", "max_input_channels": 1, "default_samplerate": 22050}):
@@ -148,3 +149,91 @@ class TestAudioCapture:
         mock_stream.stop.assert_called_once()
         mock_stream.close.assert_called_once()
         assert cap._stream is None
+
+
+class TestSampleRateNegotiation:
+    """Tests for _negotiate_sample_rate retry logic.
+
+    After a systemd restart, ALSA may need seconds to release the audio
+    device from the previous process. The retry loop gives it time before
+    falling back to a potentially wrong default rate."""
+
+    def _configure_mock_sd(self, mock_sd):
+        """Wire the real PortAudioError into the mock so except clauses work.
+        Without this, `except (sd.PortAudioError, ValueError)` in the
+        production code fails because mock_sd.PortAudioError is a MagicMock,
+        not a BaseException subclass."""
+        mock_sd.PortAudioError = sd.PortAudioError
+
+    @patch("noise_warden.audio.time.sleep")
+    @patch("noise_warden.audio.sd")
+    def test_succeeds_on_first_attempt(self, mock_sd, mock_sleep):
+        """No retries or fallback when the configured rate works immediately."""
+        self._configure_mock_sd(mock_sd)
+        mock_sd.query_devices.return_value = {
+            "name": "FakeMic", "max_input_channels": 1, "default_samplerate": 48000,
+        }
+        mock_sd.check_input_settings.return_value = None
+
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
+
+        assert cap.sr == 22050
+        mock_sleep.assert_not_called()
+
+    @patch("noise_warden.audio.time.sleep")
+    @patch("noise_warden.audio.sd")
+    def test_succeeds_after_retry(self, mock_sd, mock_sleep):
+        """Retry succeeds on the 3rd attempt — should use configured rate."""
+        self._configure_mock_sd(mock_sd)
+        mock_sd.query_devices.return_value = {
+            "name": "FakeMic", "max_input_channels": 1, "default_samplerate": 48000,
+        }
+        mock_sd.check_input_settings.side_effect = [
+            sd.PortAudioError("rejected"),
+            sd.PortAudioError("rejected"),
+            None,  # success on attempt 3
+        ]
+
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
+
+        assert cap.sr == 22050
+        assert mock_sleep.call_count == 2
+
+    @patch("noise_warden.audio.time.sleep")
+    @patch("noise_warden.audio.sd")
+    def test_falls_back_after_all_retries_exhausted(self, mock_sd, mock_sleep):
+        """After 5 failed attempts, falls back to the device default rate."""
+        self._configure_mock_sd(mock_sd)
+        mock_sd.query_devices.return_value = {
+            "name": "FakeMic", "max_input_channels": 1, "default_samplerate": 48000,
+        }
+        mock_sd.check_input_settings.side_effect = [
+            sd.PortAudioError("rejected"),
+            sd.PortAudioError("rejected"),
+            sd.PortAudioError("rejected"),
+            sd.PortAudioError("rejected"),
+            sd.PortAudioError("rejected"),
+            None,  # fallback check_input_settings with 48000 succeeds
+        ]
+
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
+
+        assert cap.sr == 48000
+        assert cap.frames == 48000
+        # 4 sleeps between attempts 1-2, 2-3, 3-4, 4-5 (no sleep after last failure)
+        assert mock_sleep.call_count == 4
+
+    @patch("noise_warden.audio.time.sleep")
+    @patch("noise_warden.audio.sd")
+    def test_keeps_configured_rate_when_fallback_also_fails(self, mock_sd, mock_sleep):
+        """If both configured and default rates fail, keep the configured rate
+        and let the error surface later when the stream is opened."""
+        self._configure_mock_sd(mock_sd)
+        mock_sd.query_devices.return_value = {
+            "name": "FakeMic", "max_input_channels": 1, "default_samplerate": 48000,
+        }
+        mock_sd.check_input_settings.side_effect = sd.PortAudioError("rejected")
+
+        cap = AudioCapture(sample_rate=22050, block_seconds=1.0)
+
+        assert cap.sr == 22050
