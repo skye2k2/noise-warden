@@ -507,19 +507,61 @@ class Engine:
         During the song_gap_merge_sec window, sub-threshold audio accumulates
         at the end of every recording.  This dead air inflates file size and
         carries no evidentiary value.  Trimming it keeps snippets concise.
-        NOTE: could be made more precise by trimming to the last
-        positively-classified block instead of last above-threshold block.
+
+        Uses streaming I/O (never loads entire file into memory) and applies a
+        50 ms cosine fade-out to the final samples to prevent DC-offset pops.
         """
         try:
-            data, sr = sf.read(wav_path, dtype="float32")
+            with sf.SoundFile(wav_path, mode="r") as infile:
+                sr = infile.samplerate
+                total_frames = infile.frames
+                channels = infile.channels
+
             samples_per_block = int(sr * block_seconds)
             samples_to_trim = blocks_to_trim * samples_per_block
 
-            if samples_to_trim <= 0 or samples_to_trim >= len(data):
+            if samples_to_trim <= 0 or samples_to_trim >= total_frames:
                 return
 
-            trimmed = data[:len(data) - samples_to_trim]
-            sf.write(wav_path, trimmed, sr, subtype="PCM_16")
+            keep_frames = total_frames - samples_to_trim
+
+            # Streaming copy to a temp file, applying fade-out to the last chunk
+            FADE_SAMPLES = int(sr * 0.05)  # 50 ms cosine fade-out
+            CHUNK_SIZE = 65536
+
+            tmp = wav_path + ".tmp.wav"
+            try:
+                with sf.SoundFile(wav_path, mode="r") as infile:
+                    with sf.SoundFile(tmp, mode="w", samplerate=sr,
+                                      channels=channels, subtype="PCM_16") as outfile:
+                        frames_written = 0
+                        while frames_written < keep_frames:
+                            remaining = keep_frames - frames_written
+                            to_read = min(CHUNK_SIZE, remaining)
+                            chunk = infile.read(to_read, dtype="float32")
+                            if len(chunk) == 0:
+                                break
+
+                            # Apply fade-out if this chunk contains the final samples
+                            frames_written += len(chunk) if len(chunk.shape) == 1 else chunk.shape[0]
+                            if frames_written >= keep_frames:
+                                chunk_len = len(chunk) if len(chunk.shape) == 1 else chunk.shape[0]
+                                fade_len = min(FADE_SAMPLES, chunk_len)
+                                if fade_len > 0:
+                                    # Cosine curve from 1→0 over fade_len samples
+                                    fade = np.cos(np.linspace(0, np.pi / 2, fade_len)).astype(np.float32)
+                                    if len(chunk.shape) == 1:
+                                        chunk[-fade_len:] *= fade
+                                    else:
+                                        chunk[-fade_len:] *= fade[:, np.newaxis]
+
+                            outfile.write(chunk)
+
+                os.replace(tmp, wav_path)
+            except Exception:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
         except (OSError, RuntimeError) as exc:
             # Non-fatal — the un-trimmed snippet is still usable evidence.
             print(f"[engine] Snippet tail trim failed for {wav_path}: {exc}")
@@ -707,9 +749,20 @@ class Engine:
         decays (near-monotonically) as the vehicle passes.
 
         Returns True if: duration is under the configured max AND the tail portion
-        of dB readings shows at most 1 uptick (predominantly decreasing)."""
+        of dB readings shows at most 1 uptick (predominantly decreasing).
+
+        A "sticky threshold" prevents misclassifying a legitimate long incident as
+        a drive-by just because the sound faded out gradually (e.g., natural song
+        ending). If the incident has been active longer than driveby_sticky_threshold_sec
+        (default 30), it is by definition not a drive-by."""
         max_dur = float(self.cfg["detection"].get("driveby_max_duration_sec", 30))
         tail_frac = float(self.cfg["detection"].get("driveby_fade_tail_fraction", 0.5))
+        sticky_sec = float(self.cfg["detection"].get("driveby_sticky_threshold_sec", 30))
+
+        # Sticky threshold: if the incident has been going for this long, it's
+        # not a drive-by regardless of how the tail looks.
+        if duration_sec > sticky_sec:
+            return False
 
         if duration_sec > max_dur:
             return False
@@ -886,6 +939,39 @@ class Engine:
         music_focus = self.cfg["detection"]["mode"] == "continuous_music_focus"
         incident_id = self.active["id"]
         dismissed = False
+
+        # Music-focus refinement: in music_focus mode, we skip the general
+        # drive_by and too_short auto-dismiss checks (v17, DECISIONS D5).
+        # HOWEVER, comma, when analyze_clip reclassifies the stored WAV as
+        # non-music (flyover, impulse, engine_noise, etc.) AND the incident
+        # is short, there's no reason to keep it — the music_focus protection
+        # should only shield incidents that ARE music. Without this, single
+        # music_like blocks that trigger an incident but get reclassified as
+        # flyover slip through the safety net and clutter the log.
+        _MUSIC_CLASSES = {"amplified_bass", "music", "music_like"}
+        min_sec = int(self.cfg["audio"].get("min_incident_seconds", 20))
+        active_dur = max(1, round((self.active["last_above"] - self.active["start"]).total_seconds()))
+        if (not force and music_focus and updated_class
+                and not any(updated_class.startswith(mc) for mc in _MUSIC_CLASSES)
+                and active_dur < min_sec):
+            quarantine_path = None
+            if snippet_path and os.path.exists(snippet_path):
+                try:
+                    quarantine_dir = os.path.join(os.path.dirname(snippet_path), "autodismissed")
+                    os.makedirs(quarantine_dir, exist_ok=True)
+                    quarantine_path = os.path.join(quarantine_dir, os.path.basename(snippet_path))
+                    shutil.move(snippet_path, quarantine_path)
+                except OSError as exc:
+                    print(f"[engine] Failed to quarantine non-music snippet {snippet_path}: {exc}")
+            with self.storage.conn() as c:
+                c.execute(
+                    "UPDATE incidents SET classification=?, excluded=1, snippet_path=? WHERE id=?",
+                    (updated_class or "too_short", quarantine_path if snippet_path and quarantine_path and os.path.exists(quarantine_path) else None, incident_id),
+                )
+            print(f"[engine] Music-focus auto-dismissed incident {incident_id} as non-music "
+                  f"({updated_class}, {active_dur}s active < {min_sec}s minimum)")
+            dismissed = True
+
         if not force and not music_focus and self._looks_like_driveby(all_dbs, raw_dur):
             quarantine_path = None
             if snippet_path and os.path.exists(snippet_path):
@@ -913,10 +999,8 @@ class Engine:
         # Compare against active_dur (time above threshold), not dur — dur
         # includes snippet_post_seconds tail padding that inflates the stored
         # duration. The preroll lead-in is also excluded (it precedes start_ts).
-        # Skipped in music-focus mode (see drive-by note above) — a short music
-        # burst is a legitimate detection there, not a transient to discard.
-        min_sec = int(self.cfg["audio"].get("min_incident_seconds", 3))
-        active_dur = max(1, round((self.active["last_above"] - self.active["start"]).total_seconds()))
+        # Skipped in music-focus mode — handled separately above with the
+        # reclassified-as-non-music check which is more nuanced.
         if not force and not dismissed and not music_focus and active_dur < min_sec:
             quarantine_path = None
             if snippet_path and os.path.exists(snippet_path):
@@ -1150,10 +1234,21 @@ class Engine:
         last_cleanup = time.time()
         last_network_check = time.time()
         last_temp_check = time.time()
-        CLEANUP_INTERVAL = 86400   # Re-run disk/memory checks once per day
+        last_memory_check = time.time()
+        CLEANUP_INTERVAL = 86400   # Re-run disk checks once per day
+        MEMORY_CHECK_INTERVAL = 300  # Check RSS every 5 minutes (was daily — missed OOM spikes)
         NETWORK_CHECK_INTERVAL = 60  # Re-check network link every minute
         TEMP_CHECK_INTERVAL = 30     # Re-check CPU temperature every 30 seconds
         audio_fail_count = 0       # Consecutive audio I/O failures (for backoff)
+
+        # Preroll warmup: suppress incident creation until the preroll buffer
+        # has accumulated enough blocks for snippet_pre_seconds of lead-in.
+        # After a crash-restart the buffer is empty, so the first incident
+        # would have no audible lead-in.
+        pre_sec = float(self.cfg["audio"].get("snippet_pre_seconds", 2))
+        block_sec_cfg = float(self.cfg["audio"].get("block_seconds", 1.0))
+        warmup_blocks_needed = max(1, round(pre_sec / block_sec_cfg))
+        blocks_since_start = 0
 
         while self.running:
             try:
@@ -1170,6 +1265,10 @@ class Engine:
                     self._check_throttle()
                     last_temp_check = now
 
+                if now - last_memory_check >= MEMORY_CHECK_INTERVAL:
+                    self._check_memory_usage()
+                    last_memory_check = now
+
                 if not self.state.snapshot()["armed"]:
                     time.sleep(0.25)
                     continue
@@ -1177,6 +1276,7 @@ class Engine:
                 block = self.capture.read_block()
                 self.state.set(mic_ok=True)
                 audio_fail_count = 0  # Successful read — reset failure counter
+                blocks_since_start += 1
 
                 dbfs = rms_dbfs(block)
                 db_now = dba_estimate(dbfs, float(self.cfg["detection"]["calibration_offset_db"]))
@@ -1265,6 +1365,12 @@ class Engine:
                 if self._in_response_cooldown() and not self.active:
                     continue
 
+                # Preroll warmup: suppress new incident creation until the
+                # preroll buffer has enough blocks for snippet_pre_seconds.
+                # Still process existing active incidents normally — warmup
+                # only prevents starting NEW ones.
+                warmup_active = blocks_since_start < warmup_blocks_needed
+
                 if db_now >= threshold:
                     if filter_hit is None:
                         # Sound passed all filters — normal incident path.
@@ -1274,6 +1380,8 @@ class Engine:
 
                         if classify == "music_like" or self.cfg["detection"]["mode"] != "continuous_music_focus":
                             if not self.active:
+                                if warmup_active:
+                                    continue  # Preroll buffer not yet full — skip incident creation
                                 mode = "record_only" if is_night(datetime.now(), self.cfg["detection"]["night_start_hour"], self.cfg["detection"]["night_end_hour"]) else "respond"
                                 self._begin_incident(db_now, threshold, mscore, classify, mode)
 
@@ -1302,7 +1410,8 @@ class Engine:
                             # Don't log a separate excluded incident — would double-count.
                         else:
                             # No active incident — log as excluded if appropriate.
-                            if self._should_log_excluded():
+                            # Skip during preroll warmup (same reasoning as normal incidents).
+                            if self._should_log_excluded() and not warmup_active:
                                 if self._excluded_id and self._excluded_filter == filter_hit:
                                     self._extend_excluded_incident(db_now)
                                 else:
@@ -1338,7 +1447,6 @@ class Engine:
                         except Exception as e:
                             print(f"[engine] Periodic cleanup error: {e}")
                     self._check_disk_quota()
-                    self._check_memory_usage()
                     # Periodic device validation — catch slow drift or silent mic swap
                     ok, msg = self.capture.validate_device()
                     if not ok:

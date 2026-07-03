@@ -7,6 +7,24 @@
 > story — see [DECISIONS.md](DECISIONS.md). Remaining work is in
 > [../NEXT.md](../NEXT.md).
 
+## v19 - 2026-07-03 — "Memory-Safe Edition"
+
+Operational reliability release driven by a pattern of OOM crashes during incident finalization on the Pi. Root cause: `_finalize_incident` reads the entire WAV file into memory for tail trimming, denoising, normalization, and `analyze_clip`. A 2-hour incident at 22050 Hz produces a ~280 MB WAV that expands to ~606 MB in float32 — within striking distance of the Pi's 1024 MB `MemoryMax`. A 3-hour incident reliably OOM-kills the process, leaving a crash-repaired incident with `duration_sec=0.0` and a partial/orphaned WAV. 10 crash-repaired incidents in the current database, all during confirmed music sessions. This release also addresses short incident clutter, recording artifacts, and auto-dismissal gaps identified during a review of v18 production logs.
+
+<details>
+
+- **Streaming WAV finalization (OOM fix)** — `analyze_clip()` now reads blocks sequentially via `sf.SoundFile.read(block_size)` instead of loading the entire file with `sf.read()`. Peak memory drops from ~600 MB (for a 2-hour recording) to ~86 KB (one block). `_trim_snippet_tail()` streams to a temp file and atomically replaces the original. `normalize_snippet()` uses a two-pass streaming approach (pass 1: find peak, pass 2: apply gain in chunks). `denoise_snippet()` skips files larger than 100 MB (full-file STFT is architecturally incompatible with memory-constrained environments at that scale). The root cause of the crash-repair pattern: every `_finalize_incident` call and every `_check_duration_split` trigger tried to load the complete WAV into RAM, exceeding the 1024 MB systemd `MemoryMax` for incidents longer than ~80 minutes.
+- **Memory check frequency increased** — `_check_memory_usage()` now runs every 5 minutes (was once per day via `CLEANUP_INTERVAL`). The daily interval meant a memory spike during finalization was never caught before OOM — the check ran 23 hours too late. At 5-minute intervals the 700 MB self-termination threshold can trigger before systemd's hard kill.
+- **Reduced `max_incident_record_hours` default (6 → 2)** — Defense in depth alongside streaming finalization. A 2-hour WAV at 22050 Hz is ~280 MB on disk — well within safe streaming territory on a Pi. The timeline still shows consecutive blocks for the same noise event; splitting only affects per-file size. 6 hours produced 784 MB WAVs that caused OOM even with the old read-all approach.
+- **Raised `min_incident_seconds` default (3 → 20)** — The v18 production log contained dozens of 3–7 second incidents classified as impulse, wind, or flyover that added zero evidentiary value. 20 seconds excludes door slams, brief gusts, and single-pass aircraft while still capturing the start of any genuine music session. The previous default (3s) was calibrated for impulse detection which is explicitly out of scope for the current deployment.
+- **Music-focus auto-dismiss for reclassified-as-non-music short incidents** — In `continuous_music_focus` mode, v17 intentionally skipped drive-by and too-short auto-dismiss (DECISIONS D5). HOWEVER, comma, when `analyze_clip` reclassifies the stored WAV as non-music (flyover, impulse, engine_noise, etc.) AND the incident's active duration is below `min_incident_seconds`, there is no reason to keep it — the music_focus protection should only shield incidents that ARE music. Without this, single music_like blocks that trigger an incident but get reclassified as flyover slipped through the safety net. Music-classified incidents (music_like, amplified_bass, music) remain protected regardless of duration.
+- **Drive-by sticky threshold** — New `driveby_sticky_threshold_sec` config key (default 30). If an incident has been active longer than this duration, `_looks_like_driveby` returns False regardless of tail shape. Prevents legitimate long incidents (e.g., a song ending with a natural fade-out) from being misclassified as drive-bys. Previously, a 25-second music incident whose final seconds showed a monotonic dB decay could be auto-dismissed.
+- **Cosine fade-out on trimmed WAV endings (pop fix)** — `_trim_snippet_tail` now applies a 50 ms cosine fade-out to the final samples of the trimmed WAV. This smoothly ramps the amplitude to zero, eliminating the DC-offset pop/click heard at the end of some recordings. The pop was caused by the raw sample-boundary cut at the trim point.
+- **Preroll warmup guard** — After engine startup (including crash-restart), incident creation is suppressed until `snippet_pre_seconds / block_seconds` blocks have accumulated in the preroll buffer. This ensures the first incident after a restart has a proper lead-in recording instead of starting with above-threshold audio and no context. Default warmup: 2 blocks (2 seconds). The engine still processes audio during warmup (updating db_history, feature_history) — only incident creation is deferred.
+- **Fix SoundFile handle leak in streaming `analyze_clip`** — The streaming file handle was opened without exception safety. If any DSP function crashed during block processing, the handle was abandoned. Now wrapped in `try/finally` so the file descriptor is released even on exceptions.
+
+</details>
+
 ## v18 - 2026-06-12 — "Night Watch Edition"
 
 Stabilization release driven by a 5-hour total detection blackout on the first v17 deploy. The ALSA audio device rejected the configured 22050 Hz sample rate during a service restart (device still held by the previous process), silently fell back to 48000 Hz, and every spectral threshold became miscalibrated — zero incidents were created during an entire evening of confirmed loud music. This release adds retry-with-backoff to sample rate negotiation, fixes the `_compute_dominant` lead-in classification leak, and corrects the systemd service file for older systemd versions.
@@ -108,8 +126,6 @@ Post-mortem hardening from a 9-day OOM-kill outage (Apr 21–29), reclassify jou
 Two new exclusion filters (wind, flyover), engine-sound false positive fixes, and several quality-of-life improvements to incident recording and lifecycle management. 534 tests passing, 0 warnings.
 
 <details>
-
-<summary>Key details</summary>
 
 ### Wind exclusion filter (new)
 
@@ -225,8 +241,6 @@ First-time Raspberry Pi deployment revealed a cascade of real-world failure mode
 
 <details>
 
-<summary>Key details</summary>
-
 ### Copy-based installation (CHDIR fix)
 
 - **Problem** — `install_pi.sh` previously created a symlink from `/opt/noise-warden/<version>/` pointing to wherever the user extracted the archive (e.g., `~/Desktop/noise-warden-v12/`). The `noisewarden` system user couldn't traverse the source user's home directory, causing `status=200/CHDIR` on service start
@@ -275,8 +289,6 @@ First-time Raspberry Pi deployment revealed a cascade of real-world failure mode
 Enhancements to assist in the inevitable tweaking required to actually deploy this solution. Many configuration defaults tweaked after analyzing real-world input. Regression tests built up to continue to only get better without future silent breakages.
 
 <details>
-
-<summary>Key details</summary>
 
 ### Conversation filter tightening
 
@@ -459,8 +471,6 @@ Enhancements to assist in the inevitable tweaking required to actually deploy th
 
 <details>
 
-<summary>Key details</summary>
-
 ### Sound classification expansion (Tier 1)
 
 - **Ten-category classification** — replaced binary `music_like`/`other` with ten categories: `music`, `music_like`, `unknown`, `impulse`, `thunder`, `rain`, `mower`, `birdsong`, `drive_by`, `forced_test`. Filter-identified sounds are now labeled with their filter name instead of being silently discarded
@@ -589,8 +599,6 @@ Polish pass addressing observations from initial local testing. Dashboard declut
 
 <details>
 
-<summary>Key details</summary>
-
 ### Dashboard polish
 
 - **"Running" pill removed** — if you can see the dashboard, the app is running. The pill was always `True` and carried no useful information. The `running` key remains in `/api/state` for Home Assistant consumers
@@ -678,8 +686,6 @@ Polish pass addressing observations from initial local testing. Dashboard declut
 UI/UX overhaul for evidence clarity, cross-platform timezone handling, data rounding, borderline threshold filtering, and calibration wizard improvements. After finally seeing the code running, there were definite improvements to be made.
 
 <details>
-
-<summary>Key details</summary>
 
 ### Timestamp & data precision
 
@@ -803,8 +809,6 @@ Response system overhaul with real GPIO relay control, self-noise suppression (d
 
 <details>
 
-<summary>Key details</summary>
-
 ### Noise floor gate
 
 - **Configurable ambient noise floor** — new `detection.noise_floor_db` config key (default 50 dBA). Signals below this threshold skip the entire DSP pipeline (spectrum analysis, beat confidence, music classification, all exclusion filters). Reduces CPU load on the Pi and avoids processing blocks of data that could never approach an incident threshold. Set to 0 to disable. Configurable via calibration page UI or YAML; takes effect immediately (no restart needed)
@@ -843,8 +847,6 @@ Response system overhaul with real GPIO relay control, self-noise suppression (d
 Visual timeline redesign with offline-first architecture, plus a comprehensive deployment-hardening pass addressing silent failure modes, data integrity, and operational resilience. The primary use case is presenting cached noise incident data — including audio snippets — to authorities without network access, and having the system survive real-world Pi deployment conditions.
 
 <details>
-
-<summary>Key details</summary>
 
 ### Timeline
 
@@ -899,8 +901,6 @@ Security hardening, operational polish, and closing the loop on several long-sta
 
 <details>
 
-<summary>Key details</summary>
-
 ### Security
 
 - **Player command injection fixed** — `PlaylistPlayer.start()` uses `shlex.split()` instead of `.split()` for safe tokenization of `player_command`
@@ -943,8 +943,6 @@ Bug fix round addressing 9 issues identified during v4 code review. Removed dead
 
 <details>
 
-<summary>Key details</summary>
-
 ### Fixed
 
 - **Dead config keys removed** — `sustain_blocks_required`, `release_blocks_required`, and `driveby_max_duration_sec` (which was dead code at the time) stripped from config
@@ -970,8 +968,6 @@ Bug fix round addressing 9 issues identified during v4 code review. Removed dead
 Package renamed from `app` to `noise_warden`. Ordinance thresholds are now embedded and authoritative. Thread-safe state, config validation, MQTT Home Assistant integration, WAV chunk-to-disk recording (no unbounded RAM), `/api/health`, pause/resume controls, incident notes in UI, timeline date filtering, bearer token auth, dedicated `noisewarden` service user, and snippet retention cleanup.
 
 <details>
-
-<summary>Key details</summary>
 
 ### Architecture
 
@@ -1072,8 +1068,6 @@ Major architectural flattening, new DSP pipeline with music-likeness scoring and
 
 <details>
 
-<summary>Key details</summary>
-
 ### Architecture
 
 Flattened from nested packages to flat modules:
@@ -1164,8 +1158,6 @@ Semi-production-ready release with live audio capture, GPIO relay control, and 5
 
 <details>
 
-<summary>Key details</summary>
-
 ### Architecture
 
 Major restructure into proper Python packages:
@@ -1228,15 +1220,11 @@ Major restructure into proper Python packages:
 
 </details>
 
----
-
 ## v1 - 2026-04-02 — "Hardened Deployment Edition"
 
 Major architectural rewrite with multi-page web UI, WAV snippet capture, incident merging, and experimental noise rejection scaffolds. HOWEVER, comma, the core audio capture was regressed to stub/fake data, making this version non-functional for actual monitoring.
 
 <details>
-
-<summary>Key details</summary>
 
 ### Architecture
 
@@ -1314,15 +1302,11 @@ Flattened from v0's subpackage structure to a single `app/` directory with dedic
 
 </details>
 
----
-
 ## v0 - 2026-04-01 — "Ordinance-Aware Skeleton"
 
 Initial proof-of-concept with a fully-planned architecture and working basic pipeline: audio capture, A-weighted measurement, spectral classification, incident logging, GPIO relay + VLC playback, REST API, single-page web UI, and Home Assistant integration.
 
 <details>
-
-<summary>Key details</summary>
 
 ### Architecture
 

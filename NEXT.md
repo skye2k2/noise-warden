@@ -2,7 +2,7 @@
 
 Remaining work only. Completed items live in the [CHANGELOG](docs/CHANGELOG.md); the rationale behind rejected approaches lives in [docs/DECISIONS.md](docs/DECISIONS.md). This file was consolidated from the former `NEXT.md` (stability analysis, v15/16) and `NEXT_RELEASE.md` (v17 planning) once their completed and rejected items had been recorded elsewhere.
 
-**Status at consolidation (2026-06-11):** v17 is feature-complete (beat removal, finalize keystone + parity, body-windowed metrics, engine midband veto, infraction-first UI, mode-aware auto-dismiss, music-focus gap merge, portable snippet paths, version display). The items below are what still remains.
+**Status at consolidation (2026-06-11):** v17 is feature-complete (beat removal, finalize keystone + parity, body-windowed metrics, engine midband veto, infraction-first UI, mode-aware auto-dismiss, music-focus gap merge, portable snippet paths, version display). v18 stabilized sample-rate negotiation and the `_compute_dominant` lead-in leak. v19 eliminated the OOM crash pattern via streaming WAV finalization, raised `min_incident_seconds` to 20, reduced `max_incident_record_hours` to 2, added drive-by sticky threshold, cosine fade-out on trimmed endings, preroll warmup guard, and music-focus auto-dismiss refinement for reclassified-as-non-music short incidents. The items below are what still remains.
 
 ---
 
@@ -20,7 +20,7 @@ Remaining work only. Completed items live in the [CHANGELOG](docs/CHANGELOG.md);
 
 ## Priority 2 — Sample-rate normalization in `analyze_clip` (cross-device correctness)
 
-**The single most important correctness fix for reliable analysis.** All 15 regression WAVs in `tests/classification_data/` are 44100 Hz, but the Pi records at 22050 Hz. Spectral features (centroid, band ratios) change with sample rate, so thresholds tuned on the test clips do **not** precisely match live Pi behavior. The `analyze_clip` source still carries a `NOTE:` comment flagging this divergence.
+**The single most important correctness fix for reliable analysis.** All 15 regression WAVs in `tests/classification_data/` are 44100 Hz, but the Pi is set to record at 22050 Hz. Spectral features (centroid, band ratios) change with sample rate, so thresholds tuned on the test clips do **not** precisely match live Pi behavior. The `analyze_clip` source still carries a `NOTE:` comment flagging this divergence.
 
 <details>
 
@@ -101,7 +101,7 @@ These are lower-value polish items noted across prior analysis and the README TO
 
 ## Unprioritized/Unverified
 
-- **YAML grouping is a little arbitrary** — `audio` vs. `detection` placement is inconsistent; e.g. `noise_floor_db` and `calibration_offset_db` arguably belong under a renamed `recording` section. Cosmetic; defer until a config-schema pass.
+- **YAML grouping is a little arbitrary** — `audio` vs. `detection` placement is inconsistent; e.g. `noise_floor_db` and `calibration_offset_db` arguably belong under a renamed `recording` section. Additionally, `min_incident_seconds` and `max_incident_record_hours` live under `audio` even though they are behavioral/detection settings. Cosmetic; defer until a config-schema pass.
 - **Dual-mic plugins not wired into engine** — `ReferenceSubtractor` (NLMS) and `DualMicDifferential` (spectral subtraction) are implemented in `plugins.py` with documented algorithms but not yet called from the engine loop. Requires a second `AudioCapture` instance for the reference device.
 - **Install script enforces `/opt/noise-warden/` but the YAML hardcodes paths** — both `install_pi.sh` and `noise_warden.yaml` assume `/opt/noise-warden/` paths. The `NOISE_WARDEN_CONFIG` env var and the snippet-path resolver (DECISIONS D6) cover the common cases, but `shared_dir`/`base_dir` inside the YAML are still literal. Changing one without the other can break silently.
 - **`/api/state` and `/api/health` have no auth** — these endpoints bypass `must_auth()`. Low-risk read-only data on LAN, but noted for awareness. (Auth token itself is now encrypted in transit over the self-signed TLS cert.)
@@ -128,6 +128,6 @@ Recorded in full in [docs/DECISIONS.md](docs/DECISIONS.md). Summary so they are 
 - **Multiple uvicorn workers** — architecturally impossible while the engine is an in-process daemon thread owning the audio device + DB (DECISIONS D8).
 - **`deque` for `db_history`/`feature_history`** — DSP slices these; converting at each call site costs more than the current re-slice. Allocation volume is within GC's comfort zone.
 - **Persistent SQLite connection** — real but unprofitable refactor; WAL mode already handles the concurrent reader/writer pattern. Revisit only if profiling shows connection churn is a bottleneck.
-- **Streaming/batching `reclassify_all`** — it is an operator-initiated CLI tool, not a background process; memory is freed on return and the `MemoryMax` guard is a safety net.
+- **Full-file STFT denoising for large WAVs** — streaming STFT denoising is architecturally complex and the benefit is marginal (normalization handles audibility). v19 skips files >100 MB; incidents are now capped at 2 hours (~280 MB) so this limit is rarely hit.
 
 </details>

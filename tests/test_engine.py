@@ -558,6 +558,7 @@ class TestTailTrim:
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
         base_cfg["audio"]["recording_enabled"] = False
         base_cfg["detection"]["driveby_max_duration_sec"] = 0
+        base_cfg["audio"]["min_incident_seconds"] = 1  # Focus on tail trim, not auto-dismiss
 
         # 10 active blocks at 70 dB, then 12 silent blocks at 40 dB (the tail)
         active_dbs = [70.0] * 10

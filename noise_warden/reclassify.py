@@ -77,6 +77,20 @@ def denoise_snippet(wav_path, percentile=10, alpha=1.0, beta=0.02,
         dict with keys {action, noise_floor_db, snr_improvement_db}
         or None if the file was skipped (too short or I/O error).
     """
+    # Large-file guard: full-file STFT denoising is architecturally
+    # incompatible with memory-constrained environments when the file
+    # exceeds ~100 MB on disk (~200 MB in float32). Skip denoising and
+    # let the normalization pass handle audibility instead.
+    MAX_DENOISE_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+    try:
+        file_size = os.path.getsize(wav_path)
+    except OSError:
+        file_size = 0
+    if file_size > MAX_DENOISE_FILE_SIZE:
+        print(f"[reclassify] Skipping denoising for {os.path.basename(wav_path)} "
+              f"({file_size / (1024 * 1024):.0f} MB > {MAX_DENOISE_FILE_SIZE // (1024 * 1024)} MB limit)")
+        return {"action": "skipped_large_file", "file_size_mb": round(file_size / (1024 * 1024), 1)}
+
     try:
         data, sr = sf.read(wav_path, dtype="float32")
 
@@ -190,11 +204,23 @@ def normalize_snippet(wav_path, target_peak_dbfs=-6.0):
         or None if the file was skipped (already loud enough or silent).
     """
     try:
-        data, sr = sf.read(wav_path, dtype="float32")
-        peak = float(np.max(np.abs(data)))
+        # Streaming two-pass normalization: first pass finds peak amplitude,
+        # second pass applies gain. Never loads the entire file into memory.
+        STREAM_CHUNK = 65536
+
+        # Pass 1: find peak amplitude by streaming
+        peak = 0.0
+        with sf.SoundFile(wav_path, mode="r") as infile:
+            sr = infile.samplerate
+            while True:
+                chunk = infile.read(STREAM_CHUNK, dtype="float32")
+                if len(chunk) == 0:
+                    break
+                chunk_peak = float(np.max(np.abs(chunk)))
+                if chunk_peak > peak:
+                    peak = chunk_peak
 
         if peak < 1e-10:
-            # Essentially silent — skip to avoid extreme amplification
             return None
 
         current_peak_dbfs = 20.0 * np.log10(peak)
@@ -206,13 +232,28 @@ def normalize_snippet(wav_path, target_peak_dbfs=-6.0):
             return None
 
         gain_linear = 10.0 ** (gain_db / 20.0)
-        normalized = data * gain_linear
 
-        # Clamp to [-1, 1] as a safety net (shouldn't be needed since
-        # we target below 0 dBFS, but protects against edge cases)
-        normalized = np.clip(normalized, -1.0, 1.0)
+        # Pass 2: apply gain and write to a temp file, then replace original
+        import tempfile
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", dir=os.path.dirname(wav_path))
+        os.close(tmp_fd)
+        try:
+            with sf.SoundFile(wav_path, mode="r") as infile:
+                with sf.SoundFile(tmp_path, mode="w", samplerate=sr,
+                                  channels=infile.channels, subtype="PCM_16") as outfile:
+                    while True:
+                        chunk = infile.read(STREAM_CHUNK, dtype="float32")
+                        if len(chunk) == 0:
+                            break
+                        normalized = np.clip(chunk * gain_linear, -1.0, 1.0)
+                        outfile.write(normalized)
+            os.replace(tmp_path, wav_path)
+        except Exception:
+            # Clean up temp file on failure
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
-        sf.write(wav_path, normalized, sr, subtype="PCM_16")
         return {
             "action": "normalized",
             "gain_db": round(gain_db, 1),
@@ -258,19 +299,29 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
     cal_offset = float(detection_cfg["calibration_offset_db"])
     min_music = float(detection_cfg["min_music_like_score"])
 
-    data, sr = sf.read(wav_path, dtype="float32")
-    if len(data.shape) > 1:
-        data = data[:, 0]
-
+    # Streaming block reads: open the file and read one block at a time
+    # instead of loading the entire WAV into memory. For a 2-hour
+    # recording at 22050 Hz, this reduces peak memory from ~600 MB to
+    # ~86 KB (one block). The SoundFile object supports sequential reads
+    # via .read(N) which returns the next N frames.
+    #
     # NOTE: If the file's native sample rate differs from the config's
     # audio.sample_rate, spectral features (centroid, band ratios) will
     # vary. The resample_audio() utility in dsp.py can normalize this,
     # but all filter thresholds and regression test expectations would
     # need recalibration at the canonical rate first. See NEXT.md §5.
+    try:
+        infile = sf.SoundFile(wav_path, mode="r")
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"Cannot open WAV file {wav_path}: {exc}") from exc
+
+    sr = infile.samplerate
+    total_frames = infile.frames
+    channels = infile.channels
 
     block_seconds = float(audio_cfg.get("block_seconds", 1.0))
     block_size = int(sr * block_seconds)
-    n_blocks = len(data) // block_size
+    n_blocks = total_frames // block_size
 
     # Determine lead-in / lead-out boundaries to match the engine's behavior.
     # Only applied for engine-captured snippets — standalone recordings (test
@@ -303,109 +354,115 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
     holdover_gap = 0
     feature_history = []
 
-    for i in range(n_blocks):
-        block = data[i * block_size : (i + 1) * block_size]
+    try:
+        for i in range(n_blocks):
+            block = infile.read(block_size, dtype="float32")
+            if len(block) < block_size:
+                break
+            # Collapse stereo to mono if needed
+            if len(block.shape) > 1:
+                block = block[:, 0]
 
-        dbfs = rms_dbfs(block)
-        db_now = dba_estimate(dbfs, cal_offset)
-        db_history.append(db_now)
+            dbfs = rms_dbfs(block)
+            db_now = dba_estimate(dbfs, cal_offset)
+            db_history.append(db_now)
 
-        feats = spectrum_features(block, sr)
-        feature_history.append(feats)
-        feature_history = feature_history[-24:]
-        mscore = music_like_score(feats)
+            feats = spectrum_features(block, sr)
+            feature_history.append(feats)
+            feature_history = feature_history[-24:]
+            mscore = music_like_score(feats)
 
-        # Lead-in blocks: mark as "lead-in" without running the filter chain.
-        # The engine labels these with a negative timestamp; reclassify uses
-        # a positive block index but the same label so journals compare equal
-        # after the negative→positive conversion below.
-        if i < lead_in_blocks:
-            final = "lead-in"
-            filt = None
-        # Lead-out blocks: mark as "lead-out" — these are the post-trigger
-        # tail that the engine preserves for recording context but never
-        # classifies in the journal.
-        elif i >= lead_out_start:
-            final = "lead-out"
-            filt = None
-        else:
-            # Normal DSP classification for the incident body
-            prev = db_history[-2] if len(db_history) > 1 else db_now
-            raw_filt = identify_filter(feats, db_history, db_now, prev, detection_cfg,
-                                       feature_history=feature_history)
-
-            # Apply holdover (same as engine._identify_filter)
-            filt, prev_filt, prev_filt_run, holdover_gap = apply_filter_holdover(
-                raw_filt, prev_filt, prev_filt_run, holdover_gap, detection_cfg,
-            )
-
-            # Replicate engine._classify_sound logic (with engine_noise veto).
-            # midband veto threshold must match the engine — see engine_midband_veto.
-            midband_veto = float(detection_cfg.get("engine_midband_veto", 0.40))
-            if feats.get("midband_ratio", 0) > midband_veto:
-                classify = "engine_noise"
-            elif (feats.get("lowband_ratio", 0) > 0.10 and
-                  feats.get("envelope_cv", 0.5) < 0.10 and
-                  feats.get("harmonic_ratio", 0.5) < 0.40):
-                classify = "engine_noise"
-            elif mscore >= min_music:
-                classify = "music_like"
+            # Lead-in blocks: mark as "lead-in" without running the filter chain.
+            # The engine labels these with a negative timestamp; reclassify uses
+            # a positive block index but the same label so journals compare equal
+            # after the negative→positive conversion below.
+            if i < lead_in_blocks:
+                final = "lead-in"
+                filt = None
+            # Lead-out blocks: mark as "lead-out" — these are the post-trigger
+            # tail that the engine preserves for recording context but never
+            # classifies in the journal.
+            elif i >= lead_out_start:
+                final = "lead-out"
+                filt = None
             else:
-                classify = "unknown"
+                # Normal DSP classification for the incident body
+                prev = db_history[-2] if len(db_history) > 1 else db_now
+                raw_filt = identify_filter(feats, db_history, db_now, prev, detection_cfg,
+                                           feature_history=feature_history)
 
-            final = filt if filt else classify
+                # Apply holdover (same as engine._identify_filter)
+                filt, prev_filt, prev_filt_run, holdover_gap = apply_filter_holdover(
+                    raw_filt, prev_filt, prev_filt_run, holdover_gap, detection_cfg,
+                )
 
-        # Build journal (transitions only, like engine._update_class_journal).
-        # When a filter first identifies a sound, backdate the entry by the
-        # filter's detection latency — the pattern was present before we had
-        # enough history to confirm it.
-        if not journal or journal[-1][1] != final:
-            entry_block = i
-            if filt:
-                latency = get_filter_detection_latency(filt, detection_cfg)
-                backdated = i - latency
+                # Replicate engine._classify_sound logic (with engine_noise veto).
+                # midband veto threshold must match the engine — see engine_midband_veto.
+                midband_veto = float(detection_cfg.get("engine_midband_veto", 0.40))
+                if feats.get("midband_ratio", 0) > midband_veto:
+                    classify = "engine_noise"
+                elif (feats.get("lowband_ratio", 0) > 0.10 and
+                      feats.get("envelope_cv", 0.5) < 0.10 and
+                      feats.get("harmonic_ratio", 0.5) < 0.40):
+                    classify = "engine_noise"
+                elif mscore >= min_music:
+                    classify = "music_like"
+                else:
+                    classify = "unknown"
 
-                # If backdating would overlap with or precede a trailing
-                # "unknown" entry, replace it — that unknown was really the
-                # lead-in to this filter's detection window.
-                if (journal and journal[-1][1] == "unknown" and
-                        backdated <= journal[-1][0]):
-                    journal.pop()
+                final = filt if filt else classify
 
-                earliest = (journal[-1][0] + 1) if journal else 0
-                entry_block = max(earliest, backdated)
+            # Build journal (transitions only, like engine._update_class_journal).
+            # When a filter first identifies a sound, backdate the entry by the
+            # filter's detection latency — the pattern was present before we had
+            # enough history to confirm it.
+            if not journal or journal[-1][1] != final:
+                entry_block = i
+                if filt:
+                    latency = get_filter_detection_latency(filt, detection_cfg)
+                    backdated = i - latency
 
-                # After replacing, check if we'd duplicate the previous entry
-                if journal and journal[-1][1] == final:
-                    continue
-            journal.append((entry_block, final))
+                    # If backdating would overlap with or precede a trailing
+                    # "unknown" entry, replace it — that unknown was really the
+                    # lead-in to this filter's detection window.
+                    if (journal and journal[-1][1] == "unknown" and
+                            backdated <= journal[-1][0]):
+                        journal.pop()
 
-        # Env std for display
-        if len(db_history) >= 2:
-            window = db_history[-12:]
-            env_std = float(np.std(np.array(window, dtype=float)))
-        else:
-            env_std = 0.0
+                    earliest = (journal[-1][0] + 1) if journal else 0
+                    entry_block = max(earliest, backdated)
 
-        filter_counts[filt or "none"] = filter_counts.get(filt or "none", 0) + 1
+                    # After replacing, check if we'd duplicate the previous entry
+                    if journal and journal[-1][1] == final:
+                        continue
+                journal.append((entry_block, final))
 
-        blocks.append({
-            "block": i,
-            "dba": round(db_now, 1),
-            "centroid_hz": round(feats["centroid_hz"]),
-            "envelope_cv": round(feats.get("envelope_cv", 0.0), 3),
-            "flatness": round(feats["flatness"], 3),
-            "harmonic_ratio": round(feats.get("harmonic_ratio", 0.0), 3),
-            "lowband": round(feats["lowband_ratio"], 3),
-            "midband": round(feats["midband_ratio"], 3),
-            "highband": round(feats["highband_ratio"], 3),
-            "mscore": round(mscore, 2),
-            "env_std": round(env_std, 2),
-            "filter": filt,
-            "classification": final,
-        })
+            # Env std for display
+            if len(db_history) >= 2:
+                window = db_history[-12:]
+                env_std = float(np.std(np.array(window, dtype=float)))
+            else:
+                env_std = 0.0
 
-    # Convert reclassify journal timestamps to match the engine's convention:
+            filter_counts[filt or "none"] = filter_counts.get(filt or "none", 0) + 1
+
+            blocks.append({
+                "block": i,
+                "dba": round(db_now, 1),
+                "centroid_hz": round(feats["centroid_hz"]),
+                "envelope_cv": round(feats.get("envelope_cv", 0.0), 3),
+                "flatness": round(feats["flatness"], 3),
+                "harmonic_ratio": round(feats.get("harmonic_ratio", 0.0), 3),
+                "lowband": round(feats["lowband_ratio"], 3),
+                "midband": round(feats["midband_ratio"], 3),
+                "highband": round(feats["highband_ratio"], 3),
+                "mscore": round(mscore, 2),
+                "env_std": round(env_std, 2),
+                "filter": filt,
+                "classification": final,
+            })
+    finally:
+        infile.close()
     # the engine uses a negative timestamp for lead-in (round(-preroll_sec))
     # and elapsed seconds from start_ts for everything else. To produce
     # comparable journals, shift block indices so lead-in blocks are negative

@@ -151,3 +151,29 @@ This is why the CHANGELOG's "Testing Resources" section warns, in capital letter
 **Why:** Documenting a valid range in a comment and then accepting any value is a recurring source of silent misbehavior. If the YAML comment says a percentile is 0–100 or a gap is in seconds, the loader should enforce that. This keeps a fat-fingered config edit from producing baffling runtime behavior far from its cause.
 
 </details>
+
+## D11. WAV finalization must stream — never load entire files into memory
+
+**Decision:** All WAV post-processing in `_finalize_incident` (tail trimming, denoising, normalization) and `analyze_clip` must read files block-by-block. Full-file `sf.read()` is prohibited for engine-captured snippets. Denoising (which requires full-file STFT) skips files larger than 100 MB.
+
+<details>
+
+**Why:** v18 production logging revealed a pattern of crash-repaired incidents (10 in the database at time of discovery, all during confirmed music sessions). Root cause: `_finalize_incident` read the entire WAV into memory as float32 for four sequential operations — tail trimming, denoising, normalization, and `analyze_clip`. At 22050 Hz, a 2-hour incident produces ~280 MB on disk → ~606 MB in float32. At 48000 Hz (the v18 fallback rate that produced 14 orphaned WAVs), a 2.5-hour recording reached 784 MB on disk → ~1.5 GB in float32 — well beyond the 1024 MB `MemoryMax`. The memory check only ran once per day, so it never caught the spike.
+
+**Data loss:** Each OOM crash destroyed the active incident's metadata (duration, classification, journal all lost — marked crash-repaired with `duration_sec=0.0`) and potentially corrupted the in-progress WAV (the `SoundFile` handle was open at crash time). 14 orphaned WAVs totaling ~5.2 GB of audio evidence (35–143 minutes each) survived on disk but lost their DB rows during prior cleanup. These were later recovered via `--repair-snippet-paths` and `analyze_clip`, but any crash-repaired incident whose WAV was not flushed to disk at crash time is irrecoverable.
+
+**Consequence:** `max_incident_record_hours` was reduced from 6 → 2 as defense in depth (a 2-hour WAV at 22050 Hz is ~280 MB — safe for streaming). The memory check interval was increased from daily to every 5 minutes. Streaming I/O is now the architectural norm for all WAV processing in the engine path; full-file reads are reserved for the test/calibration layer only.
+
+</details>
+
+## D12. Music-focus auto-dismiss applies to reclassified-as-non-music short incidents
+
+**Decision:** In `continuous_music_focus` mode, v17 intentionally skipped the `drive_by` and `too_short` auto-dismiss checks (see D5). v19 adds a refinement: after the `analyze_clip` keystone reclassifies the stored WAV, if the dominant classification is NOT music-related (`music_like`, `amplified_bass`, `music`) AND the active duration is below `min_incident_seconds`, the incident is auto-dismissed.
+
+<details>
+
+**Why:** The music-focus gate in the engine run loop creates incidents only when a block classifies as `music_like` in real-time. But the `analyze_clip` keystone at finalization reclassifies the stored WAV end-to-end — and the dominant classification across all blocks may be something else (flyover, impulse, engine_noise). Without this refinement, a single `music_like` block that triggers an incident but gets reclassified as flyover slips through the safety net. The D5 rationale still holds for incidents that ARE music: a short `music_like` burst is a legitimate detection. But a short `flyover` in music-focus mode is noise, not signal.
+
+**Example (incident #8416):** A 13-second incident started because one block scored `music_like`, but `analyze_clip` reclassified it as `flyover (multiple)` (music_like_score=0.84 but spectral profile dominated by flyover across blocks). Under v17 rules it survived. Under v19 it would be auto-dismissed as a non-music transient.
+
+</details>
