@@ -223,6 +223,38 @@ def spectrum_features(arr: np.ndarray, sr: int):
         "midband_ratio": midband_ratio,
     }
 
+def envelope_window_metrics(samples, sr, frame_sec=0.25):
+    """Peak-to-trough envelope contrast and alternation count for one analysis
+    window — the quantified form of the rendered waveform's visual signature
+    (DECISIONS D13).
+
+    The envelope is plain RMS per frame_sec, matching the incidents-page
+    waveform's per-pixel buckets, so the numbers correspond to what the
+    operator sees: through-wall music falls 15–25 dB into troughs between
+    beats and alternates at ~1 Hz; machine duty-cycle noise (planes, mowers)
+    modulates too fast to drop at this timescale and measures nearly flat.
+
+    Returns (depth_db, swings): depth_db = p90 − p10 of the frame envelope in
+    dB; swings = count of envelope crossings of the depth midline (tall/short
+    bar alternations). Returns (None, None) when the window holds fewer than
+    8 frames (2 s at the default frame size) — too little envelope to judge.
+    """
+    frame = int(sr * frame_sec)
+    if frame <= 0:
+        return None, None
+    n_frames = len(samples) // frame
+    if n_frames < 8:
+        return None, None
+    frames = np.asarray(samples[:n_frames * frame], dtype=np.float64).reshape(n_frames, frame)
+    env_db = 20.0 * np.log10(np.sqrt(np.mean(frames ** 2, axis=1)) + 1e-12)
+    p10, p90 = np.percentile(env_db, [10, 90])
+    depth_db = float(p90 - p10)
+    midline = (p90 + p10) / 2.0
+    above = env_db > midline
+    swings = int(np.sum(above[1:] != above[:-1]))
+    return depth_db, swings
+
+
 def music_like_score(features: dict):
     """Composite heuristic: how much does this sound resemble music?
 

@@ -681,7 +681,10 @@ class TestExcludedIncidents:
         s = Storage(str(tmp_path / "test.db"))
         with s.conn() as c:
             version = c.execute("PRAGMA user_version").fetchone()[0]
-            assert version == 4
+            # Assert against the canonical constant, not a literal — a
+            # hard-coded version here went stale when migration 5 landed.
+            from noise_warden.storage import SCHEMA_VERSION
+            assert version == SCHEMA_VERSION
             # Verify the column exists by inserting with excluded=1
             row = {
                 "start_ts": "2026-04-01T12:00:00+00:00", "start_db": 70, "peak_db": 70,
@@ -692,3 +695,29 @@ class TestExcludedIncidents:
             iid = s.create_incident(row)
             inc = s.get_incident(iid)
             assert inc["excluded"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Envelope depth + swing persistence (v21, DECISIONS D13)
+# ---------------------------------------------------------------------------
+
+class TestEnvelopeMetricsPersistence:
+    """finalize_incident stores the D13 envelope metrics when provided and
+    leaves them NULL when not (older rows and recording-disabled incidents)."""
+
+    def test_finalize_persists_envelope_metrics(self, tmp_storage, sample_incident):
+        iid = tmp_storage.create_incident(sample_incident)
+        tmp_storage.finalize_incident(
+            iid, "2026-04-01T12:05:00+00:00", 300.0, 78.0, 74.0, None,
+            envelope_depth_db=17.3, envelope_swings=8.0)
+        row = tmp_storage.get_incident(iid)
+        assert row["envelope_depth_db"] == pytest.approx(17.3)
+        assert row["envelope_swings"] == pytest.approx(8.0)
+
+    def test_finalize_without_metrics_leaves_null(self, tmp_storage, sample_incident):
+        iid = tmp_storage.create_incident(sample_incident)
+        tmp_storage.finalize_incident(
+            iid, "2026-04-01T12:05:00+00:00", 300.0, 78.0, 74.0, None)
+        row = tmp_storage.get_incident(iid)
+        assert row["envelope_depth_db"] is None
+        assert row["envelope_swings"] is None

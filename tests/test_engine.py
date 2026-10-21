@@ -898,6 +898,254 @@ class TestMinIncidentDuration:
 
 
 # ---------------------------------------------------------------------------
+# Music-shield corroboration (v21): in music-focus mode, a short incident whose
+# dominant classification is music-family is only shielded from the too_short
+# dismissal when the journal corroborates it with enough music-classified time.
+# A single false-positive music_like block (e.g. production incidents 9016/9017,
+# 3-second keepers whose journals were [unknown, music_like, unknown]) must no
+# longer survive on the strength of that one block.
+# ---------------------------------------------------------------------------
+
+class TestMusicShieldCorroboration:
+    """The D5 music shield requires journal corroboration before exempting a
+    short incident from too_short dismissal (music_focus_shield_min_music_sec)."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def _active_incident(self, tmp_storage, journal, now):
+        """Build the minimal active-incident dict used by _finalize_incident,
+        2 seconds active + 8 seconds tail (below the min_incident_seconds=3
+        each test sets), with the given live classification journal."""
+        return {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+                "threshold_db": 65.0, "music_like_score": 0.7,
+                "classification": "music_like", "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=10),
+            "dbs": [70.0, 70.0] + [40.0] * 8,
+            "classification": "music_like",
+            "class_journal": journal,
+            "period": "day",
+            "responded": False,
+            "last_above": now - timedelta(seconds=8),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+    def _finalize(self, base_cfg, tmp_storage, tmp_state, journal):
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["audio"]["min_incident_seconds"] = 3
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+        engine.active = self._active_incident(
+            tmp_storage, journal, datetime.now(tz=timezone.utc))
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+        return tmp_storage.list_incidents()
+
+    def test_single_music_block_short_incident_dismissed(self, base_cfg, tmp_storage, tmp_state):
+        """One music_like second inside an [unknown, music_like, unknown]
+        journal is not corroboration — the short incident is dismissed even
+        though its dominant classification is music-family (music_like+)."""
+        incidents = self._finalize(
+            base_cfg, tmp_storage, tmp_state,
+            [(0, "unknown"), (1, "music_like"), (2, "unknown")])
+        assert len(incidents) == 0, (
+            "Uncorroborated single-block music_like should be auto-dismissed"
+        )
+
+    def test_corroborated_music_short_incident_kept(self, base_cfg, tmp_storage, tmp_state):
+        """A journal with 5 music_like seconds satisfies the default 2-second
+        corroboration floor — the shield holds and the incident is kept."""
+        incidents = self._finalize(
+            base_cfg, tmp_storage, tmp_state,
+            [(0, "music_like"), (5, "unknown")])
+        assert len(incidents) == 1, (
+            "Corroborated short music incident should keep the D5 shield"
+        )
+
+    def test_corroboration_disabled_restores_v19_behavior(self, base_cfg, tmp_storage, tmp_state):
+        """music_focus_shield_min_music_sec=0 disables corroboration: a
+        single-block music_like short incident survives, as in v19."""
+        base_cfg["detection"]["music_focus_shield_min_music_sec"] = 0
+        incidents = self._finalize(
+            base_cfg, tmp_storage, tmp_state,
+            [(0, "unknown"), (1, "music_like"), (2, "unknown")])
+        assert len(incidents) == 1, (
+            "Corroboration floor of 0 should restore the unconditional shield"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Excluded-class continuation cutoff (v21): in music-focus mode, excluded-class
+# blocks may only refresh last_above for one gap-merge window; after that the
+# incident goes stale and the gap-timeout finalizes it even though the dB is
+# still above threshold. Without this, one music_like block on a windy night
+# records wind to the 2-hour cap (production incident 9025 = exactly 7200s).
+# ---------------------------------------------------------------------------
+
+class TestExcludedContinuationCutoff:
+    """Excluded blocks stop extending an active music-focus incident after
+    music_focus_gap_merge_sec of consecutive excluded time, and the stale
+    incident is finalized from the above-threshold branches."""
+
+    def _make_engine(self, base_cfg, tmp_storage, tmp_state):
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                return Engine(base_cfg, tmp_storage, tmp_state)
+
+    def _active(self, tmp_storage, now, last_above_ago_sec=0):
+        return {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+                "threshold_db": 65.0, "music_like_score": 0.7,
+                "classification": "music_like", "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=60),
+            "dbs": [70.0] * 10,
+            "classification": "music_like",
+            "class_journal": [(0, "music_like")],
+            "period": "day",
+            "responded": False,
+            "last_above": now - timedelta(seconds=last_above_ago_sec),
+            "tmp_wav": None,
+            "recording": False,
+        }
+
+    def test_refresh_allowed_until_cutoff_then_denied(self, base_cfg, tmp_storage, tmp_state):
+        """With a 5-second gap-merge window and 1-second blocks, the first five
+        excluded blocks may refresh last_above; the sixth may not."""
+        base_cfg["detection"]["music_focus_gap_merge_sec"] = 5
+        base_cfg["audio"]["block_seconds"] = 1.0
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.active = self._active(tmp_storage, datetime.now(tz=timezone.utc))
+
+        results = [engine._excluded_refresh_allowed() for _ in range(6)]
+        assert results == [True] * 5 + [False], (
+            "Excluded blocks must stop refreshing after one gap-merge window"
+        )
+
+    def test_music_block_resets_the_run(self, base_cfg, tmp_storage, tmp_state):
+        """A music block between excluded runs resets the consecutive counter."""
+        base_cfg["detection"]["music_focus_gap_merge_sec"] = 3
+        base_cfg["audio"]["block_seconds"] = 1.0
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.active = self._active(tmp_storage, datetime.now(tz=timezone.utc))
+
+        assert [engine._excluded_refresh_allowed() for _ in range(3)] == [True] * 3
+        engine.active["excluded_run_sec"] = 0.0  # what the normal music path does
+        assert engine._excluded_refresh_allowed() is True, (
+            "The excluded run must restart after a music block resets it"
+        )
+
+    def test_non_music_focus_mode_always_refreshes(self, base_cfg, tmp_storage, tmp_state):
+        """Plain continuous mode keeps the v19 behavior: excluded blocks always
+        refresh last_above, with no cutoff."""
+        base_cfg["detection"]["mode"] = "continuous"
+        base_cfg["detection"]["music_focus_gap_merge_sec"] = 1
+        base_cfg["audio"]["block_seconds"] = 1.0
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.active = self._active(tmp_storage, datetime.now(tz=timezone.utc))
+
+        assert all(engine._excluded_refresh_allowed() for _ in range(10)), (
+            "Non-music-focus modes must refresh unconditionally"
+        )
+
+    def test_stale_active_finalized_above_threshold(self, base_cfg, tmp_storage, tmp_state):
+        """When last_above is older than the gap-merge window, the stale check
+        finalizes the incident even though dB never dropped below threshold."""
+        base_cfg["audio"]["recording_enabled"] = False
+        base_cfg["audio"]["min_incident_seconds"] = 0
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+        base_cfg["detection"]["music_focus_gap_merge_sec"] = 5
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.active = self._active(
+            tmp_storage, datetime.now(tz=timezone.utc), last_above_ago_sec=10)
+
+        with patch.object(engine.ha, "publish_event"):
+            finalized = engine._maybe_finalize_stale_active()
+
+        assert finalized is True
+        assert engine.active is None, "Stale incident should have been finalized"
+        assert len(tmp_storage.list_incidents()) == 1
+
+    def test_fresh_active_not_finalized(self, base_cfg, tmp_storage, tmp_state):
+        """A recently-refreshed incident is left alone by the stale check."""
+        base_cfg["detection"]["music_focus_gap_merge_sec"] = 5
+        engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
+        engine.active = self._active(
+            tmp_storage, datetime.now(tz=timezone.utc), last_above_ago_sec=1)
+
+        assert engine._maybe_finalize_stale_active() is False
+        assert engine.active is not None
+
+
+# ---------------------------------------------------------------------------
+# Envelope metrics at finalize (v21, DECISIONS D13): when an incident has a
+# recorded snippet, finalization computes and stores the depth/swing metrics.
+# Display-only in v21 — no dismissal decision reads them yet.
+# ---------------------------------------------------------------------------
+
+class TestEnvelopeMetricsAtFinalize:
+
+    def test_finalize_stores_envelope_metrics_for_recorded_incident(
+            self, base_cfg, tmp_storage, tmp_state, tmp_path):
+        """A finalized incident with a real WAV gets non-NULL envelope metrics."""
+        import soundfile as sf
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                engine = Engine(base_cfg, tmp_storage, tmp_state)
+        base_cfg["audio"]["min_incident_seconds"] = 0
+        base_cfg["detection"]["driveby_max_duration_sec"] = 0
+        base_cfg["detection"]["mode"] = "continuous"
+        base_cfg["audio"]["snippet_normalize"] = False
+        base_cfg["audio"]["denoise_enabled"] = False
+
+        # 10 seconds of 60 Hz bursts (one 8s analysis window's worth of audio)
+        sr = 22050
+        samples = np.random.default_rng(7).normal(0.0, 0.002, sr * 10)
+        tone = np.sin(2 * np.pi * 60.0 * np.arange(int(sr * 0.15)) / sr) * 0.6
+        for second in range(10):
+            samples[second * sr:second * sr + len(tone)] += tone
+        wav_path = str(tmp_path / "incident_tmp.wav")
+        sf.write(wav_path, samples.astype(np.float32), sr)
+
+        now = datetime.now(tz=timezone.utc)
+        engine.active = {
+            "id": tmp_storage.create_incident({
+                "start_ts": "2026-01-01T00:00:00+00:00",
+                "start_db": 70.0, "peak_db": 70.0, "avg_db": 70.0,
+                "threshold_db": 65.0, "music_like_score": 0.7,
+                "classification": "music_like", "mode": "respond",
+            }),
+            "start": now - timedelta(seconds=10),
+            "dbs": [70.0] * 10,
+            "classification": "music_like",
+            "class_journal": [(0, "music_like")],
+            "period": "day",
+            "responded": False,
+            "last_above": now,
+            "tmp_wav": wav_path,
+            "recording": True,
+        }
+
+        with patch.object(engine.ha, "publish_event"):
+            engine._finalize_incident()
+
+        row = tmp_storage.list_incidents()[0]
+        assert row["envelope_depth_db"] is not None, (
+            "Recorded incident should carry the D13 depth metric"
+        )
+        assert row["envelope_swings"] is not None
+
+
+# ---------------------------------------------------------------------------
 # Audio device validation
 # ---------------------------------------------------------------------------
 
@@ -2250,3 +2498,29 @@ class TestClassificationJournal:
         engine = self._make_engine(base_cfg, tmp_storage, tmp_state)
         assert engine.active is None
         engine._update_class_journal("music")
+
+
+# ---------------------------------------------------------------------------
+# Snippet file permissions (v21 bug fix): tempfile.NamedTemporaryFile creates
+# mode 0600, so every recorded WAV since the tempfile-based recorder landed
+# has been unreadable to the noisewarden group (broke operator scp/rsync and
+# required manual chmod sweeps on the Pi on 2026-07 and 2026-10-21).
+# ---------------------------------------------------------------------------
+
+class TestSnippetFilePermissions:
+
+    def test_incident_wav_is_group_readable(self, base_cfg, tmp_storage, tmp_state, tmp_path):
+        """The temp WAV created at incident start must carry group-read."""
+        base_cfg["app"]["shared_dir"] = str(tmp_path)
+        (tmp_path / "snippets").mkdir(exist_ok=True)
+        with patch("noise_warden.engine.AudioCapture", return_value=FakeCapture([])):
+            with patch("noise_warden.engine.HAClient"):
+                engine = Engine(base_cfg, tmp_storage, tmp_state)
+        engine._begin_incident(70.0, 65.0, 0.5, "music_like", "respond")
+        wav = engine.active["tmp_wav"]
+        assert wav is not None and os.path.exists(wav)
+        mode = os.stat(wav).st_mode & 0o777
+        engine._close_wav_handle()
+        assert mode & 0o044, (
+            f"Snippet WAV mode {oct(mode)} is not group/other-readable"
+        )

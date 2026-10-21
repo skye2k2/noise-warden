@@ -28,6 +28,7 @@ import yaml
 from noise_warden.dsp import (
     apply_filter_holdover,
     dba_estimate,
+    envelope_window_metrics,
     get_filter_detection_latency,
     identify_filter,
     music_like_score,
@@ -103,14 +104,25 @@ def denoise_snippet(wav_path, percentile=10, alpha=1.0, beta=0.02,
             return None
 
         # ── Forward STFT ──────────────────────────────────────────────
+        # Zero-pad one full FFT window at each end so every REAL sample gets
+        # full overlap coverage in the reconstruction. Without this, the first
+        # and last fft_size - hop_size samples are covered by a single Hann
+        # window whose squared tail approaches zero, and the overlap-add
+        # normalization below divides spectral-subtraction residue by that
+        # near-zero sum — amplifying a properly faded, near-silent clip tail
+        # into a full-scale click (live incidents 9293/9294, 2026-10-21).
+        pad = fft_size
+        padded = np.concatenate([
+            np.zeros(pad, dtype=np.float32), data, np.zeros(pad, dtype=np.float32)])
+
         window = np.hanning(fft_size).astype(np.float32)
-        n_frames = 1 + (len(data) - fft_size) // hop_size
+        n_frames = 1 + (len(padded) - fft_size) // hop_size
         # Pre-allocate complex STFT matrix
         stft = np.zeros((n_frames, fft_size // 2 + 1), dtype=np.complex64)
 
         for i in range(n_frames):
             start = i * hop_size
-            frame = data[start:start + fft_size] * window
+            frame = padded[start:start + fft_size] * window
             stft[i] = np.fft.rfft(frame)
 
         magnitudes = np.abs(stft)
@@ -121,7 +133,16 @@ def denoise_snippet(wav_path, percentile=10, alpha=1.0, beta=0.02,
         # consistent energy in every frame; transient signals (speech,
         # music, bangs) will only appear in some frames, pushing their
         # percentile above the noise floor.
-        noise_floor = np.percentile(magnitudes, percentile, axis=0)
+        # Frames that overlap the zero padding are near-silent and would drag
+        # the low-percentile estimate below the true floor (weakening the
+        # subtraction), so the estimate uses only frames made of real samples.
+        first_real = (pad + hop_size - 1) // hop_size
+        last_real = (pad + len(data) - fft_size) // hop_size
+        if last_real >= first_real:
+            noise_floor = np.percentile(magnitudes[first_real:last_real + 1], percentile, axis=0)
+        else:
+            # Clip shorter than one unpadded frame — fall back to all frames.
+            noise_floor = np.percentile(magnitudes, percentile, axis=0)
 
         # Diagnostic: average noise floor in dB (for logging)
         mean_noise_mag = float(np.mean(noise_floor))
@@ -143,7 +164,7 @@ def denoise_snippet(wav_path, percentile=10, alpha=1.0, beta=0.02,
 
         # ── Inverse STFT (overlap-add) ────────────────────────────────
         cleaned_stft = cleaned_mag * np.exp(1j * phases)
-        output_len = len(data)
+        output_len = len(padded)
         output = np.zeros(output_len, dtype=np.float32)
         window_sum = np.zeros(output_len, dtype=np.float32)
 
@@ -157,10 +178,14 @@ def denoise_snippet(wav_path, percentile=10, alpha=1.0, beta=0.02,
             output[start:end] += frame[:actual_len] * window[:actual_len]
             window_sum[start:end] += window[:actual_len] ** 2
 
-        # Normalize by window overlap (avoid division by zero in
-        # regions with insufficient overlap at the very end)
+        # Normalize by window overlap. The padding above guarantees full
+        # coverage for every real sample; the epsilon guard only matters
+        # inside the discarded pad regions.
         nonzero = window_sum > 1e-8
         output[nonzero] /= window_sum[nonzero]
+
+        # Strip the padding — keep exactly the original sample count.
+        output = output[pad:pad + len(data)]
 
         # Clamp to valid audio range
         output = np.clip(output, -1.0, 1.0)
@@ -305,11 +330,18 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
     # ~86 KB (one block). The SoundFile object supports sequential reads
     # via .read(N) which returns the next N frames.
     #
-    # NOTE: If the file's native sample rate differs from the config's
-    # audio.sample_rate, spectral features (centroid, band ratios) will
-    # vary. The resample_audio() utility in dsp.py can normalize this,
-    # but all filter thresholds and regression test expectations would
-    # need recalibration at the canonical rate first. See NEXT.md §5.
+    # Sample-rate normalization (v21, DECISIONS D15): blocks are analyzed at
+    # min(file rate, configured rate). A file ABOVE the canonical rate is
+    # FFT-downsampled per block — exact normalization, discarding only what a
+    # canonical-rate capture would never have seen. A file BELOW the canonical
+    # rate is analyzed at its own native rate: upsampling would fabricate an
+    # empty top band that crushes spectral flatness and misfires the filter
+    # chain (measured 2026-10-21: 44100 Hz regression clips upsampled to
+    # 48000 classified rain as diesel+ — the empty 22.05-24 kHz band dropped
+    # flatness below rain's gate). Natural recordings fill their container's
+    # bandwidth, so native-rate analysis keeps flatness and the absolute-Hz
+    # band ratios threshold-comparable. Per-block resampling keeps the
+    # streaming memory profile intact.
     try:
         infile = sf.SoundFile(wav_path, mode="r")
     except (OSError, RuntimeError) as exc:
@@ -322,6 +354,10 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
     block_seconds = float(audio_cfg.get("block_seconds", 1.0))
     block_size = int(sr * block_seconds)
     n_blocks = total_frames // block_size
+
+    # Analysis rate: min(native, configured) — see the normalization comment
+    # above for why upsampling is deliberately never done.
+    target_sr = min(sr, int(audio_cfg.get("sample_rate", sr) or sr))
 
     # Determine lead-in / lead-out boundaries to match the engine's behavior.
     # Only applied for engine-captured snippets — standalone recordings (test
@@ -363,11 +399,14 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
             if len(block.shape) > 1:
                 block = block[:, 0]
 
+            if sr != target_sr:
+                block = resample_audio(block, sr, target_sr)
+
             dbfs = rms_dbfs(block)
             db_now = dba_estimate(dbfs, cal_offset)
             db_history.append(db_now)
 
-            feats = spectrum_features(block, sr)
+            feats = spectrum_features(block, target_sr)
             feature_history.append(feats)
             feature_history = feature_history[-24:]
             mscore = music_like_score(feats)
@@ -591,6 +630,73 @@ def _compute_dominant(journal, duration):
     # classification. Consistent with the multi-source fallback above.
     non_bookend = [entry[1] for entry in journal if entry[1] not in _BOOKENDS]
     return non_bookend[0] if non_bookend else "unknown"
+
+
+def envelope_depth_metrics(wav_path, window_sec=8.0, hop_sec=4.0, deep_window_db=12.0):
+    """Per-clip aggregation of the D13 envelope metrics, streamed.
+
+    Slides an 8-second window (4-second hop) across the WAV, computes
+    dsp.envelope_window_metrics per window, and aggregates: depth = p90 of the
+    per-window depths (so lead-ins and silent tails cannot dilute a music
+    body), swings = median alternation count among deep (>= deep_window_db)
+    windows, 0.0 when no window is deep. Streaming keeps memory flat on
+    multi-hundred-MB incident files per DECISIONS D11.
+
+    Returns (depth_db, swings) as floats, or (None, None) when the clip is
+    shorter than one analysis window.
+    """
+    depths = []
+    swings_deep = []
+    with sf.SoundFile(wav_path) as f:
+        sr = f.samplerate
+        win = int(sr * window_sec)
+        hop = int(sr * hop_sec)
+        buf = np.zeros(0, dtype=np.float32)
+        while True:
+            chunk = f.read(win - len(buf), dtype="float32", always_2d=True)
+            if chunk.shape[0] == 0:
+                break
+            buf = np.concatenate([buf, chunk.mean(axis=1)])
+            if len(buf) < win:
+                break
+            depth_db, swings = envelope_window_metrics(buf, sr)
+            if depth_db is not None:
+                depths.append(depth_db)
+                if depth_db >= deep_window_db:
+                    swings_deep.append(swings)
+            buf = buf[hop:]
+    if not depths:
+        return None, None
+    depth = float(np.percentile(depths, 90))
+    swing_median = float(np.median(swings_deep)) if swings_deep else 0.0
+    return depth, swing_median
+
+
+def music_seconds(journal, duration):
+    """Span-weighted seconds of music-family classification in a journal.
+
+    Exists so the engine's D5 music shield can demand corroboration: a short
+    incident whose *dominant* classification is music-family may still rest on
+    a single music block (production incidents 9016/9017 were kept on journals
+    of [unknown, music_like, unknown]). Spans are accounted exactly as in
+    _compute_dominant — each entry runs to the next entry's timestamp, the
+    last to `duration` — with lead-in/lead-out bookends excluded.
+    """
+    _MUSIC_PREFIXES = ("amplified_bass", "music", "music_like")
+    total = 0
+    for idx in range(len(journal)):
+        cls = str(journal[idx][1])
+        if cls in ("lead-in", "lead-out"):
+            continue
+        if not cls.startswith(_MUSIC_PREFIXES):
+            continue
+        start_sec = journal[idx][0]
+        if idx + 1 < len(journal):
+            end_sec = journal[idx + 1][0]
+        else:
+            end_sec = duration
+        total += max(0, end_sec - start_sec)
+    return total
 
 
 # ---------------------------------------------------------------------------

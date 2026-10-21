@@ -29,22 +29,11 @@ Findings behind these items are recorded in CHANGELOG v20 and DECISIONS D1 (adde
 
 </details>
 
-## Priority 2 — Sample-rate normalization in `analyze_clip` (canonical rate: 48000 — see DECISIONS D15)
+## Priority 2 — Sample-rate normalization: DONE in v21 (min-rule); remaining piece folded into Priority 4
 
-**The single most important correctness fix for reliable analysis — re-scoped 2026-10-21.** The deployment has *always* captured at 48000 Hz (D15: the mic's only native rate; the configured 22050 was rejected on 179 of 224 starts and every stored WAV is 48 kHz). Production-data-derived thresholds — including the `flyover_max_music_score` guard — are therefore already 48 kHz-consistent. What remains out of step: the 15 regression WAVs in `tests/classification_data/` are 44100 Hz, and `analyze_clip` still carries the `NOTE:` comment about rate divergence.
+**Resolved 2026-10-21 (v21):** `analyze_clip` now analyzes at min(file rate, configured rate) — files above canonical are FFT-downsampled per block, sub-rate files run at native rate, and upsampling is deliberately never done (it fabricates an empty top band that crushed flatness and classified rain as diesel — see DECISIONS D15 v21 addendum). The regression suite pins the canonical 48000 for determinism; the 44100 clips therefore analyze at native rate and keep their validated expectations.
 
-<details>
-
-- The `resample_audio()` FFT utility already exists in `dsp.py`.
-- Work required:
-  1. Enable resampling to the configured sample rate at the top of `analyze_clip` so any mismatched input (the 44100 regression clips, foreign recordings) is analyzed at the deployment's canonical rate (48000 here, per D15).
-  2. Re-run all 15 regression clips at 48000 and update `REGRESSION_CLIPS` expectations and the calibration notes.
-  3. Re-evaluate `holdover_priority_breakers` in the local config — `flyover` was removed as a breaker because it false-positived on storm-rain at 44100 Hz; that may change at 48000.
-  4. Revisit the `plane-flyover.wav` regression (currently classifies `wind (multiple)` because its 44100 Hz mscore median 0.61 trips the flyover guard) — at 48000 the mscore may drop back under 0.55.
-- Expect many of the 15 clips to change classification when resampled — this is a dedicated session, not a drive-by edit.
-- The 10 user-tagged genuine flyovers classify as wind, thunder, diesel, or amplified_bass — not flyover — so the flyover filter's thresholds need comprehensive recalibration at 48000 regardless. Real single-prop flyovers take about a minute and have waveform shapes distinctly different from amplified music (see also D13's depth/swing separation).
-
-</details>
+**Remaining, moved to Priority 4 (reference library):** genuine 48 kHz regression clips cut from the production corpus (44100 sources can never be 48 kHz baselines), the comprehensive flyover-threshold recalibration (the 10 user-tagged genuine flyovers still classify as wind/thunder/diesel/amplified_bass), and the `holdover_priority_breakers` re-evaluation that depends on it.
 
 ## Priority 3 — Operational hardening (attic deployment reliability)
 
@@ -70,7 +59,11 @@ Logging currently goes only to stdout/journald. If journald retention expires or
 
 </details>
 
-## Priority 4 — Tagging system (v18: dataset quality + scaling)
+## Priority 4 (post-v21) — Per-type deep analysis + curated reference library, then purge non-nuisance types from authority-facing data
+
+Once v21's instrumentation is trusted: the operator does not want flyover, drive-by, lawn-mower, or storm data kept as part of the incident data shown to authorities. For each non-nuisance type: pull everything recorded of that type (direct SSH sync makes including the freshest Pi data easy now — see the 2026-10-21 session tooling), run deep analysis to identify its key separating characteristics (the D13 depth/swing method is the template), and keep a set of nicely-clipped representative samples to expand `tests/classification_data/` and the calibration reference set. Then the bulk recordings of those types can be dropped from the incident DB with their characteristics preserved. Big and partly manual; previously blocked on the awkward remote-analysis workflow, which is now solved.
+
+## Priority 5 — Tagging system (v18: dataset quality + scaling)
 
 The free-text notes workflow does not scale to the current corpus (~13 GB snippets, thousands of rows). Tags are the way to curate at this size and to build a labeled training set for any future spectral classifier.
 
@@ -93,7 +86,7 @@ The free-text notes workflow does not scale to the current corpus (~13 GB snippe
 
 </details>
 
-## Priority 5 — Smaller carried-forward items
+## Priority 6 — Smaller carried-forward items
 
 These are lower-value polish items noted across prior analysis and the README TODO list. None are blocking.
 

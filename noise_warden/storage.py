@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS incidents (
   notes TEXT,
   deleted INTEGER DEFAULT 0,
   excluded INTEGER DEFAULT 0,
-  class_journal TEXT
+  class_journal TEXT,
+  envelope_depth_db REAL,
+  envelope_swings REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_incidents_start_ts ON incidents(start_ts DESC);
@@ -44,7 +46,7 @@ CREATE TABLE IF NOT EXISTS calibration_profiles (
 '''
 
 # Increment this when adding migrations. Each migration runs exactly once.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 class Storage:
     def __init__(self, db_path: str):
@@ -111,6 +113,16 @@ class Storage:
             except Exception:
                 pass
 
+        # Migration 5: add the D13 envelope depth/swing metrics computed at
+        # finalize (v21). Display-only — no dismissal logic reads them yet.
+        if current < 5:
+            print(f"[storage] Running migration to schema version 5")
+            for column in ("envelope_depth_db REAL", "envelope_swings REAL"):
+                try:
+                    c.execute(f"ALTER TABLE incidents ADD COLUMN {column}")
+                except Exception:
+                    pass  # Column already exists (fresh DB created with updated SCHEMA)
+
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         print(f"[storage] Schema version now {SCHEMA_VERSION}")
 
@@ -129,16 +141,18 @@ class Storage:
             ))
             return int(cur.lastrowid)
 
-    def finalize_incident(self, incident_id: int, end_ts: str, duration_sec: float, peak_db: float, avg_db: float, snippet_path: str | None, class_journal: str | None = None, classification: str | None = None, music_like_score: float | None = None):
+    def finalize_incident(self, incident_id: int, end_ts: str, duration_sec: float, peak_db: float, avg_db: float, snippet_path: str | None, class_journal: str | None = None, classification: str | None = None, music_like_score: float | None = None, envelope_depth_db: float | None = None, envelope_swings: float | None = None):
         with self.conn() as c:
             c.execute('''
                 UPDATE incidents
                 SET end_ts=?, duration_sec=?, peak_db=?, avg_db=?, snippet_path=?,
                     class_journal=COALESCE(?, class_journal),
                     classification=COALESCE(?, classification),
-                    music_like_score=COALESCE(?, music_like_score)
+                    music_like_score=COALESCE(?, music_like_score),
+                    envelope_depth_db=COALESCE(?, envelope_depth_db),
+                    envelope_swings=COALESCE(?, envelope_swings)
                 WHERE id=?
-            ''', (end_ts, duration_sec, peak_db, avg_db, snippet_path, class_journal, classification, music_like_score, incident_id))
+            ''', (end_ts, duration_sec, peak_db, avg_db, snippet_path, class_journal, classification, music_like_score, envelope_depth_db, envelope_swings, incident_id))
 
     def update_incident_notes(self, incident_id: int, notes: str):
         with self.conn() as c:

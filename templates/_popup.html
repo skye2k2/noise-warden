@@ -168,6 +168,13 @@ function showPopup(inc) {
   if (inc.music_like_score != null) {
     html += '<div class="popup-section">';
     html += '<div><span class="popup-lbl">Music-like score:</span> <span class="popup-val">' + safeNum(inc.music_like_score).toFixed(2) + '</span></div>';
+    // D13 envelope metrics (v21): peak-to-trough contrast of the rendered
+    // waveform plus how often it alternates. Deep (>=14 dB) AND frequently
+    // alternating (>=6 swings) reads as music; deep but single-swing is an
+    // impulse (thunder); shallow is machine duty-cycle noise.
+    if (inc.envelope_depth_db != null) {
+      html += '<div><span class="popup-lbl">Envelope depth:</span> <span class="popup-val">' + safeNum(inc.envelope_depth_db).toFixed(1) + ' dB, ' + safeNum(inc.envelope_swings).toFixed(0) + ' swings/8s</span></div>';
+    }
     if (inc.responded) {
       html += '<div><span class="popup-lbl">Response:</span> <span class="popup-val">Activated</span></div>';
     }

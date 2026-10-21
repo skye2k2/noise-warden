@@ -17,6 +17,20 @@ from .reclassify import analyze_clip, reclassify_all
 from .seed import seed_all, DEFAULT_CLASSIFICATION_DIR
 
 cfg = load_yaml()
+
+# Durable application log (NEXT.md 3b): tee stdout/stderr to a size-rotated
+# file beside the DB so diagnostic history survives journald retention expiry
+# or corruption (both happened during the original memory-starved outage).
+# Installed only under systemd — local dev keeps plain console output.
+if os.environ.get("INVOCATION_ID"):
+    import sys
+
+    from .logtee import TeeStdout
+
+    _log_path = os.path.join(cfg["app"]["shared_dir"], "noise_warden.log")
+    sys.stdout = TeeStdout(sys.stdout, _log_path)
+    sys.stderr = TeeStdout(sys.stderr, _log_path)
+
 storage = Storage(os.path.join(cfg["app"]["shared_dir"], "noise_warden.db"))
 state = StateStore()
 engine = Engine(cfg, storage, state)
@@ -388,6 +402,8 @@ def timeline(request: Request, view: str = "day"):
             "avg_db": r.get("avg_db"),
             "threshold_db": r.get("threshold_db"),
             "music_like_score": r.get("music_like_score"),
+            "envelope_depth_db": r.get("envelope_depth_db"),
+            "envelope_swings": r.get("envelope_swings"),
             "classification": r.get("classification", ""),
             "class_journal": r.get("class_journal", ""),
             "mode": r.get("mode", ""),

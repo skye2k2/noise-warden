@@ -228,9 +228,16 @@ REGRESSION_CLIPS = {
 
 @pytest.fixture(scope="module")
 def local_cfg():
-    """Load the local dev config YAML."""
+    """Load the local dev config YAML, pinned to the canonical analysis rate.
+
+    The sample rate is forced to 48000 (DECISIONS D15: the deployment's true
+    capture rate) rather than inherited from the machine-local YAML, so the
+    regression baselines are deterministic on every machine. analyze_clip
+    resamples each 44100 Hz clip to this rate before feature extraction."""
     with open(LOCAL_CFG) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    cfg["audio"]["sample_rate"] = 48000
+    return cfg
 
 
 # ---------------------------------------------------------------------------

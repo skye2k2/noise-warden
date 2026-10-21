@@ -447,15 +447,32 @@ class TestDenoiseSnippet:
     """Tests for the standalone denoise_snippet function."""
 
     def test_reduces_noise_preserves_tone(self, tmp_path):
-        """A tone embedded in white noise should emerge cleaner after denoising.
-        The tone's spectral bin should remain strong relative to its neighbors."""
+        """A TRANSIENT tone embedded in white noise should emerge cleaner after
+        denoising — minimum statistics only protects content that is absent
+        from enough frames to stay above the per-bin percentile, which is the
+        algorithm's documented contract and matches real signals (music,
+        speech, bangs). A constant tone is legitimately treated as part of the
+        stationary floor and subtracted.
+
+        History: this test originally used a constant 3-second tone and
+        measured the FIRST second of output — which passed only because the
+        pre-v21 OLA edge bug amplified the file head to full scale, inflating
+        the tone bin (honest interior ratio was 0.64, i.e. the constant tone
+        did NOT survive). Rewritten 2026-10-21 alongside the edge-artifact fix
+        to assert the behavior the docstring actually promises."""
         wav_path = str(tmp_path / "noisy_tone.wav")
         sr = 22050
         duration = 3.0
-        # Loud tone + moderate noise — the tone should survive denoising
-        tone = _make_tone(1000, duration, sr=sr, amplitude=0.5)
         noise = _make_noise(duration, sr=sr, amplitude=0.15)
-        _write_wav(wav_path, tone + noise, sr=sr)
+        # Tone bursts with 50% duty: on during odd half-seconds. Present in
+        # only half the frames, the tone bin's 10th percentile stays at the
+        # noise level, so subtraction removes hiss but not the bursts.
+        tone = _make_tone(1000, duration, sr=sr, amplitude=0.5)
+        gate = np.zeros(len(tone), dtype=np.float32)
+        half = sr // 2
+        for burst_start in range(half, len(tone), 2 * half):
+            gate[burst_start:burst_start + half] = 1.0
+        _write_wav(wav_path, tone * gate + noise, sr=sr)
 
         result = denoise_snippet(wav_path, percentile=10, alpha=1.0, beta=0.02)
 
@@ -464,17 +481,15 @@ class TestDenoiseSnippet:
         assert "noise_floor_db" in result
         assert "snr_improvement_db" in result
 
-        # Verify the 1000 Hz tone survived denoising: its spectral energy
-        # should be significantly above the median magnitude (the noise floor).
+        # Measure an interior burst (1.5-2.0 s): tone bin well above the
+        # median, and clearly stronger than in an interior quiet gap.
         data, _ = sf.read(wav_path, dtype="float32")
-        fft_mag = np.abs(np.fft.rfft(data[:sr]))  # first second
-        freqs = np.fft.rfftfreq(sr, 1.0 / sr)
-        tone_bin = np.argmin(np.abs(freqs - 1000))
-        # The tone bin should be well above the median noise floor
-        median_mag = float(np.median(fft_mag[50:]))  # skip DC/very-low
-        tone_mag = float(fft_mag[tone_bin])
-        assert tone_mag > median_mag * 2, (
-            f"Tone at 1000 Hz ({tone_mag:.1f}) should be >2x median ({median_mag:.1f})"
+        freqs = np.fft.rfftfreq(half, 1.0 / sr)
+        tone_bin = int(np.argmin(np.abs(freqs - 1000)))
+        burst_mag = np.abs(np.fft.rfft(data[int(1.5 * sr):2 * sr]))
+        burst_ratio = float(burst_mag[tone_bin]) / float(np.median(burst_mag[50:]))
+        assert burst_ratio > 2, (
+            f"Transient tone should survive denoising (ratio {burst_ratio:.2f})"
         )
 
     def test_skips_too_short_file(self, tmp_path):
@@ -717,3 +732,185 @@ class TestAnalyzeClipLeadInOut:
         journal = [(0, "unknown"), (5, "mower")]
         result = _compute_dominant(journal, 60)
         assert result == "mower+"
+
+
+# ---------------------------------------------------------------------------
+# Streaming per-clip envelope metrics (v21, DECISIONS D13)
+# ---------------------------------------------------------------------------
+
+class TestEnvelopeDepthMetricsAggregate:
+    """envelope_depth_metrics streams a WAV in 8s windows and aggregates the
+    per-window dsp metrics: p90 of window depths, median swings among deep
+    (>=12 dB) windows. Streaming keeps memory flat per DECISIONS D11."""
+
+    SR = 22050
+
+    def _write(self, tmp_path, name, samples):
+        import soundfile as sf
+        path = str(tmp_path / name)
+        sf.write(path, samples.astype("float32"), self.SR)
+        return path
+
+    def test_beat_clip_aggregates_deep(self, tmp_path):
+        import numpy as np
+        from noise_warden.reclassify import envelope_depth_metrics
+        rng = np.random.default_rng(42)
+        samples = rng.normal(0.0, 0.002, self.SR * 16)
+        tone = np.sin(2 * np.pi * 60.0 * np.arange(int(self.SR * 0.15)) / self.SR) * 0.6
+        for second in range(16):
+            samples[second * self.SR:second * self.SR + len(tone)] += tone
+        depth_db, swings = envelope_depth_metrics(self._write(tmp_path, "beats.wav", samples))
+        assert depth_db is not None and depth_db >= 14.0
+        assert swings >= 6
+
+    def test_drone_clip_aggregates_shallow_with_zero_swings(self, tmp_path):
+        import numpy as np
+        from noise_warden.reclassify import envelope_depth_metrics
+        samples = np.sin(2 * np.pi * 60.0 * np.arange(self.SR * 16) / self.SR) * 0.3
+        depth_db, swings = envelope_depth_metrics(self._write(tmp_path, "drone.wav", samples))
+        assert depth_db is not None and depth_db < 6.0
+        assert swings == 0, "No deep windows → swing median must be 0"
+
+    def test_clip_shorter_than_one_window_returns_none(self, tmp_path):
+        import numpy as np
+        from noise_warden.reclassify import envelope_depth_metrics
+        samples = np.sin(2 * np.pi * 60.0 * np.arange(self.SR * 3) / self.SR) * 0.3
+        depth_db, swings = envelope_depth_metrics(self._write(tmp_path, "short.wav", samples))
+        assert depth_db is None and swings is None
+
+
+# ---------------------------------------------------------------------------
+# Denoiser OLA edge artifact (v21 bug fix)
+# ---------------------------------------------------------------------------
+
+class TestDenoiseEdgeArtifact:
+    """The overlap-add reconstruction must not amplify the file's edges.
+
+    Root cause of the "hard click at clip end" regression: in the final
+    fft_size - hop samples only one analysis window overlaps, its squared
+    Hann tail approaches zero, and dividing by that near-zero window_sum
+    amplifies spectral-subtraction residue into a burst — audible as a click
+    precisely because the tail was properly faded to silence beforehand
+    (observed on live incidents 9293/9294: ~0.001 faded tail, final ~2 ms
+    spiking to 0.13-0.18)."""
+
+    SR = 48000
+
+    def test_denoise_preserves_faded_quiet_tail(self, tmp_path):
+        import numpy as np
+        import soundfile as sf
+        from noise_warden.reclassify import denoise_snippet
+
+        rng = np.random.default_rng(3)
+        # 3 s of audible noise, then a 50 ms cosine fade to silence — the
+        # exact shape _trim_snippet_tail leaves behind.
+        samples = rng.normal(0.0, 0.1, self.SR * 3).astype(np.float32)
+        fade_len = int(self.SR * 0.05)
+        samples[-fade_len:] *= np.cos(np.linspace(0, np.pi / 2, fade_len)).astype(np.float32)
+
+        path = str(tmp_path / "faded.wav")
+        sf.write(path, samples, self.SR)
+
+        result = denoise_snippet(path)
+        assert result is not None and result["action"] == "denoised"
+
+        cleaned, _ = sf.read(path, dtype="float32")
+        # The final 5 ms were essentially silent going in (< 0.02 peak);
+        # they must stay silent coming out. The bug amplified them to > 0.1.
+        tail_peak = float(np.max(np.abs(cleaned[-int(self.SR * 0.005):])))
+        assert tail_peak < 0.02, (
+            f"Denoiser amplified the faded tail to {tail_peak:.3f} — OLA edge artifact"
+        )
+
+    def test_denoise_preserves_quiet_head(self, tmp_path):
+        import numpy as np
+        import soundfile as sf
+        from noise_warden.reclassify import denoise_snippet
+
+        rng = np.random.default_rng(4)
+        samples = rng.normal(0.0, 0.1, self.SR * 3).astype(np.float32)
+        fade_len = int(self.SR * 0.05)
+        samples[:fade_len] *= np.cos(np.linspace(np.pi / 2, 0, fade_len)).astype(np.float32)
+
+        path = str(tmp_path / "faded_head.wav")
+        sf.write(path, samples, self.SR)
+        assert denoise_snippet(path)["action"] == "denoised"
+
+        cleaned, _ = sf.read(path, dtype="float32")
+        head_peak = float(np.max(np.abs(cleaned[:int(self.SR * 0.005)])))
+        assert head_peak < 0.02, (
+            f"Denoiser amplified the quiet head to {head_peak:.3f} — OLA edge artifact"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sample-rate normalization in analyze_clip (v21 Group A, DECISIONS D15)
+# ---------------------------------------------------------------------------
+
+class TestAnalyzeClipRateNormalization:
+    """analyze_clip analyzes at min(file rate, configured rate) — DECISIONS
+    D15. Downsampling to the canonical rate is exact normalization; upsampling
+    is deliberately never done, because fabricating an empty top band crushes
+    spectral flatness and misfires the filter chain (measured: 44100 Hz
+    regression clips upsampled to 48000 classified rain as diesel+)."""
+
+    def _lowpassed_noise(self, sr, seconds=6, cutoff_hz=8000, seed=11):
+        """Broadband noise with no content above cutoff_hz, so the same signal
+        can be represented exactly at every rate involved."""
+        rng = np.random.default_rng(seed)
+        data = rng.normal(0.0, 0.2, sr * seconds)
+        spec = np.fft.rfft(data)
+        freqs = np.fft.rfftfreq(len(data), 1.0 / sr)
+        spec[freqs > cutoff_hz] = 0.0
+        return np.fft.irfft(spec, n=len(data)).astype(np.float32)
+
+    def test_higher_rate_file_downsampled_to_config_rate(self, tmp_path):
+        """The same content in a 96000 container and a 48000 container must
+        produce near-identical features under a 48000 config — the oversampled
+        file is normalized down to canonical."""
+        from noise_warden.dsp import resample_audio
+        target_sr = 48000
+        master = self._lowpassed_noise(target_sr)
+        path_48k = str(tmp_path / "content_48k.wav")
+        sf.write(path_48k, master, target_sr)
+        path_96k = str(tmp_path / "content_96k.wav")
+        sf.write(path_96k, resample_audio(master, target_sr, 96000), 96000)
+
+        audio_cfg = {"sample_rate": target_sr, "block_seconds": 1.0}
+        result_48k = analyze_clip(path_48k, _minimal_detection_cfg(), audio_cfg)
+        result_96k = analyze_clip(path_96k, _minimal_detection_cfg(), audio_cfg)
+
+        blocks_48k = result_48k["blocks"]
+        blocks_96k = result_96k["blocks"]
+        assert len(blocks_48k) == len(blocks_96k), (
+            "Block counts must match — both files hold the same seconds of audio"
+        )
+        for key in ("flatness", "lowband", "midband", "highband"):
+            med_48k = float(np.median([b[key] for b in blocks_48k]))
+            med_96k = float(np.median([b[key] for b in blocks_96k]))
+            assert med_96k == pytest.approx(med_48k, rel=0.05, abs=0.02), (
+                f"{key}: 96000-file median {med_96k:.4f} vs 48000-file {med_48k:.4f} "
+                f"— downsample normalization missing or broken"
+            )
+
+    def test_lower_rate_file_analyzed_at_native_rate(self, tmp_path):
+        """A sub-canonical file is analyzed at its own rate: features must
+        match a run where the config rate equals the file rate (i.e. no
+        upsampling-induced distortion is introduced by a higher config rate)."""
+        file_sr = 22050
+        master = self._lowpassed_noise(file_sr)
+        path_22k = str(tmp_path / "content_22k.wav")
+        sf.write(path_22k, master, file_sr)
+
+        result_under_48k_cfg = analyze_clip(
+            path_22k, _minimal_detection_cfg(), {"sample_rate": 48000, "block_seconds": 1.0})
+        result_under_native_cfg = analyze_clip(
+            path_22k, _minimal_detection_cfg(), {"sample_rate": file_sr, "block_seconds": 1.0})
+
+        for key in ("flatness", "lowband", "midband", "highband"):
+            a = float(np.median([b[key] for b in result_under_48k_cfg["blocks"]]))
+            b = float(np.median([b[key] for b in result_under_native_cfg["blocks"]]))
+            assert a == pytest.approx(b, rel=1e-6), (
+                f"{key}: sub-rate file was altered by a higher config rate "
+                f"({a:.4f} vs native {b:.4f}) — upsampling must never happen"
+            )

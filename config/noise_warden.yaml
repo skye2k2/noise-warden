@@ -46,6 +46,7 @@ detection:
   # Still training.
   song_gap_merge_sec: 12
   music_focus_gap_merge_sec: 45        # In continuous_music_focus mode only, the gap-merge window (seconds) before an active incident finalizes. Longer than song_gap_merge_sec because music dips below threshold between songs / during quiet passages / when a passing vehicle briefly masks the bass; a longer window keeps one nuisance session as a single incident instead of fragmenting it (and prevents a brief re-rise from being auto-dismissed as a separate drive-by). Other modes use song_gap_merge_sec.
+  music_focus_shield_min_music_sec: 2  # In continuous_music_focus mode only, the journal corroboration a SHORT incident (below min_incident_seconds) needs before its music-family classification shields it from too_short dismissal: at least this many journal-seconds must be music-classified. A single false-positive music_like block otherwise keeps a 3-second recording of nothing. 0 disables corroboration (v19 behavior: any music-family dominant shields unconditionally).
   min_music_like_score: 0.62
   engine_midband_veto: 0.40            # If midband_ratio (180-1200 Hz energy) exceeds this, classify as engine_noise rather than music_like. Engine/vehicle/aircraft noise concentrates in the midband; music has a scooped-mid "smiley EQ". Calibrated from 3 months of labeled data: confirmed music midband p75 ~0.22, engine sources routinely >0.40. Lower = more aggressive engine rejection (risks vetoing genuine music); raise toward 0.50 if real music is being misclassified.
   impulse_peak_delta_db: 14.0

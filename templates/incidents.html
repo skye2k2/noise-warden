@@ -49,7 +49,7 @@
       <td class="diag-col">{{ r.classification }}</td>
       <td>
         {% if r.snippet_path %}<button class="snippet-play-btn"
-          data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "classification": r.classification or "", "class_journal": r.class_journal or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
+          data-incident='{{ {"id": r.id, "start_ts": r.start_ts, "end_ts": r.end_ts or "", "duration_sec": r.duration_sec, "start_db": r.start_db, "peak_db": r.peak_db, "avg_db": r.avg_db, "threshold_db": r.threshold_db, "music_like_score": r.music_like_score, "envelope_depth_db": r.envelope_depth_db, "envelope_swings": r.envelope_swings, "classification": r.classification or "", "class_journal": r.class_journal or "", "mode": r.mode or "", "responded": r.responded|default(false, true), "notes": r.notes or "", "has_snippet": true}|tojson }}'
           title="Play audio snippet">&#9654;</button>{% endif %}
       </td>
       <td>

@@ -12,7 +12,7 @@ from .dsp import (
     identify_filter, music_like_score,
 )
 from .ordinance import applicable_threshold, is_night
-from .reclassify import analyze_clip, denoise_snippet, normalize_snippet, _compute_dominant
+from .reclassify import analyze_clip, denoise_snippet, envelope_depth_metrics, music_seconds, normalize_snippet, _compute_dominant
 from .response import RelayController, PlaylistPlayer
 from .ha import HAClient
 
@@ -439,6 +439,12 @@ class Engine:
             os.makedirs(snippets_dir, exist_ok=True)
             tmp = tempfile.NamedTemporaryFile(prefix=f"incident_{iid}_", suffix=".wav", dir=snippets_dir, delete=False)
             tmp.close()
+            # NamedTemporaryFile creates mode 0600, which made every recorded
+            # WAV unreadable to the noisewarden group (broke operator scp and
+            # the UI for non-owner readers; required manual chmod sweeps on the
+            # Pi). Snippets are evidence files, not secrets — match the 0664
+            # convention of the shared directory.
+            os.chmod(tmp.name, 0o664)
             self.active["tmp_wav"] = tmp.name
 
             # Open the WAV file once and keep the handle for the incident's lifetime.
@@ -680,6 +686,44 @@ class Engine:
         specifically filtering for music, so logging mower/birdsong adds noise."""
         return self.cfg["detection"]["mode"] != "continuous_music_focus"
 
+    def _excluded_refresh_allowed(self):
+        """Decide whether an excluded-class (filter-caught) block may refresh
+        the active incident's last_above, and account for it.
+
+        In continuous_music_focus mode, excluded blocks may only extend an
+        incident for one gap-merge window of consecutive excluded time; past
+        that, last_above goes stale so the gap-timeout can close the incident.
+        Without this cutoff, a single music_like block on a windy night held a
+        recording open to the 2-hour cap (incident 9025). Any block that
+        refreshes through the normal music path resets the run by zeroing
+        active["excluded_run_sec"]. Other modes refresh unconditionally — an
+        incident there legitimately tracks any above-threshold noise.
+        """
+        if self.cfg["detection"]["mode"] != "continuous_music_focus":
+            return True
+        block_sec = float(self.cfg["audio"].get("block_seconds", 1.0))
+        run_sec = float(self.active.get("excluded_run_sec", 0.0)) + block_sec
+        self.active["excluded_run_sec"] = run_sec
+        return run_sec <= self._gap_merge_sec()
+
+    def _maybe_finalize_stale_active(self):
+        """Finalize the active incident if last_above is older than the
+        gap-merge window. Returns True when a finalize happened.
+
+        The below-threshold branch has always performed this check; the
+        above-threshold branches need it too, because in music-focus mode a
+        sustained excluded or unknown-class sound keeps dB above threshold
+        forever and the below-threshold branch is never reached (incidents
+        9025/9164 ran to their caps this way).
+        """
+        if not self.active:
+            return False
+        gap = (datetime.now().astimezone() - self.active["last_above"]).total_seconds()
+        if gap >= self._gap_merge_sec():
+            self._finalize_incident()
+            return True
+        return False
+
     def _gap_merge_sec(self):
         """Effective gap-merge window (seconds) before an active incident finalizes.
 
@@ -896,6 +940,8 @@ class Engine:
         journal_json = json.dumps(live_journal) if live_journal else None
         updated_class = None
         music_like = None
+        env_depth = None
+        env_swings = None
         if snippet_path and os.path.exists(snippet_path):
             try:
                 clip = analyze_clip(
@@ -909,6 +955,14 @@ class Engine:
                 print(f"[engine] analyze_clip keystone failed for incident "
                       f"{self.active['id']}: {exc}; falling back to live journal")
                 updated_class = _compute_dominant(live_journal, dur) if live_journal else None
+            # D13 envelope metrics (display-only in v21). Isolated from the
+            # keystone so a metrics failure can never cost a classification,
+            # and vice versa.
+            try:
+                env_depth, env_swings = envelope_depth_metrics(snippet_path)
+            except Exception as exc:
+                print(f"[engine] envelope metrics failed for incident "
+                      f"{self.active['id']}: {exc}")
         elif live_journal:
             updated_class = _compute_dominant(live_journal, dur)
 
@@ -921,6 +975,8 @@ class Engine:
             class_journal=journal_json,
             classification=updated_class,
             music_like_score=music_like,
+            envelope_depth_db=env_depth,
+            envelope_swings=env_swings,
         )
         self.ha.publish_event({"type": "incident_end", "id": self.active["id"], "duration_sec": dur})
 
@@ -951,8 +1007,30 @@ class Engine:
         _MUSIC_CLASSES = {"amplified_bass", "music", "music_like"}
         min_sec = int(self.cfg["audio"].get("min_incident_seconds", 20))
         active_dur = max(1, round((self.active["last_above"] - self.active["start"]).total_seconds()))
+
+        # v21 corroboration: a music-family dominant classification alone is not
+        # enough to shield a short incident — the journal must contain at least
+        # music_focus_shield_min_music_sec of music-classified time. A single
+        # false-positive music_like block otherwise keeps a 3-second recording
+        # of nothing (production incidents 9016/9017). 0 disables the check,
+        # restoring the unconditional v19 shield. Clamped at the use site per
+        # DECISIONS D10 (negative values make no sense as a duration floor).
+        shield_ok = True
+        if not force and music_focus and updated_class and active_dur < min_sec:
+            is_music = any(updated_class.startswith(mc) for mc in _MUSIC_CLASSES)
+            shield_min = max(0, int(self.cfg["detection"].get(
+                "music_focus_shield_min_music_sec", 2)))
+            if is_music and shield_min > 0:
+                try:
+                    journal_entries = json.loads(journal_json) if journal_json else []
+                except (TypeError, ValueError):
+                    journal_entries = []
+                if music_seconds(journal_entries, dur) < shield_min:
+                    shield_ok = False
+
         if (not force and music_focus and updated_class
-                and not any(updated_class.startswith(mc) for mc in _MUSIC_CLASSES)
+                and (not any(updated_class.startswith(mc) for mc in _MUSIC_CLASSES)
+                     or not shield_ok)
                 and active_dur < min_sec):
             quarantine_path = None
             if snippet_path and os.path.exists(snippet_path):
@@ -968,7 +1046,13 @@ class Engine:
                     "UPDATE incidents SET classification=?, excluded=1, snippet_path=? WHERE id=?",
                     (updated_class or "too_short", quarantine_path if snippet_path and quarantine_path and os.path.exists(quarantine_path) else None, incident_id),
                 )
-            print(f"[engine] Music-focus auto-dismissed incident {incident_id} as non-music "
+            # shield_ok is only False for a music-family classification that
+            # failed journal corroboration — name the reason accordingly.
+            if shield_ok:
+                reason = "as non-music"
+            else:
+                reason = "as uncorroborated music"
+            print(f"[engine] Music-focus auto-dismissed incident {incident_id} {reason} "
                   f"({updated_class}, {active_dur}s active < {min_sec}s minimum)")
             dismissed = True
 
@@ -1391,12 +1475,19 @@ class Engine:
                             else:
                                 self.active["dbs"].append(db_now)
                                 self.active["last_above"] = datetime.now().astimezone()
+                                # A genuine (music-path) refresh ends any run of
+                                # consecutive excluded blocks — see _excluded_refresh_allowed.
+                                self.active["excluded_run_sec"] = 0.0
                                 self._append_audio(block)
                         else:
                             # Music-focus mode and not music — don't create incident
                             if self.active:
                                 self.active["dbs"].append(db_now)
                                 self._append_audio(block)
+                                # No refresh happens here, so a sustained unknown-class
+                                # sound must not hold the incident open past the
+                                # gap-merge window (incident 9164 ran 101 minutes).
+                                self._maybe_finalize_stale_active()
                     else:
                         # Filter caught this sound — but noise IS still present above threshold.
                         if self.active:
@@ -1404,8 +1495,13 @@ class Engine:
                             # Refresh last_above: the mic is hearing continuous above-threshold
                             # noise even though the source changed. Without this, the incident
                             # zombie-timeouts despite ongoing noise just because a filter matched.
-                            self.active["last_above"] = datetime.now().astimezone()
+                            # HOWEVER, comma — in music-focus mode the refresh allowance runs
+                            # out after one gap-merge window of consecutive excluded blocks,
+                            # after which the stale check below closes the incident.
+                            if self._excluded_refresh_allowed():
+                                self.active["last_above"] = datetime.now().astimezone()
                             self._append_audio(block)
+                            self._maybe_finalize_stale_active()
                             # Journal already captures the classification transition (logged above).
                             # Don't log a separate excluded incident — would double-count.
                         else:

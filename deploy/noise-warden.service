@@ -11,10 +11,17 @@ StartLimitBurst=5
 Type=simple
 User=noisewarden
 Group=noisewarden
-# Without this, the noisewarden system user inherits systemd's default umask, and soundfile.write() creates WAVs as 600 (owner-only). With UMask=0022, files created will be 644 — readable by any user on the Pi.
+# Default umask for ordinary file creation (644). NOTE: this never applied to
+# the incident WAVs — tempfile.NamedTemporaryFile hardcodes mode 0600 and
+# ignores umask, which left every recording group-unreadable until v21 added
+# an explicit chmod at creation (engine._begin_incident).
 UMask=0022
 WorkingDirectory=/opt/noise-warden/current
 Environment=NOISE_WARDEN_CONFIG=/opt/noise-warden/current/config/noise_warden.yaml
+# Unbuffered stdout: engine print() output is otherwise block-buffered to
+# journald, and log lines lagged DAYS behind the events they describe
+# (DECISIONS D15: the Sep 19-23 2026 buffer flushed in one burst).
+Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/bin/sh -c 'test -d /opt/noise-warden/current/noise_warden || (echo "ERROR: /opt/noise-warden/current does not resolve to a valid project directory. Re-run install_pi.sh." && exit 1)'
 ExecStartPre=/bin/sh -c 'test -f /opt/noise-warden/tls/cert.pem || (echo "ERROR: TLS certificate not found at /opt/noise-warden/tls/cert.pem. Re-run install_pi.sh." && exit 1)'
 ExecStart=/opt/noise-warden/venv/bin/uvicorn noise_warden.main:app --host 0.0.0.0 --port 8787 --ssl-certfile /opt/noise-warden/tls/cert.pem --ssl-keyfile /opt/noise-warden/tls/key.pem

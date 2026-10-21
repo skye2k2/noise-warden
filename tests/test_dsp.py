@@ -2162,3 +2162,48 @@ class TestFilterDetectionLatency:
     def test_config_override_wind(self):
         custom = {"wind_min_history": 8}
         assert get_filter_detection_latency("wind", custom) == 8
+
+
+# ---------------------------------------------------------------------------
+# Envelope depth + swing metrics (v21, DECISIONS D13)
+# ---------------------------------------------------------------------------
+
+class TestEnvelopeWindowMetrics:
+    """The D13 visual-signature metric, per analysis window: through-wall
+    music shows deep (15-25 dB) envelope troughs alternating at ~1 Hz on the
+    rendered waveform, while machine duty-cycle noise averages flat. The pure
+    per-window function lives in dsp; the streaming per-clip aggregator lives
+    in reclassify (file I/O stays out of this module)."""
+
+    SR = 22050
+
+    def _beat_window(self, seconds=8):
+        """150 ms bursts of 60 Hz sine at 1 Hz over a near-silent floor —
+        the idealized rendered-waveform signature of through-wall bass music."""
+        total = np.random.default_rng(42).normal(0.0, 0.002, self.SR * seconds)
+        tone = np.sin(2 * np.pi * 60.0 * np.arange(int(self.SR * 0.15)) / self.SR) * 0.6
+        for second in range(seconds):
+            start = second * self.SR
+            total[start:start + len(tone)] += tone
+        return total.astype(np.float32)
+
+    def _drone_window(self, seconds=8):
+        """Constant-amplitude 60 Hz drone — machine-like, no envelope depth."""
+        return (np.sin(2 * np.pi * 60.0 * np.arange(self.SR * seconds) / self.SR) * 0.3
+                ).astype(np.float32)
+
+    def test_beat_window_is_deep_with_frequent_swings(self):
+        from noise_warden.dsp import envelope_window_metrics
+        depth_db, swings = envelope_window_metrics(self._beat_window(), self.SR)
+        assert depth_db >= 14.0, f"Beat train should measure deep, got {depth_db}"
+        assert swings >= 6, f"Beat train should alternate frequently, got {swings}"
+
+    def test_drone_window_is_shallow(self):
+        from noise_warden.dsp import envelope_window_metrics
+        depth_db, swings = envelope_window_metrics(self._drone_window(), self.SR)
+        assert depth_db < 6.0, f"Steady drone should measure shallow, got {depth_db}"
+
+    def test_window_too_short_returns_none(self):
+        from noise_warden.dsp import envelope_window_metrics
+        result = envelope_window_metrics(self._drone_window(seconds=1), self.SR)
+        assert result == (None, None)
