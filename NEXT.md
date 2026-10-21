@@ -17,17 +17,11 @@ Findings behind these items are recorded in CHANGELOG v20 and DECISIONS D1 (adde
 
 ---
 
-## Priority 1 — Data migration after v17 (do before trusting the dashboard)
+## Priority 1 — Historical reclassify migration: BLOCKED on classifier quality (measured 2026-10-21) — unblock via Priority 4
 
-**Run `reclassify --update` against the production database to migrate historical rows to the v17 logic.** The v17 changes (beat removal collapsing `music`→`music_like`, the tightened midband veto, body-median `music_like_score` replacing the first-block snapshot) only affect *new* incidents at finalize. Existing rows keep their old classifications/scores until reprocessed.
+**The v21 dry run failed its ground-truth review; do not run `reclassify --update` until the per-type recalibration (Priority 4) lands.** The dry run proposed changes to 253 of 326 kept incidents. Aggregate transitions looked plausible (69 flyover→music-family, 35 flyover→wind), but cross-checking the 111 hand-tagged incidents among them found **35 flips contradicting ground truth** in both directions: genuine planes/helicopters reclassified as `amplified_bass`/`music_like` (the flyover mscore guard evicts them and the music scorer claims them), and confirmed IDIOT music reclassified as `wind`/`diesel` (flyover releases it but wind wins instead of music). Swapping one ~30%-wrong labeling for a different ~30%-wrong labeling would mutate evidence rows without improving dashboard trust. Dry-run procedure and caveats remain valid (copy/backup first — `shared/noise_warden.pre-v21-migration.db` exists on the Pi and in `local_data/` — and `reclassify --all` is a safe read-only preview; the batch is resilient to unreadable WAVs as of v21.1).
 
-<details>
-
-- **Justification:** Without this, the dashboard shows a mix of old- and new-logic classifications, which is confusing and undermines the trust the infraction-first redesign was meant to build.
-- **Caution:** This is a bulk mutation of thousands of rows. Run it against a **copy** first and eyeball the diff (`reclassify --all` dry-run shows what would change). Confirm the diff is sane before `--update` on the real DB.
-- **Note:** `reclassify --repair-snippet-paths` may be needed first if working from a database copied off the Pi (see DECISIONS D6).
-
-</details>
+**Operational note (2026-10-21):** the baked-in denoiser edge clicks were repaired across both stores with a detect-then-zero+fade pass over clip tails — local backup: 1,375 of 1,740 clips repaired; Pi: 721 of 1,078 (the engine's live recording skipped; post-v21 recordings don't develop the artifact). Zero residual detections afterward on either store.
 
 ## Priority 2 — Sample-rate normalization: DONE in v21 (min-rule); remaining piece folded into Priority 4
 
