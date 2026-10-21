@@ -24,7 +24,7 @@ audio:
   denoise_percentile: 10              # Percentile for per-bin noise floor estimation (0–100). Lower = more conservative (removes less). The Nth percentile of each frequency bin's magnitude across all STFT frames is treated as stationary noise. 10 catches steady hiss while preserving transient events (speech, music, bangs). Raise to 15–20 for noisier environments; lower to 5 for minimal denoising.
   denoise_alpha: 1.0                  # Oversubtraction factor. 1.0 = subtract exactly the estimated noise floor. Values > 1.0 subtract more aggressively (cleaner but risks removing quiet signal content). Values < 1.0 subtract less (preserves more signal but leaves some hiss). Range 0.5–2.0 is practical; 1.0 is a safe default.
   denoise_beta: 0.04                  # Spectral floor as a fraction of original magnitude (0.0–1.0). Prevents complete zeroing of frequency bins, which causes "musical noise" — annoying tinkly/watery artifacts from phase-only reconstruction. 0.02 is the code default; 0.04 is slightly more conservative for the attic environment. Raise to 0.05 if you hear artifacts.
-  retention_days: 30                  # IF auto_purge_enabled, how many days to keep snippets and incidents before auto-deletion.
+  retention_days: 90                  # IF auto_purge_enabled, how many days to keep snippets and incidents before auto-deletion.
   auto_purge_enabled: false           # Set to true to automatically delete snippets and incidents older than retention_days.
 
 detection:
@@ -201,6 +201,7 @@ detection:
   flyover_highband_max: 0.60          # Separates from escaped mower blocks (highband 0.56–0.82)
   flyover_env_std_max: 8.0            # Allows approach/departure amplitude arc — real plane median 2.7
   flyover_min_history: 4              # Short — flyovers are transient (user reports max ~45 seconds)
+  flyover_max_music_score: 0.55       # Reject blocks with high music-like scores. Through-wall bass music lands inside flyover's spectral ranges and was consistently misclassified. Real flyovers: mscore median 0.26–0.57. Confirmed IDIOT music: mscore median 0.62–0.73. The 0.55 ceiling provides clean separation. Matches the guard pattern on rain/wind/mower.
   # Conversation targeting: mid-frequency speech with syllable-level amplitude modulation.
   # Broadest catch — checked last in filter priority order. Not yet battle-tested.
   conversation_centroid_min_hz: 500

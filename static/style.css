@@ -230,6 +230,17 @@ textarea {
   color: var(--text-muted);
 }
 
+/* Retention-policy warning under the destructive incident buttons. Amber accent reads as
+   "caution" in both themes without shouting like the red .destructive buttons above it. */
+.warning-note {
+  border-left: 3px solid #e6a23c;
+  padding: 8px 12px;
+  margin: 12px 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-card);
+}
+
 .pill {
   display: inline-block;
   margin: 4px;

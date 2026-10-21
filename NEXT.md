@@ -2,6 +2,16 @@
 
 Remaining work only. Completed items live in the [CHANGELOG](docs/CHANGELOG.md); the rationale behind rejected approaches lives in [docs/DECISIONS.md](docs/DECISIONS.md). This file was consolidated from the former `NEXT.md` (stability analysis, v15/16) and `NEXT_RELEASE.md` (v17 planning) once their completed and rejected items had been recorded elsewhere.
 
+## NEW Items needing prioritization
+
+Findings behind these items are recorded in CHANGELOG v20 and DECISIONS D1 (addendum), D13, and D14 — this list is the remaining work only. Current code (v20) is deployed at https://pi.lan:8787/incidents.
+
+- **Engine fix: music-shield corroboration.** A single false-positive `music_like` block spawns an incident that the D5 shield then exempts from the `too_short` check when finalize still calls it music-ish (engine.py ~line 954; e.g. incidents 9016/9017 — 3-second keepers). Require corroboration (≥2 music-classified journal blocks, or a minimum active duration) before the shield applies.
+- **Engine fix: excluded-class continuation cutoff.** Excluded-class blocks refresh `last_above` on an active incident, so one music block on a windy night records wind to the 2-hour cap (incident 9025). In music-focus mode, stop refreshing after roughly a gap-merge window of consecutive excluded blocks so the normal gap-close finalizes the incident.
+- **Candidate feature: depth + swing-rate music confirmer (DECISIONS D13).** Per-window envelope depth with ~1 Hz alternation, computed at finalize — protects deep-and-alternating incidents from non-music auto-dismiss and flags shallow high-duty "music" as suspect machine noise.
+- **Optional audio cleanliness pass (DECISIONS D14).** High-pass before normalization and/or a normalization gain cap, if harsh playback on bass-heavy clips is worth addressing.
+- **Mine the purged-but-backed-up excluded corpus** (after Priorities 1–2). The July backup under `local_data/` is the only copy of 7,521 hard-deleted excluded rows; 820 have `music_like_score ≥ 0.62` (153 classified `flyover` — the pre-guard misclassification pattern). Reclassifying that cohort with the v20 guard quantifies how much real signal auto-dismiss removed.
+
 **Status at consolidation (2026-06-11):** v17 is feature-complete (beat removal, finalize keystone + parity, body-windowed metrics, engine midband veto, infraction-first UI, mode-aware auto-dismiss, music-focus gap merge, portable snippet paths, version display). v18 stabilized sample-rate negotiation and the `_compute_dominant` lead-in leak. v19 eliminated the OOM crash pattern via streaming WAV finalization, raised `min_incident_seconds` to 20, reduced `max_incident_record_hours` to 2, added drive-by sticky threshold, cosine fade-out on trimmed endings, preroll warmup guard, and music-focus auto-dismiss refinement for reclassified-as-non-music short incidents. The items below are what still remains.
 
 ---
@@ -32,6 +42,7 @@ Remaining work only. Completed items live in the [CHANGELOG](docs/CHANGELOG.md);
   4. Re-evaluate `holdover_priority_breakers` in the local config — `flyover` was removed as a breaker because it false-positived on storm-rain at 44100 Hz; that may change at 22050 Hz.
 - ~9 of 15 clips change classification when resampled, so this is a dedicated session, not a drive-by edit. Estimated ~2 hours.
 - Related README TODO: "Make sure the system functions the same with 48 kHz sampling and recording" — same root cause, same fix.
+- **Flyover filter accuracy is sample-rate-dependent.** v19 added a `flyover_max_music_score: 0.55` guard after analysis of production data showed 8 out of 8 confirmed IDIOT music incidents were misclassified as `flyover (multiple)`. The flyover filter's broad spectral thresholds (centroid 1400–12000, flatness 0.15–0.55) overlap heavily with through-wall bass music. The mscore guard provides clean separation using real-world data (real flyovers: mscore 0.26–0.57, IDIOT music: 0.62–0.73). HOWEVER, comma, this introduced a regression in the `plane-flyover.wav` regression clip (44100 Hz, mscore median 0.61 at that rate) — the clip now classifies as `wind (multiple)` instead of `flyover (multiple)`. After sample-rate normalization to 22050 Hz the mscore will likely drop and the classification may revert. The 10 user-tagged genuine flyovers are ironically classified as wind, thunder, diesel, or amplified_bass — not flyover — further evidence that the flyover filter's thresholds need comprehensive recalibration at the canonical sample rate. Real single-prop flyovers from the nearby airport take about a minute and have waveform shapes distinctly different from amplified music.
 
 </details>
 

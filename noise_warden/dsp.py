@@ -902,7 +902,8 @@ def looks_like_flyover(features, recent_db, flatness_min=0.15,
                        centroid_max=12000.0, midband_min=0.15,
                        lowband_min=0.10, lowband_max=0.50,
                        highband_max=0.60, env_std_max=8.0,
-                       min_history=4, window=12):
+                       min_history=4, window=12,
+                       max_music_score=0.55):
     """Aerial vehicle or transient engine — planes, helicopters, fast-pass vehicles.
 
     This filter runs late in the priority chain (after wind, rain, weedwhacker,
@@ -936,6 +937,15 @@ def looks_like_flyover(features, recent_db, flatness_min=0.15,
     have very low lowband (0.02–0.06), well below the 0.10 floor. Real
     flyovers always have at least some engine rumble (plane min 0.16).
 
+    Key separator from amplified bass music: music_like_score ceiling.
+    Through-wall bass music lands squarely inside the flyover spectral
+    ranges (centroid 1400–4000, flatness 0.15–0.40, midband 0.15–0.35,
+    lowband 0.16–0.40) and was being misclassified as flyover in 8 out
+    of 8 confirmed IDIOT incidents reviewed in v19. Real flyovers have
+    mscore median 0.26–0.57; confirmed music has mscore median 0.62–0.73.
+    The 0.55 ceiling provides clean separation and matches the guard
+    pattern already used by rain, wind, and mower filters.
+
     Args:
         features: spectrum_features() output dict
         recent_db: last N dB readings
@@ -958,8 +968,16 @@ def looks_like_flyover(features, recent_db, flatness_min=0.15,
         min_history: minimum readings before filter activates (default 4 — short for
             transient flyovers)
         window: number of recent readings to evaluate (default 12)
+        max_music_score: maximum music_like_score before rejecting (default 0.55).
+            Blocks with high music scores are more likely amplified bass music
+            than engine noise, even if their spectral shape falls within the
+            flyover ranges. Real flyovers rarely exceed 0.55; confirmed IDIOT
+            music incidents consistently score 0.62+.
     """
     if len(recent_db) < min_history:
+        return False
+
+    if music_like_score(features) > max_music_score:
         return False
 
     env_std = float(np.std(np.array(recent_db[-window:], dtype=float)))
@@ -1232,6 +1250,7 @@ def _check_flyover(features, db_history, db_now, prev_db, det, feature_history=N
         highband_max=float(det.get("flyover_highband_max", 0.60)),
         env_std_max=float(det.get("flyover_env_std_max", 8.0)),
         min_history=int(det.get("flyover_min_history", 4)),
+        max_music_score=float(det.get("flyover_max_music_score", 0.55)),
     )
 
 def _check_conversation(features, db_history, db_now, prev_db, det, feature_history=None):

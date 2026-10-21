@@ -85,6 +85,14 @@
       <button  class="destructive">Clear All Incidents</button>
     </form>
   </p>
+  <div class="warning-note">
+    {% if auto_purge_enabled %}
+    ⚠️ Auto-purge is <strong>enabled</strong>: incidents and audio older than <strong>{{ retention_days }} days</strong> are deleted automatically and permanently.
+    {% else %}
+    ⚠️ Auto-purge is <strong>disabled</strong> — nothing is deleted automatically (retention is set to {{ retention_days }} days if it is ever enabled).
+    {% endif %}
+    The Clear buttons above hard-delete database rows and their WAV files immediately; there is no undo. Back up <code>shared/noise_warden.db</code> and <code>shared/snippets/</code> before clearing.
+  </div>
   {% if not rows %}
   <p>
     <form method="post" action="/incidents/seed" onsubmit="return confirm('Seed the database from classification_data WAV files?')">

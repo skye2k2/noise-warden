@@ -1736,10 +1736,16 @@ class TestLooksLikeWind:
 class TestLooksLikeFlyover:
     """Flyover: aerial/transient vehicle engine sounds."""
 
-    # Real plane flyover profile (median values from plane-flyover.wav)
+    # Real plane flyover profile (adjusted from plane-flyover.wav medians).
+    # lowband reduced from 0.28 to 0.20 because the test clip is at 44100 Hz
+    # (spectral features shift with sample rate); real flyovers at 22050 Hz
+    # show lower bass. envelope_cv and harmonic_ratio included to produce a
+    # realistic mscore (~0.52) that stays below the flyover_max_music_score
+    # guard (0.55). User-tagged flyovers: mscore median 0.26–0.57.
     PLANE_FEATS = {
-        "flatness": 0.39, "centroid_hz": 4500, "lowband_ratio": 0.28,
+        "flatness": 0.39, "centroid_hz": 4500, "lowband_ratio": 0.20,
         "midband_ratio": 0.31, "highband_ratio": 0.40,
+        "envelope_cv": 0.08, "harmonic_ratio": 0.15,
     }
     # Real engine speed profile (core blocks from engine-speed-launch.wav)
     ENGINE_FEATS = {
@@ -1788,6 +1794,28 @@ class TestLooksLikeFlyover:
         """Wildly erratic amplitude (conversation-level) is not flyover."""
         wild_db = [40.0, 90.0, 40.0, 90.0, 40.0, 90.0, 40.0, 90.0, 40.0, 90.0, 40.0, 90.0]
         assert looks_like_flyover(self.PLANE_FEATS, wild_db) is False
+
+    def test_high_mscore_rejected(self):
+        """Blocks with high music_like_score should fail the flyover filter.
+        Through-wall bass music has spectral ranges that overlap flyover but
+        consistently higher mscore (median 0.62–0.73 vs flyover 0.26–0.57)."""
+        musical_feats = {**self.PLANE_FEATS, "lowband_ratio": 0.35,
+                         "envelope_cv": 0.25, "harmonic_ratio": 0.55}
+        assert looks_like_flyover(musical_feats, self.STABLE_DB) is False
+
+    def test_low_mscore_accepted(self):
+        """Blocks with low music_like_score pass the flyover filter normally."""
+        assert looks_like_flyover(self.PLANE_FEATS, self.STABLE_DB) is True
+
+    def test_mscore_guard_configurable(self):
+        """The mscore ceiling is configurable via max_music_score."""
+        musical_feats = {**self.PLANE_FEATS, "lowband_ratio": 0.35,
+                         "envelope_cv": 0.25, "harmonic_ratio": 0.55}
+        # Rejected at default 0.55
+        assert looks_like_flyover(musical_feats, self.STABLE_DB) is False
+        # Accepted with a permissive ceiling
+        assert looks_like_flyover(musical_feats, self.STABLE_DB,
+                                  max_music_score=0.90) is True
 
 
 # ===========================================================================

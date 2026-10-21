@@ -1207,7 +1207,7 @@ class Engine:
             print(f"[engine] Orphan cleanup error: {e}")
 
         # Run snippet cleanup at engine startup (only if auto-purge is explicitly enabled)
-        retention_days = int(self.cfg["audio"].get("retention_days", 30))
+        retention_days = int(self.cfg["audio"].get("retention_days", 90))
         auto_purge = bool(self.cfg["audio"].get("auto_purge_enabled", False))
         if auto_purge:
             try:

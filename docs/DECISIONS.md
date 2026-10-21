@@ -48,6 +48,8 @@ The [CHANGELOG](CHANGELOG.md) records *what* changed and *when*. This file recor
 
 **Consequence:** A displayed number that is wrong most of the time is worse than no number. The spectral `music_like_score` (bass + tonal balance + harmonic structure) is retained as a *tentative* hint, paired with an engine/midband veto. A genuine music classifier, if ever pursued, must be spectral/harmonic and trained on labeled data — **not** rhythm-based, because the dominant false positives in this environment are themselves periodic machines.
 
+**Addendum (2026-10-21) — re-tested with a corrected implementation; the rhythm-timing conclusion stands, but see D13 for what the eye actually measures.** An audit of the removed v16 code found a real flaw: on 1-second blocks, `intra_block_beat_confidence`'s `max_lag = n_frames//2` capped detection at 120 BPM, so the shipped detector only ever saw 120–180 BPM with at most two beat periods per window — the 40–140 BPM "heavy beat" band the operator kept pointing at was mostly below its floor, and broadband noise scored a 0.50 baseline. A corrected detector (8-second windows, 50 Hz low-band onset envelope, 40–140 BPM autocorrelation with baseline subtraction and harmonic support, per-window scoring so lead-ins/tails cannot dilute) was run over the full labeled corpus (124 confirmed-music, 57 machine, 25 nature clips; 9,393 windows): **machines still out-score music at every threshold** (windows above 0.2: machines 38.7% vs music 9.9%). Prop-plane amplitude modulation genuinely lands in the musical tempo band, so onset-timing coherence remains a *machine* indicator, not a music indicator. HOWEVER, comma — the operator's "I can identify it instantly from the waveform" claim was NOT thereby refuted: the rendered waveform exposes modulation *depth*, not timing coherence, and depth does separate. See D13.
+
 </details>
 
 ## D2. Infraction-first, not classification-first
@@ -175,5 +177,35 @@ This is why the CHANGELOG's "Testing Resources" section warns, in capital letter
 **Why:** The music-focus gate in the engine run loop creates incidents only when a block classifies as `music_like` in real-time. But the `analyze_clip` keystone at finalization reclassifies the stored WAV end-to-end — and the dominant classification across all blocks may be something else (flyover, impulse, engine_noise). Without this refinement, a single `music_like` block that triggers an incident but gets reclassified as flyover slips through the safety net. The D5 rationale still holds for incidents that ARE music: a short `music_like` burst is a legitimate detection. But a short `flyover` in music-focus mode is noise, not signal.
 
 **Example (incident #8416):** A 13-second incident started because one block scored `music_like`, but `analyze_clip` reclassified it as `flyover (multiple)` (music_like_score=0.84 but spectral profile dominated by flyover across blocks). Under v17 rules it survived. Under v19 it would be auto-dismissed as a non-music transient.
+
+</details>
+
+## D13. Envelope modulation depth — not beat timing — is what visually separates music from machines
+
+**Decision:** The feature that reproduces the operator's at-a-glance waveform identification of music is **peak-to-trough envelope contrast at the display timescale** (RMS per ~250 ms frame, in dB), optionally paired with the alternation rate of that envelope. Any future music-confirmation feature should be built on depth + swing rate, not onset timing (D1) and not spectral shape alone.
+
+<details>
+
+**Why:** The incidents-page waveform renders one RMS bucket per pixel (~200–400 ms per column on typical clips), normalized to the clip's own max. At that timescale, through-wall music shows alternating tall/short bars because the envelope falls 15–25 dB into real troughs between beats, while plane/helicopter modulation (roughly 10–80 Hz) averages flat inside every bucket — the signal never gets time to drop before the next cycle pushes it back up. The operator's eye was measuring dynamic contrast; the failed rhythm detectors (D1) were measuring timing coherence. Both results are true simultaneously: music through walls loses its onset *timing* at the microphone but keeps its *dynamics*; machines are the opposite — coherent timing, near-zero dynamics.
+
+**Validation (2026-10-21, labeled corpus: 124 confirmed-music / 57 machine / 25 nature clips).** Per-clip p90 of per-8s-window depth (p90 − p10 of the 250 ms RMS envelope in dB):
+
+- Music: median 16.4 dB (p10 = 10.6 dB). Machines: median 9.7 dB (p90 = 14.7 dB). Music's 10th percentile sits above machines' median.
+- Threshold sweep: depth ≥ 14 dB captures 72.6% of music clips vs 15.8% of machine clips; ≥ 16 dB captures 54.8% vs 7.0%.
+- The lowest-depth "music" clips are label noise — incidents tagged with the neighbor's name but recording his *truck* (1.5–8 dB, duty ≈ 1.0) — so true separation is better than the raw numbers.
+- Thunder and other impulses are deep (up to 35 dB) but are distinguished by **swing rate**: in deep windows, music's envelope crosses its midline a median 8 times per 8 s (the ~1 Hz tall-short-tall bar alternation), machines 3, nature/thunder 4. Deep AND frequently-alternating ≈ music; deep-but-single-excursion ≈ impulse/thunder; shallow ≈ machine duty-cycle noise.
+- Most top-depth confirmed-music clips were classified `flyover (multiple)` by the pre-v20 pipeline — the exact misclassification pattern the `flyover_max_music_score` guard addresses — meaning a depth feature would have caught them independently.
+
+**Consequence:** A candidate engine feature exists (NEXT.md) to compute per-window depth + swing rate at finalize as a music *confirmer* — e.g. to protect deep-and-alternating incidents from non-music auto-dismiss and to flag shallow high-duty "music" detections as suspect machines. Analysis scripts are untracked scratch (`.TMP_depth_analysis.py`, regenerable); the numbers above are the durable record.
+
+</details>
+
+## D14. "Blown-out" bass audio is normalization boost, not capture clipping — do not buy a pop filter
+
+**Decision:** The harsh/overloaded sound on bass-heavy recordings is **not** microphone or ADC overload, and no physical mic accessory (pop filter, foam) will change it. If cleaner playback audio is wanted, the levers are digital: a 20–30 Hz high-pass before snippet normalization, and/or a cap on normalization gain (e.g. max +30 dB).
+
+<details>
+
+**Why:** A flat-top scan over all 210 labeled corpus clips (scale-independent: runs of ≥4 samples pinned at the file's own extremes, since normalization rescales any original clipping away from digital full scale; detector validated against a synthetically clipped sine before trusting the clean result) found a worst case of 0.003% pinned samples — in a thunder clip, whose waveform is naturally near-square at the crack. Raw captures peak at −30 to −50 dBFS (documented in the config), so there is 30+ dB of digital headroom at capture; overload is physically implausible at the ~80–85 dB SPL peaks these incidents record. What the ear hears is `snippet_normalize` boosting recordings 25–45 dB to the −6 dBFS target, which raises structure-borne low-frequency rumble and the noise floor along with the signal.
 
 </details>

@@ -131,6 +131,10 @@ def incidents(request: Request, page: int = 1, show: str = ""):
         "excluded_classifications": EXCLUDED_CLASSIFICATIONS,
         "active_filters": show_classifications or [],
         "show_param": show,
+        # Retention policy surfaced in the warning block under the destructive buttons,
+        # so the operator never again has to guess what is (or is not) auto-deleting data.
+        "retention_days": int(cfg["audio"].get("retention_days", 90)),
+        "auto_purge_enabled": bool(cfg["audio"].get("auto_purge_enabled", False)),
     })
 
 @app.post("/incidents/{incident_id}/notes")
