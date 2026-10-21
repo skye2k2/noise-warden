@@ -209,3 +209,15 @@ This is why the CHANGELOG's "Testing Resources" section warns, in capital letter
 **Why:** A flat-top scan over all 210 labeled corpus clips (scale-independent: runs of ≥4 samples pinned at the file's own extremes, since normalization rescales any original clipping away from digital full scale; detector validated against a synthetically clipped sine before trusting the clean result) found a worst case of 0.003% pinned samples — in a thunder clip, whose waveform is naturally near-square at the crack. Raw captures peak at −30 to −50 dBFS (documented in the config), so there is 30+ dB of digital headroom at capture; overload is physically implausible at the ~80–85 dB SPL peaks these incidents record. What the ear hears is `snippet_normalize` boosting recordings 25–45 dB to the −6 dBFS target, which raises structure-borne low-frequency rumble and the noise floor along with the signal.
 
 </details>
+
+## D15. The canonical sample rate is 48000 Hz — the deployment never actually ran at 22050
+
+**Decision:** The attic deployment's config sets `sample_rate: 48000`, and all future threshold calibration, regression baselines, and resampling targets for this deployment use 48000 Hz as canonical. Do not set 22050 again on this hardware. The repo's shipped default stays device-agnostic (`22050`, with a comment telling users to match their mic's native rate) — the 48000 override lives in the deployed config alongside the other per-deployment values like `calibration_offset_db`.
+
+<details>
+
+**Why (discovered 2026-10-21 while investigating incident #9111's missing session):** The Comica VM10 PRO's only native capture rate is 48000 Hz. The journal shows the configured 22050 Hz was rejected and the engine fell back to 48000 on **179 of 224 service starts** (first logged fallback 2026-06-12, when v18 introduced negotiation-with-fallback), and header inspection shows **every stored WAV from April through October is 48000 Hz** — the deployment has never captured a single block at 22050. Each fallback also cost a 15-second blind window (5 rejected attempts × 3 s) and printed a "classifications unreliable" warning that was itself misleading: since production has *always* been 48 kHz, every threshold tuned on production data — including the `flyover_max_music_score` guard — was in fact tuned at 48 kHz and is consistent with live behavior. The artifacts that are actually out of step are the 44100 Hz regression clips and any threshold reasoning that assumed 22050.
+
+**Consequence:** Priority 2 (sample-rate normalization) re-targets to 48000: `analyze_clip` should resample non-48000 input *up* to the canonical rate, and the regression corpus needs re-baselining at 48000. Requesting 48000 directly also eliminates the recurring fallback warning and the 15-second capture gap on restart. Related finding, same investigation: engine `print()` output is block-buffered to journald, so log lines can lag *days* behind the events they describe (the Sep 19–23 buffer flushed in one burst at Sep 23 15:26) — `PYTHONUNBUFFERED=1` in the service unit is the cheap fix, queued in NEXT.md.
+
+</details>

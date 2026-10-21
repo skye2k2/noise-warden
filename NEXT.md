@@ -10,7 +10,8 @@ Findings behind these items are recorded in CHANGELOG v20 and DECISIONS D1 (adde
 - **Engine fix: excluded-class continuation cutoff.** Excluded-class blocks refresh `last_above` on an active incident, so one music block on a windy night records wind to the 2-hour cap (incident 9025). In music-focus mode, stop refreshing after roughly a gap-merge window of consecutive excluded blocks so the normal gap-close finalizes the incident.
 - **Candidate feature: depth + swing-rate music confirmer (DECISIONS D13).** Per-window envelope depth with ~1 Hz alternation, computed at finalize — protects deep-and-alternating incidents from non-music auto-dismiss and flags shallow high-duty "music" as suspect machine noise.
 - **Optional audio cleanliness pass (DECISIONS D14).** High-pass before normalization and/or a normalization gain cap, if harsh playback on bass-heavy clips is worth addressing.
-- **Mine the purged-but-backed-up excluded corpus** (after Priorities 1–2). The July backup under `local_data/` is the only copy of 7,521 hard-deleted excluded rows; 820 have `music_like_score ≥ 0.62` (153 classified `flyover` — the pre-guard misclassification pattern). Reclassifying that cohort with the v20 guard quantifies how much real signal auto-dismiss removed.
+- **Resurface triaged auto-dismissed incidents (analysis complete, mutation pending a decision).** The 2026-10-21 resurface scan re-ran the v20 pipeline + D13 depth/swing over every excluded row with surviving audio: of 752 analyzable clips, **14 strong** and **100 likely** music candidates flip classification (overwhelmingly `flyover`/`drive_by` → `music_like`); metadata triage flagged a further **568 likely-music rows with no surviving audio** (2026-04: 185, 2026-05: 383) for the frequency-of-abuse history. Mechanics differ by cohort: rows still in the Pi DB can be flipped in place (`excluded=0`, WAV restored from quarantine); purged rows exist only in the July backup and need re-insertion (original IDs are free) or a local evidence archive. Scan outputs: `.TMP_resurface_results.txt`, `.TMP_resurface_tierA.csv`, `.TMP_resurface_tierB.csv` (regenerate with `.TMP_resurface_scan.py`).
+- **Unbuffered engine logging.** Engine `print()` output is block-buffered to journald, so log lines can lag days behind events (D15: the Sep 19–23 buffer flushed in one burst). Add `Environment=PYTHONUNBUFFERED=1` to the systemd unit (or `print(..., flush=True)` in the engine hot paths), alongside the Priority 3b rotating file log.
 
 **Status at consolidation (2026-06-11):** v17 is feature-complete (beat removal, finalize keystone + parity, body-windowed metrics, engine midband veto, infraction-first UI, mode-aware auto-dismiss, music-focus gap merge, portable snippet paths, version display). v18 stabilized sample-rate negotiation and the `_compute_dominant` lead-in leak. v19 eliminated the OOM crash pattern via streaming WAV finalization, raised `min_incident_seconds` to 20, reduced `max_incident_record_hours` to 2, added drive-by sticky threshold, cosine fade-out on trimmed endings, preroll warmup guard, and music-focus auto-dismiss refinement for reclassified-as-non-music short incidents. The items below are what still remains.
 
@@ -28,21 +29,20 @@ Findings behind these items are recorded in CHANGELOG v20 and DECISIONS D1 (adde
 
 </details>
 
-## Priority 2 — Sample-rate normalization in `analyze_clip` (cross-device correctness)
+## Priority 2 — Sample-rate normalization in `analyze_clip` (canonical rate: 48000 — see DECISIONS D15)
 
-**The single most important correctness fix for reliable analysis.** All 15 regression WAVs in `tests/classification_data/` are 44100 Hz, but the Pi is set to record at 22050 Hz. Spectral features (centroid, band ratios) change with sample rate, so thresholds tuned on the test clips do **not** precisely match live Pi behavior. The `analyze_clip` source still carries a `NOTE:` comment flagging this divergence.
+**The single most important correctness fix for reliable analysis — re-scoped 2026-10-21.** The deployment has *always* captured at 48000 Hz (D15: the mic's only native rate; the configured 22050 was rejected on 179 of 224 starts and every stored WAV is 48 kHz). Production-data-derived thresholds — including the `flyover_max_music_score` guard — are therefore already 48 kHz-consistent. What remains out of step: the 15 regression WAVs in `tests/classification_data/` are 44100 Hz, and `analyze_clip` still carries the `NOTE:` comment about rate divergence.
 
 <details>
 
 - The `resample_audio()` FFT utility already exists in `dsp.py`.
 - Work required:
-  1. Enable resampling to the config sample rate at the top of `analyze_clip`.
-  2. Re-run all 15 regression clips at 22050 Hz.
-  3. Update `REGRESSION_CLIPS` expectations and the calibration notes.
-  4. Re-evaluate `holdover_priority_breakers` in the local config — `flyover` was removed as a breaker because it false-positived on storm-rain at 44100 Hz; that may change at 22050 Hz.
-- ~9 of 15 clips change classification when resampled, so this is a dedicated session, not a drive-by edit. Estimated ~2 hours.
-- Related README TODO: "Make sure the system functions the same with 48 kHz sampling and recording" — same root cause, same fix.
-- **Flyover filter accuracy is sample-rate-dependent.** v19 added a `flyover_max_music_score: 0.55` guard after analysis of production data showed 8 out of 8 confirmed IDIOT music incidents were misclassified as `flyover (multiple)`. The flyover filter's broad spectral thresholds (centroid 1400–12000, flatness 0.15–0.55) overlap heavily with through-wall bass music. The mscore guard provides clean separation using real-world data (real flyovers: mscore 0.26–0.57, IDIOT music: 0.62–0.73). HOWEVER, comma, this introduced a regression in the `plane-flyover.wav` regression clip (44100 Hz, mscore median 0.61 at that rate) — the clip now classifies as `wind (multiple)` instead of `flyover (multiple)`. After sample-rate normalization to 22050 Hz the mscore will likely drop and the classification may revert. The 10 user-tagged genuine flyovers are ironically classified as wind, thunder, diesel, or amplified_bass — not flyover — further evidence that the flyover filter's thresholds need comprehensive recalibration at the canonical sample rate. Real single-prop flyovers from the nearby airport take about a minute and have waveform shapes distinctly different from amplified music.
+  1. Enable resampling to the configured sample rate at the top of `analyze_clip` so any mismatched input (the 44100 regression clips, foreign recordings) is analyzed at the deployment's canonical rate (48000 here, per D15).
+  2. Re-run all 15 regression clips at 48000 and update `REGRESSION_CLIPS` expectations and the calibration notes.
+  3. Re-evaluate `holdover_priority_breakers` in the local config — `flyover` was removed as a breaker because it false-positived on storm-rain at 44100 Hz; that may change at 48000.
+  4. Revisit the `plane-flyover.wav` regression (currently classifies `wind (multiple)` because its 44100 Hz mscore median 0.61 trips the flyover guard) — at 48000 the mscore may drop back under 0.55.
+- Expect many of the 15 clips to change classification when resampled — this is a dedicated session, not a drive-by edit.
+- The 10 user-tagged genuine flyovers classify as wind, thunder, diesel, or amplified_bass — not flyover — so the flyover filter's thresholds need comprehensive recalibration at 48000 regardless. Real single-prop flyovers take about a minute and have waveform shapes distinctly different from amplified music (see also D13's depth/swing separation).
 
 </details>
 

@@ -7,7 +7,7 @@ app:
   auth_token: ""  # optional bearer token; blank disables auth (LAN only)
 
 audio:
-  sample_rate: 22050                  # 22050 (wideband), 44100 (CD quality), or 48000 (studio). Lower = smaller WAVs. If your USB mic rejects this rate, the app falls back to the device default automatically.
+  sample_rate: 22050                  # 22050 (wideband), 44100 (CD quality), or 48000 (studio). Lower = smaller WAVs. Set this to your mic's NATIVE rate: many USB mics only accept 48000, and a mismatch means a 15-second failed negotiation on every start before falling back to the device default (see DECISIONS D15 for a deployment where this went unnoticed for months).
   block_seconds: 1.0                  # Seconds per audio capture block. 1.0 is standard; smaller = more I/O overhead.
   input_device: null                  # null = default audio device.
   input_channels: 1
