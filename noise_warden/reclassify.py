@@ -898,7 +898,16 @@ def reclassify_all(storage, detection_cfg, audio_cfg, verbose=False, update=Fals
             skipped += 1
             continue
 
-        result = analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=True)
+        # Unreadable files must not abort the batch: the newest incident's WAV
+        # is typically still held open by the engine with an unfinalized
+        # header, and corrupt files should cost one skip, not the whole run
+        # (both 2026-10-21 migration dry runs died at 325/327 on the live file).
+        try:
+            result = analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=True)
+        except (RuntimeError, OSError) as exc:
+            print(f"  Incident {iid}: skipped (unreadable WAV: {exc})")
+            skipped += 1
+            continue
         processed += 1
 
         # Compare classification

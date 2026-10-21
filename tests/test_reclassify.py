@@ -914,3 +914,39 @@ class TestAnalyzeClipRateNormalization:
                 f"{key}: sub-rate file was altered by a higher config rate "
                 f"({a:.4f} vs native {b:.4f}) — upsampling must never happen"
             )
+
+
+# ---------------------------------------------------------------------------
+# reclassify_all resilience (v21 follow-up)
+# ---------------------------------------------------------------------------
+
+class TestReclassifyAllResilience:
+    """A batch run must survive an unreadable WAV — in production the newest
+    incident's WAV is still held open by the engine with an unfinalized header,
+    and both 2026-10-21 migration dry runs crashed at 325/327 on exactly that
+    file instead of reporting the 253 changes they had already computed."""
+
+    def test_unreadable_wav_is_skipped_not_fatal(self, tmp_path):
+        import numpy as np
+        from noise_warden.reclassify import reclassify_all
+        from noise_warden.storage import Storage
+
+        storage = Storage(str(tmp_path / "test.db"))
+        snippets = tmp_path / "snippets"
+        snippets.mkdir()
+
+        good = snippets / "incident_1_good.wav"
+        sf.write(str(good), np.zeros(22050, dtype="float32"), 22050)
+        bad = snippets / "incident_2_bad.wav"
+        bad.write_bytes(b"not a wav at all")
+
+        for path in (good, bad):
+            storage.create_incident({
+                "start_ts": "2026-04-01T12:00:00+00:00", "start_db": 70,
+                "peak_db": 70, "avg_db": 70, "threshold_db": 65,
+                "music_like_score": 0.5, "classification": "unknown",
+                "mode": "respond", "snippet_path": str(path),
+            })
+
+        # Must not raise despite the corrupt file.
+        reclassify_all(storage, _minimal_detection_cfg(), _minimal_audio_cfg())
