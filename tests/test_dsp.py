@@ -2207,3 +2207,181 @@ class TestEnvelopeWindowMetrics:
         from noise_warden.dsp import envelope_window_metrics
         result = envelope_window_metrics(self._drone_window(seconds=1), self.SR)
         assert result == (None, None)
+
+
+class TestModulationTracker:
+    """Streaming engine-signature tracker + looks_like_engine_rev veto.
+
+    Thresholds were calibrated on the 2026-10-29 labeled-corpus sweep (rule J,
+    DECISIONS D16); these tests pin the synthetic extremes of each sub-rule so
+    a regression in the streaming implementation is caught without the corpus.
+    """
+
+    SR = 48000
+
+    def _feed(self, tracker, signal, block_sec=1.0):
+        """Feed a signal to the tracker in engine-sized blocks."""
+        block = int(self.SR * block_sec)
+        for i in range(len(signal) // block):
+            tracker.update(signal[i * block:(i + 1) * block], self.SR)
+
+    def _engine_revving(self, seconds=10):
+        """Diesel-ish rumble: 80 Hz fundamental, amplitude-modulated at 14 Hz
+        (firing-rate lope). Near-constant level at the 0.25 s frame scale —
+        the exact profile incident 9337's revving-truck section measured."""
+        t = np.arange(self.SR * seconds) / self.SR
+        carrier = np.sin(2 * np.pi * 80.0 * t) + 0.3 * np.sin(2 * np.pi * 160.0 * t)
+        am = 1.0 + 0.5 * np.sin(2 * np.pi * 14.0 * t)
+        return (0.1 * am * carrier).astype(np.float32)
+
+    def _music_kicks(self, seconds=10):
+        """Through-wall music: 55 Hz kick bursts at 2 Hz with deep troughs
+        between beats — deep-and-alternating per DECISIONS D13."""
+        t = np.arange(self.SR * seconds) / self.SR
+        phase = (t % 0.5)
+        burst = np.exp(-phase / 0.05) * (phase < 0.2)
+        signal = 0.3 * burst * np.sin(2 * np.pi * 55.0 * t)
+        noise_floor = 0.0005 * np.sin(2 * np.pi * 300.0 * t)
+        return (signal + noise_floor).astype(np.float32)
+
+    def test_warmup_returns_none(self):
+        from noise_warden.dsp import ModulationTracker
+        tracker = ModulationTracker()
+        self._feed(tracker, self._engine_revving(seconds=4))
+        assert tracker.metrics() is None
+
+    def test_engine_rumble_measures_mechanical(self):
+        from noise_warden.dsp import ModulationTracker, looks_like_engine_rev
+        tracker = ModulationTracker()
+        self._feed(tracker, self._engine_revving())
+        metrics = tracker.metrics()
+        assert metrics is not None
+        assert 12.0 <= metrics["mod_hz"] <= 16.0, metrics
+        assert metrics["mod_prom"] >= 6.0, metrics
+        assert metrics["depth_db"] < 12.0, metrics
+        assert looks_like_engine_rev(metrics)
+
+    def test_music_kicks_are_immune(self):
+        from noise_warden.dsp import ModulationTracker, looks_like_engine_rev
+        tracker = ModulationTracker()
+        self._feed(tracker, self._music_kicks())
+        metrics = tracker.metrics()
+        assert metrics is not None
+        assert metrics["depth_db"] >= 12.0, metrics
+        assert not looks_like_engine_rev(metrics)
+
+    def test_held_idle_tone_vetoed_without_fast_modulation(self):
+        """Idle drone: continuous 55 Hz fundamental, lope below the 8 Hz mod
+        floor (incident 9432's profile: 5.6 Hz lope, hold_frac 0.72)."""
+        from noise_warden.dsp import ModulationTracker, looks_like_engine_rev
+        t = np.arange(self.SR * 10) / self.SR
+        am = 1.0 + 0.3 * np.sin(2 * np.pi * 5.6 * t)
+        idle = (0.1 * am * np.sin(2 * np.pi * 55.0 * t)).astype(np.float32)
+        tracker = ModulationTracker()
+        self._feed(tracker, idle)
+        metrics = tracker.metrics()
+        assert metrics is not None
+        assert metrics["tone_frac"] >= 0.80, metrics
+        assert metrics["hold_frac"] >= 0.50, metrics
+        assert looks_like_engine_rev(metrics)
+
+    def test_none_metrics_never_veto(self):
+        from noise_warden.dsp import looks_like_engine_rev
+        assert not looks_like_engine_rev(None)
+
+
+class TestClassifySound:
+    """Shared block classifier (engine + reclassify single source of truth)."""
+
+    CFG = {"min_music_like_score": 0.62}
+
+    def _musicish_features(self):
+        """Features that historically scored music_like for a revving truck."""
+        return {
+            "centroid_hz": 400.0,
+            "envelope_cv": 0.3,
+            "flatness": 0.35,
+            "harmonic_ratio": 0.6,
+            "highband_ratio": 0.2,
+            "lowband_ratio": 0.45,
+            "midband_ratio": 0.3,
+        }
+
+    def test_music_score_classifies_music(self):
+        from noise_warden.dsp import classify_sound
+        assert classify_sound(0.75, self._musicish_features(), self.CFG) == "music_like"
+
+    def test_rev_metrics_veto_music(self):
+        from noise_warden.dsp import classify_sound
+        rev = {"depth_db": 3.0, "hold_frac": 0.8, "mod_hz": 14.0,
+               "mod_prom": 15.0, "tone_frac": 1.0}
+        result = classify_sound(0.75, self._musicish_features(), self.CFG,
+                                rev_metrics=rev)
+        assert result == "engine_noise"
+
+    def test_deep_envelope_immune_to_veto(self):
+        from noise_warden.dsp import classify_sound
+        rev = {"depth_db": 18.0, "hold_frac": 0.8, "mod_hz": 14.0,
+               "mod_prom": 15.0, "tone_frac": 1.0}
+        result = classify_sound(0.75, self._musicish_features(), self.CFG,
+                                rev_metrics=rev)
+        assert result == "music_like"
+
+    def test_veto_can_be_disabled_in_config(self):
+        from noise_warden.dsp import classify_sound
+        cfg = {"min_music_like_score": 0.62, "engine_rev_veto": False}
+        rev = {"depth_db": 3.0, "hold_frac": 0.8, "mod_hz": 14.0,
+               "mod_prom": 15.0, "tone_frac": 1.0}
+        assert classify_sound(0.75, self._musicish_features(), cfg,
+                              rev_metrics=rev) == "music_like"
+
+    def test_midband_veto_still_first(self):
+        from noise_warden.dsp import classify_sound
+        features = dict(self._musicish_features(), midband_ratio=0.6)
+        assert classify_sound(0.75, features, self.CFG) == "engine_noise"
+
+
+class TestEngineRevFilterGate:
+    """identify_filter must not let engine-signature audio claim the
+    music-family amplified_bass filter (it counts as music seconds for the
+    music-focus keep-shield)."""
+
+    def _bass_features(self):
+        """Features that satisfy looks_like_amplified_bass's spectral gates."""
+        return {
+            "centroid_hz": 300.0,
+            "envelope_cv": 0.3,
+            "flatness": 0.30,
+            "harmonic_ratio": 0.6,
+            "highband_ratio": 0.1,
+            "lowband_ratio": 0.50,
+            "midband_ratio": 0.30,
+        }
+
+    def _stable_history(self):
+        return [62.0, 62.4, 61.8, 62.1, 62.3, 62.0, 61.9, 62.2]
+
+    def test_amplified_bass_claims_without_rev_metrics(self):
+        from noise_warden.dsp import identify_filter
+        cfg = {"min_music_like_score": 0.62}
+        result = identify_filter(self._bass_features(), self._stable_history(),
+                                 62.0, 62.0, cfg)
+        assert result == "amplified_bass"
+
+    def test_rev_signature_blocks_amplified_bass(self):
+        from noise_warden.dsp import identify_filter
+        cfg = {"min_music_like_score": 0.62}
+        rev = {"depth_db": 3.0, "hold_frac": 0.8, "mod_hz": 14.0,
+               "mod_prom": 15.0, "tone_frac": 1.0}
+        result = identify_filter(self._bass_features(), self._stable_history(),
+                                 62.0, 62.0, cfg, rev_metrics=rev)
+        assert result != "amplified_bass"
+
+    def test_deep_envelope_keeps_amplified_bass(self):
+        from noise_warden.dsp import identify_filter
+        cfg = {"min_music_like_score": 0.62}
+        rev = {"depth_db": 18.0, "hold_frac": 0.8, "mod_hz": 14.0,
+               "mod_prom": 15.0, "tone_frac": 1.0}
+        result = identify_filter(self._bass_features(), self._stable_history(),
+                                 62.0, 62.0, cfg, rev_metrics=rev)
+        assert result == "amplified_bass"

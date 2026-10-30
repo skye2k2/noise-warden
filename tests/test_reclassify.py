@@ -362,6 +362,72 @@ class TestNormalizeSnippet:
 
         assert result is None
 
+    def test_gain_cap_limits_boost(self, tmp_path):
+        """A very quiet recording must not be boosted past max_gain_db.
+
+        D14: the 'blown-out' harshness on bass-heavy clips is normalization
+        boost (+25-45 dB observed), not capture clipping. The cap keeps the
+        noise floor from being raised to painful levels on near-silent
+        captures."""
+        wav_path = str(tmp_path / "very_quiet.wav")
+        # amplitude 0.001 = -60 dBFS peak; uncapped gain to -6 would be +54 dB
+        _write_wav(wav_path, _make_tone(440, 2.0, amplitude=0.001))
+
+        result = normalize_snippet(wav_path, target_peak_dbfs=-6.0, max_gain_db=30.0)
+
+        assert result is not None
+        assert result["gain_db"] == 30.0
+
+        data, _ = sf.read(wav_path, dtype="float32")
+        actual_peak_dbfs = 20.0 * np.log10(float(np.max(np.abs(data))))
+        # -60 dBFS + 30 dB cap = -30 dBFS, well short of the -6 target
+        assert abs(actual_peak_dbfs - (-30.0)) < 1.0
+
+    def test_highpass_removes_rumble(self, tmp_path):
+        """With highpass_hz set, sub-cutoff rumble must be attenuated and the
+        normalization gain computed from the FILTERED peak, so structure-borne
+        rumble no longer dictates (and dominates) playback level (D14)."""
+        sr = 22050
+        wav_path = str(tmp_path / "rumbly.wav")
+        # Dominant 15 Hz rumble + quiet 440 Hz content worth hearing
+        rumble = _make_tone(15, 3.0, sr=sr, amplitude=0.04)
+        voice = _make_tone(440, 3.0, sr=sr, amplitude=0.004)
+        _write_wav(wav_path, rumble + voice, sr=sr)
+
+        result = normalize_snippet(wav_path, target_peak_dbfs=-6.0, highpass_hz=30.0)
+
+        assert result is not None
+        data, _ = sf.read(wav_path, dtype="float32")
+        spectrum = np.abs(np.fft.rfft(data))
+        freqs = np.fft.rfftfreq(len(data), d=1.0 / sr)
+        mag_15 = spectrum[np.argmin(np.abs(freqs - 15))]
+        mag_440 = spectrum[np.argmin(np.abs(freqs - 440))]
+
+        # Input rumble was 10x the 440 Hz content; after the high-pass the
+        # relationship must invert decisively (>= 20 dB of relative cut).
+        assert mag_440 / (mag_15 + 1e-12) > 10.0
+
+        # And the 440 Hz content (filtered peak) should now sit near target
+        actual_peak_dbfs = 20.0 * np.log10(float(np.max(np.abs(data))))
+        assert abs(actual_peak_dbfs - (-6.0)) < 1.5
+
+    def test_preserves_group_readable_mode(self, tmp_path):
+        """Normalization must not strip the 0664 evidence-file mode.
+
+        The engine chmods incident WAVs to 0664 at creation (v21 fix —
+        snippets are evidence, not secrets), but tempfile.mkstemp hardcodes
+        0600 and os.replace carries that onto the final file, silently
+        undoing the fix for every normalized recording (observed on all
+        post-v21 captures on the Pi, 2026-10-29)."""
+        wav_path = str(tmp_path / "mode.wav")
+        _write_wav(wav_path, _make_tone(440, 2.0, amplitude=0.01))
+        os.chmod(wav_path, 0o664)
+
+        result = normalize_snippet(wav_path, target_peak_dbfs=-6.0)
+
+        assert result is not None  # Confirm the rewrite path actually ran
+        assert (os.stat(wav_path).st_mode & 0o777) == 0o664
+
 
 class TestReclassifyIncidentNormalize:
     """Tests for normalize integration in reclassify_incident."""

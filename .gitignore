@@ -209,3 +209,6 @@ __marimo__/
 # Local dev (non-Pi testing artifacts)
 local_data/
 config/noise_warden_local.yaml
+
+# Temporary analysis scripts and their outputs (sandbox-wide .TMP_ convention)
+/.TMP_*

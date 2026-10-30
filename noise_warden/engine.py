@@ -10,6 +10,7 @@ from .dsp import (
     apply_filter_holdover, rms_dbfs, dba_estimate, spectrum_features,
     get_filter_detection_latency,
     identify_filter, music_like_score,
+    classify_sound, ModulationTracker,
 )
 from .ordinance import applicable_threshold, is_night
 from .reclassify import analyze_clip, denoise_snippet, envelope_depth_metrics, music_seconds, normalize_snippet, _compute_dominant
@@ -122,6 +123,11 @@ class Engine:
         self._prev_filter = None
         self._prev_filter_run = 0
         self._holdover_gap = 0
+
+        # Engine-signature tracker (8 s rolling modulation/tone window) for
+        # the music-focus engine-rev veto. Fed every captured block in the run
+        # loop so it is already warm when an incident opens.
+        self._mod_tracker = ModulationTracker()
 
     def _check_disk_quota(self):
         """Check available disk space in snippets directory and warn if below threshold.
@@ -537,6 +543,12 @@ class Engine:
 
             tmp = wav_path + ".tmp.wav"
             try:
+                # Same mode-preservation as normalize_snippet: the rewrite
+                # must not downgrade the 0664 evidence-file convention to the
+                # umask default (os.replace carries the temp file's mode).
+                with open(tmp, "w"):
+                    pass
+                os.chmod(tmp, os.stat(wav_path).st_mode & 0o777)
                 with sf.SoundFile(wav_path, mode="r") as infile:
                     with sf.SoundFile(tmp, mode="w", samplerate=sr,
                                       channels=channels, subtype="PCM_16") as outfile:
@@ -579,6 +591,7 @@ class Engine:
         raw = identify_filter(
             features, self.db_history, db_now, prev_db, self.cfg["detection"],
             feature_history=self.feature_history,
+            rev_metrics=self._mod_tracker.metrics(),
         )
         effective, self._prev_filter, self._prev_filter_run, self._holdover_gap = (
             apply_filter_holdover(
@@ -603,43 +616,13 @@ class Engine:
         The min_music_like_score threshold is configurable in detection config.
         Default: music_like >= 0.62.
 
-        Engine noise detection uses two complementary checks:
-          1. Dominant midband (>0.50) — combustion engines and vehicle noise concentrate
-             energy in the 180–1200 Hz band. Music follows a "smiley EQ" with scooped mids.
-          2. Steady bass without harmonics — when bass is present (lowband > 0.10) but the
-             intra-block envelope is flat (cv < 0.10) and harmonic structure is weak
-             (ratio < 0.40), it's mechanical rumble, not musical bass. This catches bass-heavy
-             engine sounds that have low midband (e.g., diesel idle with dominant rumble).
+        The actual rules live in dsp.classify_sound (midband veto, steady-bass
+        check, and the v22 engine-rev periodicity veto), shared with
+        reclassify.analyze_clip so the live and replay paths cannot drift.
+        This wrapper supplies the engine's rolling ModulationTracker metrics.
         """
-        det = self.cfg["detection"]
-        min_music = float(det["min_music_like_score"])
-        midband_veto = float(det.get("engine_midband_veto", 0.40))
-
-        if features:
-            midband = features.get("midband_ratio", 0)
-            envelope_cv = features.get("envelope_cv", 0.5)
-            harmonic = features.get("harmonic_ratio", 0.5)
-            lowband = features.get("lowband_ratio", 0)
-
-            # Check 1: dominant midband is a strong engine indicator. Engine /
-            # vehicle / aircraft noise concentrates energy in the 180–1200 Hz
-            # band; music follows a "smiley EQ" with scooped mids. Empirically
-            # (3 months of labeled data), confirmed music midband tops out near
-            # 0.22 (p75), while flyover/diesel/helicopter routinely exceed 0.40.
-            # A 0.40 veto removes ~9x more engine false-positives than the old
-            # 0.50 threshold while vetoing zero confirmed-music incidents.
-            if midband > midband_veto:
-                return "engine_noise"
-
-            # Check 2: bass-present but steady amplitude + no harmonic structure.
-            # Musical bass has dynamic envelope (kicks, drops) and harmonic peaks.
-            # Engine bass is a flat drone with broadband energy distribution.
-            if lowband > 0.10 and envelope_cv < 0.10 and harmonic < 0.40:
-                return "engine_noise"
-
-        if mscore >= min_music:
-            return "music_like"
-        return "unknown"
+        return classify_sound(mscore, features, self.cfg["detection"],
+                              rev_metrics=self._mod_tracker.metrics())
 
     def _update_class_journal(self, classify):
         """Append a classification transition to the active incident's journal.
@@ -896,10 +879,22 @@ class Engine:
         # The calibrated dBA measurements in the DB are the quantitative
         # evidence; the WAV is qualitative corroboration, more useful when
         # audible. Only applies when snippet_normalize is enabled in config.
+        # D14 cleanliness levers (2026-10-29, after the Oct 23/28 truck-day
+        # captures played back "clipping extremely hard"): cap the boost and
+        # high-pass structure-borne rumble out of the playback copy. The
+        # downstream analyze_clip keystone is safe analyzing the high-passed
+        # file: the stopband nulls only the sub-cutoff FFT bins (~0.1% of the
+        # spectrum at a 30 Hz cutoff), shifting flatness by <1% — nothing like
+        # the D15 empty-top-band collapse — and the 30-180 Hz lowband sits
+        # entirely above the cutoff.
         if snippet_path and os.path.exists(snippet_path):
             target_peak = float(self.cfg["audio"].get("snippet_normalize_peak_dbfs", -6.0))
             if self.cfg["audio"].get("snippet_normalize", False):
-                normalize_snippet(snippet_path, target_peak)
+                normalize_snippet(
+                    snippet_path, target_peak,
+                    max_gain_db=float(self.cfg["audio"].get("snippet_normalize_max_gain_db", 30.0)),
+                    highpass_hz=float(self.cfg["audio"].get("snippet_normalize_highpass_hz", 30.0)),
+                )
 
         # ── avg_db (body-windowed — trigger → last_above only) ─────────
         # Average over the active body (above-threshold span), excluding ALL
@@ -1366,6 +1361,12 @@ class Engine:
                 db_now = dba_estimate(dbfs, float(self.cfg["detection"]["calibration_offset_db"]))
                 self.db_history.append(db_now)
                 self.db_history = self.db_history[-240:]
+
+                # Engine-signature tracker consumes EVERY captured block (even
+                # sub-noise-floor ones, which the DSP pipeline below skips):
+                # its 8-second modulation window must stay contiguous, and it
+                # is how the veto is already warm when an incident opens.
+                self._mod_tracker.update(block, self.capture.sr)
 
                 # Noise floor gate: if the computed dBA is below the configured
                 # floor (default 50 dB), the signal is ambient white noise and

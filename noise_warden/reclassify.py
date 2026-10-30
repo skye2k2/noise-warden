@@ -12,8 +12,6 @@ Usage:
   python -m noise_warden.reclassify --all                 # batch all incidents with snippets
   python -m noise_warden.reclassify --all --update        # batch reclassify and update DB
 """
-# eslint-disable -- node scripts use the console
-
 from __future__ import annotations
 
 import argparse
@@ -27,10 +25,12 @@ import yaml
 
 from noise_warden.dsp import (
     apply_filter_holdover,
+    classify_sound,
     dba_estimate,
     envelope_window_metrics,
     get_filter_detection_latency,
     identify_filter,
+    ModulationTracker,
     music_like_score,
     resample_audio,
     rms_dbfs,
@@ -209,7 +209,83 @@ def denoise_snippet(wav_path, percentile=10, alpha=1.0, beta=0.02,
         return None
 
 
-def normalize_snippet(wav_path, target_peak_dbfs=-6.0):
+def _highpass_kernel(sr, cutoff_hz):
+    """Windowed-sinc FIR high-pass kernel (spectral inversion of a low-pass).
+
+    Linear phase, numpy-only (scipy is deliberately not a dependency). The
+    tap count scales with sr/cutoff so the transition band stays proportional
+    to the cutoff: ~9600 taps at 48 kHz / 30 Hz, stopband fully attenuated
+    below ~0.6x cutoff while the passband above ~1.3x cutoff is untouched.
+    """
+    numtaps = int(6 * sr / cutoff_hz) | 1  # odd tap count keeps delay integral
+    offsets = np.arange(numtaps) - numtaps // 2
+    lowpass = np.sinc(2.0 * cutoff_hz / sr * offsets) * (2.0 * cutoff_hz / sr)
+    lowpass *= np.hamming(numtaps)
+    highpass = -lowpass
+    highpass[numtaps // 2] += 1.0
+    return highpass.astype(np.float64)
+
+
+def _stream_filtered_chunks(wav_path, kernel, chunk_frames=131072):
+    """Yield high-pass-filtered mono-shaped chunks of a WAV via overlap-save
+    FFT convolution, compensating the FIR group delay so output samples stay
+    time-aligned with the input and the total sample count is unchanged.
+
+    Memory stays flat regardless of file length (multi-hundred-MB incident
+    files are routine), and the same generator serves both normalization
+    passes so peak measurement and gain application see identical samples.
+    """
+    taps = len(kernel)
+    fft_size = 1
+    while fft_size < max(chunk_frames, 4 * taps):
+        fft_size *= 2
+    seg_len = fft_size - taps + 1
+    kernel_fft = np.fft.rfft(kernel, fft_size)
+    delay = taps // 2
+
+    with sf.SoundFile(wav_path, mode="r") as infile:
+        tail = np.zeros(taps - 1, dtype=np.float64)
+        pending = delay  # output samples still owed to delay compensation
+        total_in = 0
+        total_out = 0
+        exhausted = False
+        while not exhausted or total_out < total_in:
+            if not exhausted:
+                chunk = infile.read(seg_len, dtype="float32")
+                if chunk.ndim > 1:
+                    chunk = chunk.mean(axis=1)
+                if len(chunk) < seg_len:
+                    exhausted = True
+                total_in += len(chunk)
+                # Flush the filter with silence once input runs out, so the
+                # delayed tail of real audio still gets emitted.
+                if exhausted:
+                    pad = min(seg_len - len(chunk), delay + (taps - 1))
+                    chunk = np.concatenate([chunk, np.zeros(pad, dtype=np.float32)])
+            else:
+                chunk = np.zeros(min(seg_len, delay), dtype=np.float32)
+
+            segment = np.concatenate([tail, chunk.astype(np.float64)])
+            valid = np.fft.irfft(np.fft.rfft(segment, fft_size) * kernel_fft,
+                                 fft_size)[taps - 1:taps - 1 + len(chunk)]
+            tail = segment[-(taps - 1):]
+
+            # Drop the group-delay prefix, then emit at most what the input
+            # has earned so len(output) == len(input) exactly.
+            if pending > 0:
+                skip = min(pending, len(valid))
+                valid = valid[skip:]
+                pending -= skip
+            emit = min(len(valid), total_in - total_out)
+            if emit > 0:
+                yield valid[:emit].astype(np.float32)
+                total_out += emit
+            if exhausted and emit <= 0:
+                break
+
+
+def normalize_snippet(wav_path, target_peak_dbfs=-6.0, max_gain_db=None,
+                      highpass_hz=0.0):
     """Normalize a WAV snippet's peak amplitude to a target dBFS level.
 
     USB microphones typically produce very low digital levels (-30 to
@@ -218,11 +294,29 @@ def normalize_snippet(wav_path, target_peak_dbfs=-6.0):
     audio immediately audible on consumer playback devices.
 
     Only boosts — never attenuates. If the recording is already louder
-    than the target, it is left untouched.
+    than the target, it is left untouched (including no high-pass pass —
+    an already-loud file is presumed healthy and is never rewritten).
+
+    The two optional cleanliness levers come from DECISIONS D14 — the
+    "blown-out" playback on bass-heavy clips is normalization boost raising
+    structure-borne rumble and the noise floor, not capture clipping:
+
+      max_gain_db: cap on the applied boost (None = uncapped legacy
+          behavior). Keeps near-silent captures from having their noise
+          floor raised 40+ dB to the pain threshold.
+      highpass_hz: when > 0, a linear-phase FIR high-pass at this cutoff is
+          applied to the written audio AND the peak is measured on the
+          filtered signal, so sub-audible rumble neither survives playback
+          nor dictates the gain. 0 disables (legacy behavior). Engine
+          analysis is unaffected either way: spectral features are computed
+          before finalize-time normalization, and the 30-180 Hz lowband
+          sits above the recommended 30 Hz cutoff regardless.
 
     Args:
         wav_path: path to the WAV file (modified in place)
         target_peak_dbfs: desired peak level in dBFS (default -6.0)
+        max_gain_db: maximum boost in dB, or None for no cap
+        highpass_hz: FIR high-pass cutoff in Hz, or 0 to disable
 
     Returns:
         dict with keys {action, gain_db, old_peak_dbfs, new_peak_dbfs}
@@ -233,17 +327,32 @@ def normalize_snippet(wav_path, target_peak_dbfs=-6.0):
         # second pass applies gain. Never loads the entire file into memory.
         STREAM_CHUNK = 65536
 
+        kernel = None
+        if highpass_hz and highpass_hz > 0:
+            with sf.SoundFile(wav_path, mode="r") as probe:
+                kernel = _highpass_kernel(probe.samplerate, float(highpass_hz))
+
+        def chunks():
+            """One streaming pass over the (optionally filtered) audio."""
+            if kernel is not None:
+                yield from _stream_filtered_chunks(wav_path, kernel, STREAM_CHUNK)
+            else:
+                with sf.SoundFile(wav_path, mode="r") as infile:
+                    while True:
+                        chunk = infile.read(STREAM_CHUNK, dtype="float32")
+                        if len(chunk) == 0:
+                            break
+                        yield chunk
+
         # Pass 1: find peak amplitude by streaming
         peak = 0.0
         with sf.SoundFile(wav_path, mode="r") as infile:
             sr = infile.samplerate
-            while True:
-                chunk = infile.read(STREAM_CHUNK, dtype="float32")
-                if len(chunk) == 0:
-                    break
-                chunk_peak = float(np.max(np.abs(chunk)))
-                if chunk_peak > peak:
-                    peak = chunk_peak
+            channels = infile.channels
+        for chunk in chunks():
+            chunk_peak = float(np.max(np.abs(chunk))) if len(chunk) else 0.0
+            if chunk_peak > peak:
+                peak = chunk_peak
 
         if peak < 1e-10:
             return None
@@ -256,22 +365,31 @@ def normalize_snippet(wav_path, target_peak_dbfs=-6.0):
         if gain_db <= 0:
             return None
 
+        if max_gain_db is not None and gain_db > max_gain_db:
+            gain_db = float(max_gain_db)
+
         gain_linear = 10.0 ** (gain_db / 20.0)
 
         # Pass 2: apply gain and write to a temp file, then replace original
         import tempfile
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", dir=os.path.dirname(wav_path))
         os.close(tmp_fd)
+
+        # mkstemp hardcodes mode 0600 (it ignores umask by design), and
+        # os.replace carries the temp file's mode onto the final WAV — which
+        # silently undid the v21 "snippets are evidence files, not secrets"
+        # 0664 fix on every normalized recording. Preserve the original
+        # file's mode so this function is mode-neutral regardless of caller.
+        os.chmod(tmp_path, os.stat(wav_path).st_mode & 0o777)
         try:
-            with sf.SoundFile(wav_path, mode="r") as infile:
-                with sf.SoundFile(tmp_path, mode="w", samplerate=sr,
-                                  channels=infile.channels, subtype="PCM_16") as outfile:
-                    while True:
-                        chunk = infile.read(STREAM_CHUNK, dtype="float32")
-                        if len(chunk) == 0:
-                            break
-                        normalized = np.clip(chunk * gain_linear, -1.0, 1.0)
-                        outfile.write(normalized)
+            # The high-pass generator collapses to mono (incident snippets are
+            # mono by construction); the legacy path preserves channel count.
+            out_channels = 1 if kernel is not None else channels
+            with sf.SoundFile(tmp_path, mode="w", samplerate=sr,
+                              channels=out_channels, subtype="PCM_16") as outfile:
+                for chunk in chunks():
+                    normalized = np.clip(chunk * gain_linear, -1.0, 1.0)
+                    outfile.write(normalized)
             os.replace(tmp_path, wav_path)
         except Exception:
             # Clean up temp file on failure
@@ -322,7 +440,6 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
       filter_counts — dict of {filter_name: count}
     """
     cal_offset = float(detection_cfg["calibration_offset_db"])
-    min_music = float(detection_cfg["min_music_like_score"])
 
     # Streaming block reads: open the file and read one block at a time
     # instead of loading the entire WAV into memory. For a 2-hour
@@ -390,6 +507,13 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
     holdover_gap = 0
     feature_history = []
 
+    # Engine-signature tracker, mirroring engine._mod_tracker. One divergence
+    # is inherent: the live engine's tracker is warm with ambient audio before
+    # the incident opens, while a replay starts cold at the file head — so the
+    # first ~8 s of a replayed clip can never be vetoed. The veto fails toward
+    # music (recording), so replay is conservative, never more aggressive.
+    mod_tracker = ModulationTracker()
+
     try:
         for i in range(n_blocks):
             block = infile.read(block_size, dtype="float32")
@@ -402,6 +526,7 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
             if sr != target_sr:
                 block = resample_audio(block, sr, target_sr)
 
+            mod_tracker.update(block, target_sr)
             dbfs = rms_dbfs(block)
             db_now = dba_estimate(dbfs, cal_offset)
             db_history.append(db_now)
@@ -428,26 +553,19 @@ def analyze_clip(wav_path, detection_cfg, audio_cfg, engine_captured=False):
                 # Normal DSP classification for the incident body
                 prev = db_history[-2] if len(db_history) > 1 else db_now
                 raw_filt = identify_filter(feats, db_history, db_now, prev, detection_cfg,
-                                           feature_history=feature_history)
+                                           feature_history=feature_history,
+                                           rev_metrics=mod_tracker.metrics())
 
                 # Apply holdover (same as engine._identify_filter)
                 filt, prev_filt, prev_filt_run, holdover_gap = apply_filter_holdover(
                     raw_filt, prev_filt, prev_filt_run, holdover_gap, detection_cfg,
                 )
 
-                # Replicate engine._classify_sound logic (with engine_noise veto).
-                # midband veto threshold must match the engine — see engine_midband_veto.
-                midband_veto = float(detection_cfg.get("engine_midband_veto", 0.40))
-                if feats.get("midband_ratio", 0) > midband_veto:
-                    classify = "engine_noise"
-                elif (feats.get("lowband_ratio", 0) > 0.10 and
-                      feats.get("envelope_cv", 0.5) < 0.10 and
-                      feats.get("harmonic_ratio", 0.5) < 0.40):
-                    classify = "engine_noise"
-                elif mscore >= min_music:
-                    classify = "music_like"
-                else:
-                    classify = "unknown"
+                # Shared block classifier — the same dsp.classify_sound the
+                # engine calls, so live and replay classifications cannot
+                # drift (they were previously duplicated inline here).
+                classify = classify_sound(mscore, feats, detection_cfg,
+                                          rev_metrics=mod_tracker.metrics())
 
                 final = filt if filt else classify
 

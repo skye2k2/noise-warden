@@ -1335,8 +1335,232 @@ FILTER_CHAIN = [
 # internal checks (Path B min_history, etc.) are already satisfied.
 FILTER_PRIORITY = {name: idx for idx, (name, _) in enumerate(FILTER_CHAIN)}
 
+class ModulationTracker:
+    """Rolling 8-second envelope/tone state for engine-signature detection.
+
+    Streams per-block audio into three parallel views of the last 8 seconds,
+    matching the offline analysis that calibrated the thresholds in
+    looks_like_engine_rev (2026-10-29, 238-clip labeled corpus):
+
+      - a 10 ms RMS envelope (modulation spectrum source),
+      - per-0.25 s-frame low-frequency tone track (fundamental + prominence),
+      - per-0.25 s-frame RMS (DECISIONS D13 depth, derived from the envelope).
+
+    The tracker is pure DSP state — no I/O, no config. The engine owns one
+    across its whole run (so it is already warm with ambient audio when an
+    incident opens); analyze_clip owns one per replayed file (whose first
+    ~8 s therefore cannot veto — the live engine is strictly better off).
+
+    Usage caveat: update() assumes blocks arrive contiguously at a fixed
+    sample rate. Feeding it blocks with gaps dilutes the modulation spectrum
+    toward zero prominence, which fails SAFE (no veto).
+    """
+
+    ENV_HOP_SEC = 0.01
+    FRAME_SEC = 0.25
+    WINDOW_SEC = 8.0
+    LF_LO_HZ = 25.0
+    LF_HI_HZ = 300.0
+    TONE_PROMINENCE_MIN = 6.0
+
+    def __init__(self):
+        self._env = []          # 10 ms RMS values, newest last
+        self._frames = []       # (f0_hz or None, prominence) per 0.25 s frame
+        self._frame_rms = []    # RMS per 0.25 s frame (depth source)
+        self._residual = np.zeros(0, dtype=np.float32)
+        self._env_max = int(self.WINDOW_SEC / self.ENV_HOP_SEC)
+        self._frames_max = int(self.WINDOW_SEC / self.FRAME_SEC)
+
+    def update(self, block, sr):
+        """Fold one audio block into the rolling window."""
+        hop = max(1, int(sr * self.ENV_HOP_SEC))
+        frame_len = int(sr * self.FRAME_SEC)
+        samples = np.concatenate([self._residual, np.asarray(block, dtype=np.float32)])
+
+        n_hops = len(samples) // hop
+        usable = n_hops * hop
+        if n_hops > 0:
+            hopped = samples[:usable].reshape(n_hops, hop)
+            self._env.extend(np.sqrt(np.mean(hopped ** 2, axis=1)).tolist())
+
+        # Frame-level work consumes the same sample stream in 0.25 s steps.
+        # Residual carries the partial frame into the next block so frame
+        # boundaries stay exact regardless of block size.
+        offset = 0
+        while offset + frame_len <= len(samples):
+            frame = samples[offset:offset + frame_len]
+            self._frame_rms.append(float(np.sqrt(np.mean(frame ** 2))))
+            self._frames.append(self._lf_tone(frame, sr))
+            offset += frame_len
+        self._residual = samples[offset:]
+
+        if len(self._env) > self._env_max:
+            self._env = self._env[-self._env_max:]
+        if len(self._frames) > self._frames_max:
+            self._frames = self._frames[-self._frames_max:]
+            self._frame_rms = self._frame_rms[-self._frames_max:]
+
+    def _lf_tone(self, frame, sr):
+        """Dominant prominent low-frequency peak of one 0.25 s frame.
+
+        Prominence is peak/median magnitude within the 25-300 Hz band —
+        scale-free, so capture level and normalization cannot shift it.
+        """
+        mag = np.abs(np.fft.rfft(frame * np.hanning(len(frame))))
+        freqs = np.fft.rfftfreq(len(frame), d=1.0 / sr)
+        band = (freqs >= self.LF_LO_HZ) & (freqs <= self.LF_HI_HZ)
+        band_mag = mag[band]
+        if len(band_mag) < 3:
+            return (None, 0.0)
+        median = float(np.median(band_mag))
+        if median <= 0:
+            return (None, 0.0)
+        peak_idx = int(np.argmax(band_mag))
+        prominence = float(band_mag[peak_idx] / median)
+        if prominence >= self.TONE_PROMINENCE_MIN:
+            return (float(freqs[band][peak_idx]), prominence)
+        return (None, prominence)
+
+    def metrics(self):
+        """Window metrics for looks_like_engine_rev, or None while warming up.
+
+        Requires the full 8 s window before reporting, so the veto thresholds
+        keep exactly the semantics they were calibrated with; a partial window
+        coarsens the modulation spectrum and inflates prominence variance.
+        """
+        if len(self._env) < self._env_max or len(self._frames) < self._frames_max:
+            return None
+
+        env = np.asarray(self._env, dtype=np.float64)
+        env = env - np.mean(env)
+        spectrum = np.abs(np.fft.rfft(env * np.hanning(len(env))))
+        mod_freqs = np.fft.rfftfreq(len(env), d=self.ENV_HOP_SEC)
+        band = (mod_freqs >= 5.0) & (mod_freqs <= 45.0)
+        band_spec = spectrum[band]
+        median = float(np.median(band_spec))
+        if median > 0:
+            peak_idx = int(np.argmax(band_spec))
+            mod_hz = float(mod_freqs[band][peak_idx])
+            mod_prom = float(band_spec[peak_idx] / median)
+        else:
+            mod_hz, mod_prom = 0.0, 0.0
+
+        env_db = 20.0 * np.log10(np.asarray(self._frame_rms) + 1e-12)
+        p10, p90 = np.percentile(env_db, [10, 90])
+        depth_db = float(p90 - p10)
+
+        tonal = [f0 for f0, _prom in self._frames]
+        tone_frac = float(np.mean([f0 is not None for f0 in tonal]))
+        hold_pairs = pair_total = 0
+        for prev_f0, now_f0 in zip(tonal, tonal[1:]):
+            if prev_f0 is None or now_f0 is None:
+                continue
+            pair_total += 1
+            if abs(now_f0 - prev_f0) / prev_f0 < 0.005:
+                hold_pairs += 1
+        hold_frac = hold_pairs / pair_total if pair_total else 0.0
+
+        return {
+            "depth_db": depth_db,
+            "hold_frac": hold_frac,
+            "mod_hz": mod_hz,
+            "mod_prom": mod_prom,
+            "tone_frac": tone_frac,
+        }
+
+
+def looks_like_engine_rev(metrics, mod_prom_min=6.0, mod_hz_min=8.0,
+                          fast_mod_hz_min=10.0, fast_mod_prom_min=4.5,
+                          tone_frac_min=0.80, hold_frac_min=0.65,
+                          depth_immunity_db=12.0):
+    """Engine-signature veto over ModulationTracker metrics — the operator's
+    "that RPM is way too high to be music" insight, made measurable.
+
+    Engines are periodic at rates music cannot reach: firing/lope/blade-pass
+    amplitude modulation lands at 8-45 Hz, while music's beat energy tops out
+    near 2.4 Hz with harmonics to ~9.6 Hz (16th notes at 144 BPM). Idling
+    engines additionally HOLD a continuous low-frequency fundamental that
+    bass lines (discrete note steps) do not. Three sub-rules, any of which
+    vetoes, all gated behind a D13 depth immunity — real music through walls
+    keeps >= 12 dB of envelope contrast, machines measure nearly flat:
+
+      E: strong modulation peak at >= 8 Hz (prominence >= 6)
+      G: persistent held LF tone (tone_frac >= 0.80, hold_frac >= 0.65 —
+         sustained bass NOTES hold up to ~0.6; a continuous idle fundamental
+         holds ~0.72, and 0.50 vetoed the locked 90 dB music regression clip)
+      I: any modulation peak at >= 10 Hz with prominence >= 4.5 — above
+         music's beat-harmonic ceiling even weak periodicity is mechanical
+
+    Calibrated 2026-10-29 on the 238-clip labeled corpus (rule "J"):
+    neutralizes 42/53 machine clips that score music-like while killing 5 of
+    121 music-labeled clips, of which the genuinely-music losses are the
+    shallow-depth hard case (the rest are mixed truck/boat clips the keyword
+    labeler had called music). Ledger: .TMP_engine_rev_results.txt /
+    DECISIONS D16.
+
+    Returns False while metrics is None (tracker warming up) — the veto
+    fails toward recording, never toward suppression.
+    """
+    if metrics is None:
+        return False
+    if metrics["depth_db"] >= depth_immunity_db:
+        return False
+    if metrics["mod_prom"] >= mod_prom_min and metrics["mod_hz"] >= mod_hz_min:
+        return True
+    if metrics["tone_frac"] >= tone_frac_min and metrics["hold_frac"] >= hold_frac_min:
+        return True
+    if metrics["mod_hz"] >= fast_mod_hz_min and metrics["mod_prom"] >= fast_mod_prom_min:
+        return True
+    return False
+
+
+def classify_sound(mscore, features, detection_cfg, rev_metrics=None):
+    """Classify a non-excluded block: music_like / engine_noise / unknown.
+
+    Single source of truth shared by engine._classify_sound and
+    reclassify.analyze_clip (previously duplicated inline in both, which is
+    exactly how the two paths drift apart). Three engine checks run before
+    the music threshold:
+
+      1. Dominant midband (> engine_midband_veto, default 0.40) — engines
+         concentrate energy in 180-1200 Hz; music's "smiley EQ" scoops mids.
+      2. Steady bass without harmonics — flat intra-block envelope
+         (cv < 0.10) with weak harmonic structure is mechanical rumble.
+      3. Engine-rev periodicity veto (looks_like_engine_rev) — catches the
+         REVVING truck that defeats 1 and 2: through-wall rev rumble is
+         bass-dominant (midband stays low) with a dynamic envelope (cv high)
+         and real firing harmonics. Gated by detection_cfg
+         engine_rev_veto (default true) and the tracker having 8 s of audio.
+    """
+    min_music = float(detection_cfg["min_music_like_score"])
+    midband_veto = float(detection_cfg.get("engine_midband_veto", 0.40))
+
+    if features:
+        if features.get("midband_ratio", 0) > midband_veto:
+            return "engine_noise"
+
+        if (features.get("lowband_ratio", 0) > 0.10 and
+                features.get("envelope_cv", 0.5) < 0.10 and
+                features.get("harmonic_ratio", 0.5) < 0.40):
+            return "engine_noise"
+
+    if mscore >= min_music:
+        # The rev veto gates only would-be music_like blocks: its thresholds
+        # were calibrated exclusively on music-scoring windows (2026-10-29
+        # corpus sweep), and relabeling sub-threshold blocks would churn
+        # journals (a locked birdsong regression clip flipped 'birdsong' →
+        # 'birdsong+' when the veto was allowed to touch non-music blocks).
+        if detection_cfg.get("engine_rev_veto", True) and looks_like_engine_rev(
+                rev_metrics,
+                depth_immunity_db=float(
+                    detection_cfg.get("engine_rev_depth_immunity_db", 12.0))):
+            return "engine_noise"
+        return "music_like"
+    return "unknown"
+
+
 def identify_filter(features, db_history, db_now, prev_db, detection_cfg,
-                    feature_history=None):
+                    feature_history=None, rev_metrics=None):
     """Run all exclusion filters in priority order and return the first match.
 
     This is the single entry point the engine uses for filter identification.
@@ -1356,6 +1580,9 @@ def identify_filter(features, db_history, db_now, prev_db, detection_cfg,
         feature_history: list of recent spectrum_features() dicts (for temporal
             pattern analysis like chorus birdsong detection). Optional; only
             used by the birdsong filter's Path D.
+        rev_metrics: ModulationTracker.metrics() output (or None). Only used
+            to keep engine-signature audio out of the music-family
+            amplified_bass filter — see below.
 
     Returns:
         Filter name string (e.g. "thunder", "birdsong") or None if no filter matches.
@@ -1363,6 +1590,20 @@ def identify_filter(features, db_history, db_now, prev_db, detection_cfg,
     for name, check_fn in FILTER_CHAIN:
         if check_fn(features, db_history, db_now, prev_db, detection_cfg,
                      feature_history=feature_history):
+            # Engine-signature veto on the music-family filter: amplified_bass
+            # gates at music score 0.45, so a revving truck scoring 0.45-0.62
+            # claims it long before classify_sound ever runs, and in
+            # music-focus mode those blocks count as music seconds for the
+            # keep-shield (how the Oct 23/28 truck sagas survived as
+            # "amplified_bass (multiple)"). A vetoed block falls through to
+            # the mechanical filters (diesel, flyover, ...) instead.
+            if (name == "amplified_bass"
+                    and detection_cfg.get("engine_rev_veto", True)
+                    and looks_like_engine_rev(
+                        rev_metrics,
+                        depth_immunity_db=float(detection_cfg.get(
+                            "engine_rev_depth_immunity_db", 12.0)))):
+                continue
             return name
 
     return None

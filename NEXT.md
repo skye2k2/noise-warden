@@ -2,15 +2,26 @@
 
 Remaining work only. Completed items live in the [CHANGELOG](docs/CHANGELOG.md); the rationale behind rejected approaches lives in [docs/DECISIONS.md](docs/DECISIONS.md). This file was consolidated from the former `NEXT.md` (stability analysis, v15/16) and `NEXT_RELEASE.md` (v17 planning) once their completed and rejected items had been recorded elsewhere.
 
-Current deployment: **v21 "True-Rate Edition"** (2026-10-21) at https://pi.lan:8787/incidents. Priorities below are in recommended execution order.
+Current deployment: **v22 "Engine Exclusion Edition"** (2026-10-29) at https://pi.lan:8787/incidents. Priorities below are in recommended execution order.
 
-## Priority 1 — v21 observation window (passive, ~1–2 weeks)
+## Priority 1 — v21+v22 observation window (passive, ~1–2 weeks)
 
-v21's new behaviors need live validation before anything gates on them:
+v21's new behaviors need live validation before anything more gates on them, and v22's veto thresholds were tuned on the 2026-10-29 corpus, so they get the same discipline:
 
+- **Engine-rev veto correctness (v22):** confirm diesel/plane/helicopter/mower days stop producing kept music-family incidents (offline replay predicts −79% music-family seconds on machine clips), and spot-listen any kept `music_like` incident for engine content. Watch specifically for the two accepted costs: quiet music UNDER engine noise being eaten, and residual short truck stubs.
+- **Normalization levers (v22):** confirm playback no longer sounds "clipped" on truck/bass captures, and that genuine music recordings still sound right with the 30 Hz high-pass + 30 dB gain cap.
 - **Dismissal correctness:** confirm the "uncorroborated music" dismissals only eat junk (journal corroboration, `music_focus_shield_min_music_sec`) and that no genuine session start gets dismissed. Confirm windy nights now close incidents ~two gap-merge windows after the last music block instead of running to the 2-hour cap.
-- **D13 envelope metrics on live incidents:** the popup now shows depth/swings per incident. Verify real music reads deep-and-alternating and machines read flat, as the labeled corpus predicted (music median 16.4 dB / ~8 swings; machines 9.7 dB / ~3). Once confirmed, wire depth+swing into auto-dismiss decisions (v22+): protect deep-and-alternating incidents, flag shallow high-duty "music" as suspect machine.
+- **D13 envelope metrics on live incidents:** the popup now shows depth/swings per incident. Verify real music reads deep-and-alternating and machines read flat, as the labeled corpus predicted (music median 16.4 dB / ~8 swings; machines 9.7 dB / ~3). v22 wired depth into the rev veto's immunity; wiring depth+swing into auto-dismiss decisions remains a candidate (protect deep-and-alternating incidents, flag shallow high-duty "music" as suspect machine).
 - **Spot-listen a sample of the 114 resurrected incidents** (search notes for `[resurfaced`) and re-exclude any the ear rejects.
+
+## Priority 1.5 — Stray-block openers: the "Why was this recorded?" class (evidence gathered 2026-10-29; needs its own calibration pass)
+
+The six operator-tagged "Why was this recorded?" incidents (9333, 9342, 9348, 9419, 9456, 9467) are NOT engine noise, so the v22 rev veto only kills one of them outright (9419, whose music blocks carry engine signature). The rest are ambient flukes — wind gusts, a plane swell, dawn birds — where an **isolated single block** crests the 0.62 music score (their tracker windows show no engine signature: modulation peaks at 5–6 Hz, exactly where music beat harmonics also live, so the veto's 8 Hz floor cannot come down). Journal evidence: 9333 opened on ONE 1-second music_like block in 72 s; 9342 on four scattered singles; real music sessions open with sustained runs. Two candidate fixes, both needing calibration against the labeled corpus before shipping:
+
+- **Opener confirmation:** require ≥ 2 consecutive music_like blocks (or M of the last K) before an incident opens in music-focus mode. Kills the single-block flukes; must verify quiet-music session starts are not delayed past their first block (lead-in preroll means no audio is lost either way).
+- **Duration-independent music corroboration at finalize:** the v21 shield only dismisses SHORT uncorroborated incidents (active_dur < min_incident_seconds); these ran 23–98 s on excluded-class refreshes and were kept with wind/flyover dominants. Extending the music-seconds corroboration to all music-focus incidents would need a threshold that keeps 9467 (8 music-seconds, a genuine borderline) on the right side of whatever the operator decides is right.
+
+Also noted during this investigation: stored `class_journal` is the finalize-replay journal (v21 keystone), not the live gate decisions — 9348/9456 show NO music-family blocks in their own journals because the replay (denoised/normalized audio, cold tracker) no longer reproduces the marginal live opener. Expect that asymmetry when auditing openers.
 
 ## Priority 2 — Tagging system (dataset quality + scaling) — pulled forward: it is the tooling every later priority needs
 
@@ -56,7 +67,6 @@ These are lower-value polish items noted across prior analysis and the README TO
 
 <details>
 
-- **Optional audio cleanliness pass (DECISIONS D14).** High-pass before normalization and/or a normalization gain cap, if harsh playback on bass-heavy clips is worth addressing (capture clipping is ruled out; the harshness is normalization boost).
 - **Minority journal entries and the `(multiple)` suffix.** A classification held for only a block or three against a sweeping majority probably should not earn a `(multiple)` suffix or be bolded — consider weighting/backtracking, or excluding minority `impulse`/`unknown` entries from the `(multiple)` test. Related: thunder-rumble tail-off looks like a diesel, but a diesel starting *exactly* as a thunderclap hits is vanishingly unlikely, so such single-block reclassifications should be clamped. (Mutual exclusion was *partially* addressed in v14 via thunder holdover; explicit post-processing remains.)
 - **Externalize ordinance thresholds from `ordinance.py` into the YAML.** The Pleasant Grove UT thresholds are hardcoded as a Python dict referenced by the thresholds page, config page, and engine. A proper `ordinance:` YAML section (city, section reference, day/night hours, per-zone dB thresholds, measurement guidance, legal notes) would make thresholds user-editable, remove city-specific magic numbers, and make evidence logs more credible. All `ORDINANCE`-based test assertions would move to fixture-injected config.
 - **`music_like_score` formula still uses unvalidated magic numbers** (the `0.6 * low + 0.4 * tonal_window` weighting and the 1.6 / 0.35 constants). Documented inline but never empirically validated. The tagging dataset (Priority 2) would enable proper tuning.
